@@ -1,0 +1,19 @@
+# Environments
+.env
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest and testing
+.pytest_cache/
+.vscode/
+.idea/
+
+# Large YOLO model weights (downloaded dynamically)
+*.pt
+
+# Local run outputs/inputs
+data/
+reports/
