@@ -7,7 +7,7 @@ from core.base_pipeline import BaseVideoPipeline
 from core.video_source import get_video_source
 
 class IntrusionDetectionPipeline(BaseVideoPipeline):
-    def initialize(self, model_weight: str = "yolov8n.pt"):
+    def initialize(self, model_weight: str = "yolov8n-pose.pt"):
         self.model = YOLO(model_weight)
 
     def process_frame(self, frame: np.ndarray, frame_idx: int, roi_polygon: np.ndarray, config: dict) -> tuple:
@@ -45,27 +45,38 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
             if cooldown_frames > 0:
                 cooldown_frames -= 1
 
+            results = self.model(frame, classes=[0], verbose=False)[0]
+            
+            # Draw skeleton over the person natively
+            frame = results.plot()
+            
             # Draw boundary
             cv2.polylines(frame, [roi_pixels], isClosed=True, color=(0, 255, 255), thickness=2)
 
-            results = self.model(frame, classes=[0], verbose=False)[0]
             intrusion_in_frame = False
 
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0])
-                foot_point = Point((x1 + x2) / 2, y2)
+            if results.keypoints is not None:
+                keypoints_xy = results.keypoints.xy.cpu().numpy()
+                keypoints_conf = results.keypoints.conf.cpu().numpy()
 
-                if roi_poly.contains(foot_point):
-                    intrusion_in_frame = True
-                    color = (0, 0, 255)
-                    cv2.putText(frame, f"INTRUSION: {conf:.2f}", (int(x1), int(y1) - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                else:
-                    color = (0, 255, 0)
-
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                cv2.circle(frame, (int(foot_point.x), int(foot_point.y)), 4, color, -1)
+                for i, person_kpts in enumerate(keypoints_xy):
+                    conf = keypoints_conf[i]
+                    
+                    # Extract ankles (Index 15 = Left Ankle, Index 16 = Right Ankle)
+                    for ankle_idx in [15, 16]:
+                        if conf[ankle_idx] > 0.5:
+                            x, y = person_kpts[ankle_idx]
+                            pt = Point(x, y)
+                            
+                            if roi_poly.contains(pt):
+                                intrusion_in_frame = True
+                                # Highlight breaching ankle in Red
+                                cv2.circle(frame, (int(x), int(y)), 8, (0, 0, 255), -1)
+                                cv2.putText(frame, "INTRUSION", (int(x) - 20, int(y) - 15),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            else:
+                                # Highlight safe ankle in Green
+                                cv2.circle(frame, (int(x), int(y)), 6, (0, 255, 0), -1)
 
             alert_event = None
 
