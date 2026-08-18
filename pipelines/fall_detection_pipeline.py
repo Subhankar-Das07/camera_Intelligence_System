@@ -76,6 +76,17 @@ class FallDetectionPipeline(BaseVideoPipeline):
                     if hip_y is None:
                         continue # Can't see hips reliably, skip tracking state
 
+                    ankle_y = None
+                    if conf[15] > 0.5 and conf[16] > 0.5:
+                        ankle_y = (kpts[15][1] + kpts[16][1]) / 2.0
+                    elif conf[15] > 0.5:
+                        ankle_y = kpts[15][1]
+                    elif conf[16] > 0.5:
+                        ankle_y = kpts[16][1]
+                    
+                    if ankle_y is None:
+                        ankle_y = by + bh/2.0 # Fallback to bottom of bounding box
+
                     if track_id not in self.history:
                         self.history[track_id] = deque(maxlen=self.history_frames)
                         
@@ -87,32 +98,24 @@ class FallDetectionPipeline(BaseVideoPipeline):
                         old_frame, old_hip_y, old_w, old_h = history_list[0]
                         curr_frame, curr_hip_y, curr_w, curr_h = history_list[-1]
                         
-                        # Calculate downward velocity
+                        # Calculate downward drop over the history window
                         dy = curr_hip_y - old_hip_y
-                        df = curr_frame - old_frame
                         
-                        if df > 0:
-                            velocity = dy / df
-                            aspect_ratio = curr_w / curr_h if curr_h > 0 else 0
+                        # 1. Sudden drop: hip drops by at least 15% of their standing height within the time window
+                        significant_drop = dy > (old_h * 0.15)
+                        
+                        # 2. Hips on ground: Vertical distance between hips and ankles is very small
+                        hip_to_ankle_dist = ankle_y - curr_hip_y
+                        hips_on_ground = hip_to_ankle_dist < (old_h * 0.25)
+                        
+                        if significant_drop and hips_on_ground:
+                            fall_detected_in_frame = True
                             
-                            # Physics rules for a fall:
-                            # 1. Dropping fast relative to body height
-                            is_dropping_fast = velocity > (old_h * 0.05) 
-                            
-                            # 2. Aspect ratio signifies laying down or strongly crouching
-                            is_horizontal = aspect_ratio > 0.8
-                            
-                            # 3. Overall drop distance is significant
-                            significant_drop = dy > (old_h * 0.3)
-                            
-                            if is_dropping_fast and is_horizontal and significant_drop:
-                                fall_detected_in_frame = True
-                                
-                                # Highlight person box in Red
-                                x1, y1 = int(bx - bw/2), int(by - bh/2)
-                                x2, y2 = int(bx + bw/2), int(by + bh/2)
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
-                                cv2.putText(frame, "FALL DETECTED!", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+                            # Highlight person box in Red
+                            x1, y1 = int(bx - bw/2), int(by - bh/2)
+                            x2, y2 = int(bx + bw/2), int(by + bh/2)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
+                            cv2.putText(frame, "FALL DETECTED!", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
 
             alert_event = None
 
