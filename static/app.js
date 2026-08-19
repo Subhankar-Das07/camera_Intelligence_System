@@ -251,10 +251,21 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function checkRunReady() {
-        runBtn.disabled = !(roiPoints.length > 2 && pipelineSelect.value && currentVideoData);
+        const needsRoi = pipelineSelect.value !== "fall_detection";
+        const hasRoi = roiPoints.length > 2;
+        runBtn.disabled = !( (needsRoi ? hasRoi : true) && pipelineSelect.value && currentVideoData);
     }
 
-    pipelineSelect.addEventListener("change", () => {
+    pipelineSelect.addEventListener("change", (e) => {
+        const isFallDetection = e.target.value === "fall_detection";
+        const machineSettings = document.getElementById("machine-settings");
+        const roiControls = document.getElementById("roi-controls");
+        
+        if (machineSettings) machineSettings.style.display = isFallDetection ? "none" : "block";
+        if (roiControls) {
+            roiControls.style.display = isFallDetection ? "none" : "block";
+            roiCanvas.style.display = isFallDetection ? "none" : "block";
+        }
         checkRunReady();
     });
 

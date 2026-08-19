@@ -3,6 +3,7 @@ from core.base_pipeline import BaseVideoPipeline
 from pipelines.intrusion_pipeline import IntrusionDetectionPipeline
 from pipelines.danger_zone_pipeline import DangerZonePipeline
 from pipelines.face_recognition_pipeline import FaceRecognitionPipeline
+from pipelines.fall_detection_pipeline import FallDetectionPipeline
 
 class PipelineRegistry:
     def __init__(self):
@@ -35,6 +36,8 @@ registry = PipelineRegistry()
 # Register out-of-the-box pipelines
 registry.register("intrusion_detection", IntrusionDetectionPipeline)
 registry.register("danger_zone", DangerZonePipeline)
-
 # ── Face Recognition pipeline (Ayush module) ─────────────────────────────────
 registry.register("face_recognition", FaceRecognitionPipeline)
+
+# ── Fall Detection pipeline ──────────────────────────────────────────────────
+registry.register("fall_detection", FallDetectionPipeline)
