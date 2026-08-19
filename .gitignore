@@ -48,3 +48,12 @@ storage/alerts/
 storage/uploads/
 storage/outputs/
 *.pt
+
+# ── Face Recognition (Ayush) ─────────────────────────
+# Downloaded ML models
+face_recognition/models/
+# Generated data / PII
+face_recognition/data/persons/
+face_recognition/data/embeddings.npz
+face_recognition/data/faces.faiss
+face_recognition/data/identities.json

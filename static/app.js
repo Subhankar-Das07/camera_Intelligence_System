@@ -38,11 +38,13 @@ document.addEventListener("DOMContentLoaded", () => {
         .then(res => res.json())
         .then(data => {
             pipelineSelect.innerHTML = "";
-            data.pipelines.forEach(p => {
-                const opt = document.createElement("option");
-                opt.value = p; opt.textContent = p;
-                pipelineSelect.appendChild(opt);
-            });
+            data.pipelines
+                .filter(p => p !== "face_recognition")   // FR has its own dedicated page
+                .forEach(p => {
+                    const opt = document.createElement("option");
+                    opt.value = p; opt.textContent = p;
+                    pipelineSelect.appendChild(opt);
+                });
             checkRunReady();
         })
         .catch(err => console.error("Error fetching pipelines:", err));
@@ -252,7 +254,9 @@ document.addEventListener("DOMContentLoaded", () => {
         runBtn.disabled = !(roiPoints.length > 2 && pipelineSelect.value && currentVideoData);
     }
 
-    pipelineSelect.addEventListener("change", checkRunReady);
+    pipelineSelect.addEventListener("change", () => {
+        checkRunReady();
+    });
 
     // ── Analysis ──────────────────────────────────────────────────────────────
 

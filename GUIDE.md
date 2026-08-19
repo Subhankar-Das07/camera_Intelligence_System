@@ -24,26 +24,26 @@ A robust, real-time computer vision platform designed to run AI pipelines on bot
 
 The codebase is highly modularized so different teams (AI, Web, Mobile) can work independently without stepping on each other's toes.
 
-### 1. AI & Backend Developers (`core/` and `pipelines/`)
-- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard.
+### 1. AI & Backend Developers (`core/`, `pipelines/`, `face_recognition/`)
+- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard (including Face Recognition endpoints).
 - **`core/`**: Contains the engine logic.
   - `base_pipeline.py`: The abstract class all AI models must inherit from.
   - `registry.py`: Auto-discovers and registers pipelines.
   - `mobile_ws.py`: Handles WebSocket connections from the Flutter app.
   - `video_source.py`: Background thread manager for lag-free RTSP streaming.
-- **`pipelines/`**: **Add new AI models here!**
-  - To add a new AI capability (e.g., Face Detection, Fire Detection):
-    1. Create a new file (e.g., `fire_pipeline.py`).
-    2. Inherit from `BaseVideoPipeline`.
-    3. Implement `initialize()` to load your PyTorch/YOLO model.
-    4. Implement `run_on_video()` to yield frames and JSON alerts.
-    5. The server will automatically discover it and add it to the Web Dashboard dropdown!
+- **`pipelines/`**:
+  - `face_recognition_pipeline.py`: Integrates the dedicated face recognition module into the pipeline architecture. Yields frames with Known/Unknown bounding boxes.
+  - *To add a new AI capability (e.g., Fire Detection):* Inherit from `BaseVideoPipeline`, implement `initialize()` and `run_on_video()`.
+- **`face_recognition/` (Ayush Module)**: 
+  - A highly accurate module using InsightFace (SCRFD + ArcFace) and FAISS for vector search.
+  - Features a unified database (`data/persons/`) where all unique faces are auto-saved on their first visit.
+  - Uses `supervision.ByteTrack` for stable identity tracking and temporal consensus for high-confidence matching.
 
 ### 2. UI / UX Web Developers (`static/`)
 This folder contains the Admin Web Dashboard that manages cameras and views live RTSP streams.
-- **`index.html`**: The main layout and DOM structure.
+- **`index.html` & `app.js`**: The main layout and DOM structure for the primary vision pipeline.
 - **`style.css`**: All styling. Uses a modern, dark-mode, flexbox-driven design.
-- **`app.js`**: Handles API calls to `main.py`, manages the video player, and calculates the exact pixel mapping for the Region of Interest (ROI) drawing canvas.
+- **`face_recognition/`**: A dedicated sub-dashboard for managing face identities, FAISS embeddings, and viewing the live recognition stream (contains its own `index.html`, `fr_app.js`, and `fr_style.css`).
 
 ### 3. Android / Flutter Developers (`edge_vision_app/`)
 This folder contains the mobile application that turns an Android phone into an edge-streaming camera.

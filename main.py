@@ -279,10 +279,193 @@ def close_stream(stream_id: str):
     return {"status": "closed"}
 
 
+@app.post("/api/connect_webcam")
+async def connect_webcam(index: int = 0):
+    """
+    Open a local webcam by device index and register it as a live stream.
+    Returns stream_id that can be passed to start_analysis just like an RTSP stream.
+    Used by the Face Recognition dashboard webcam tab.
+    """
+    def _open():
+        cam = ThreadedCamera(index)   # integer index → cv2.VideoCapture(0/1/2...)
+        if not cam.isOpened():
+            return None, None, None
+        cam.start()
+        # Wait for first real frame
+        for _ in range(30):
+            ret, frame = cam.read()
+            if ret and frame is not None:
+                h, w = frame.shape[:2]
+                return cam, w, h
+            time.sleep(0.1)
+        # Fallback to reported dimensions
+        w = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        return cam, w, h
+
+    loop = asyncio.get_running_loop()
+    try:
+        cam, width, height = await asyncio.wait_for(
+            loop.run_in_executor(None, _open), timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=400, detail="Webcam timed out. Check that no other app is using it.")
+
+    if cam is None:
+        raise HTTPException(status_code=400,
+            detail=f"Could not open webcam index {index}. Check the device is connected and not in use.")
+
+    stream_id = str(uuid.uuid4())
+    rtsp_streams[stream_id] = cam
+    rtsp_dims[stream_id] = (width, height)
+    return {"stream_id": stream_id, "width": width, "height": height}
+
+
 @app.get("/api/alerts/{session_id}")
 def get_alerts(session_id: str):
     return {"alerts": session_alerts.get(session_id, [])}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Face Recognition Management APIs (Ayush module — additive) ───────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel as _BaseModel
+
+class FaceRenameRequest(_BaseModel):
+    new_label: str
+
+
+def _get_fr_pipeline():
+    """Helper to retrieve the face_recognition pipeline instance."""
+    try:
+        return registry.get_pipeline("face_recognition")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Face recognition pipeline unavailable: {e}")
+
+
+@app.get("/api/faces/status")
+async def face_status():
+    """Return stats about the face identity database."""
+    pipeline = _get_fr_pipeline()
+    return pipeline.get_identity_manager().get_stats()
+
+
+@app.get("/api/faces/identities")
+async def list_identities():
+    """Return all registered identities with metadata and thumbnail URLs."""
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    identities = im.get_all_identities()
+    result = []
+    for pid, meta in identities.items():
+        entry = {"person_id": pid, **meta}
+        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid)
+        result.append(entry)
+    result.sort(key=lambda x: x.get("created_at", 0))
+    return {"identities": result}
+
+
+@app.post("/api/faces/register")
+async def register_face(
+    label: Optional[str] = None,
+    file: UploadFile = File(...),
+):
+    """Register a new known person from an uploaded face image."""
+    import numpy as np
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    embedder = pipeline._embedder
+
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
+    faces = embedder.detect_and_embed(img)
+    quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
+    if not quality_faces:
+        raise HTTPException(
+            status_code=422,
+            detail="No clear face detected. Ensure face is well-lit, front-facing, at least 50x50px."
+        )
+
+    best = max(quality_faces, key=lambda f: f.score)
+    pid = im.add_identity(
+        embeddings=best.embedding.reshape(1, -1),
+        label=label or None,
+        face_crops=[best.crop],
+    )
+    meta = im.get_identity(pid)
+    return {"person_id": pid, "label": meta["label"], "status": "registered"}
+
+
+@app.post("/api/faces/snapshot/{stream_id}")
+async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
+    """Grab current frame from live RTSP stream, detect face, register it."""
+    import numpy as np
+    cam = rtsp_streams.get(stream_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+
+    ret, frame = cam.read()
+    if not ret or frame is None:
+        raise HTTPException(status_code=503, detail="Could not read frame from stream.")
+
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    embedder = pipeline._embedder
+
+    faces = embedder.detect_and_embed(frame)
+    quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
+    if not quality_faces:
+        raise HTTPException(status_code=422, detail="No clear face in current frame.")
+
+    best = max(quality_faces, key=lambda f: f.score)
+    pid = im.add_identity(
+        embeddings=best.embedding.reshape(1, -1),
+        label=label or None,
+        face_crops=[best.crop],
+    )
+    meta = im.get_identity(pid)
+    return {"person_id": pid, "label": meta["label"], "status": "registered"}
+
+
+@app.patch("/api/faces/identity/{person_id}")
+async def rename_identity(person_id: str, body: FaceRenameRequest):
+    """Rename an existing identity."""
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    success = im.rename_identity(person_id, body.new_label)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
+    return {"person_id": person_id, "new_label": body.new_label, "status": "renamed"}
+
+
+@app.delete("/api/faces/identity/{person_id}")
+async def delete_identity(person_id: str):
+    """Delete a person from the database entirely."""
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    success = im.delete_identity(person_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
+    return {"person_id": person_id, "status": "deleted"}
+
+
+# ── Static file mounts (additive) ────────────────────────────────────────────
+
+# Serve face crop images for the identity manager UI
+_FR_DATA_DIR = os.path.join("face_recognition", "data")
+os.makedirs(_FR_DATA_DIR, exist_ok=True)
+os.makedirs(os.path.join(_FR_DATA_DIR, "persons"), exist_ok=True)  # persons/ always exists
+app.mount("/face_data", StaticFiles(directory=_FR_DATA_DIR), name="face_data")
+
+# Serve face recognition dashboard (separate sub-page)
+_FR_STATIC_DIR = os.path.join("static", "face_recognition")
+os.makedirs(_FR_STATIC_DIR, exist_ok=True)
 
 # Mount static root last
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
