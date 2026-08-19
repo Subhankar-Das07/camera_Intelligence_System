@@ -164,6 +164,10 @@ async def connect_stream(body: RtspConnectRequest):
     url = body.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="No stream URL provided.")
+        
+    # If the user typed "0" or "1", convert to integer for local webcam support
+    if isinstance(url, str) and url.isdigit():
+        url = int(url)
 
     def _open():
         cam = ThreadedCamera(url)

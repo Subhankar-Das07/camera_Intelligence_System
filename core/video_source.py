@@ -13,7 +13,13 @@ class ThreadedCamera:
     """
     def __init__(self, src):
         self.src = src
-        self.cap = cv2.VideoCapture(self.src)
+        
+        # Use DirectShow on Windows for local webcams (integers) to prevent MSMF hangs
+        if isinstance(self.src, int) and os.name == 'nt':
+            self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(self.src)
+            
         self.grabbed, self.frame = self.cap.read()
         self.started = False
         self.read_lock = threading.Lock()
