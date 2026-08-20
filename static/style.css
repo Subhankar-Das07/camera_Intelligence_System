@@ -372,3 +372,94 @@ input:checked + .slider:before {
 .hidden {
     display: none !important;
 }
+
+/* ── Tab Navigation ─────────────────────────────────────────────────────── */
+.tab-nav {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.25rem;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 0;
+}
+
+.tab-btn {
+    padding: 0.5rem 1.25rem;
+    border: none;
+    border-radius: 6px 6px 0 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px;
+}
+
+.tab-btn:hover {
+    background: rgba(59, 130, 246, 0.08);
+    color: var(--text-primary);
+}
+
+.tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: rgba(59, 130, 246, 0.1);
+}
+
+.tab-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+/* ── Vehicle Recognition Panel ──────────────────────────────────────────── */
+.vr-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.vr-card {
+    background: rgba(13, 148, 136, 0.1);
+    border: 1px solid #0d9488;
+    border-radius: 8px;
+    padding: 0.75rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 200px;
+    transition: transform 0.2s, background 0.2s;
+}
+
+.vr-card:hover {
+    transform: translateY(-2px);
+    background: rgba(13, 148, 136, 0.2);
+}
+
+.vr-card .vr-plate {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #2dd4bf;
+    letter-spacing: 0.1em;
+}
+
+.vr-card .vr-visits {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.vr-card .vr-time {
+    font-size: 0.75rem;
+    color: #64748b;
+}
+
+.alert-inline-video {
+    max-width: 240px;
+    border-radius: 4px;
+    background: #000;
+}

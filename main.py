@@ -16,6 +16,10 @@ from typing import List, Tuple, Dict, Any, Optional
 from core.registry import registry
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
+from pipelines.vehicle_recognition import VehicleRecognitionPipeline
+
+# Register the vehicle recognition pipeline into the shared singleton registry
+registry.register("vehicle_recognition", VehicleRecognitionPipeline)
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -251,15 +255,22 @@ def stream_video(session_id: str):
         raise HTTPException(status_code=400, detail="Pipeline not found.")
 
     if req.stream_id and req.stream_id in rtsp_streams:
-        # Pass the existing live camera object instead of reopening a second connection
-        # This prevents NVRs from throttling/rejecting the duplicate connection.
         input_path = rtsp_streams[req.stream_id]
     else:
         input_path = os.path.join(UPLOAD_DIR, req.filename)
 
+    # Vehicle recognition uses a specialised generator that harvests plate metadata
+    if req.pipeline_name == "vehicle_recognition":
+        generator_fn = _vr_mjpeg_generator(
+            session_id, pipeline, input_path, req.roi_normalized, req.config
+        )
+    else:
+        generator_fn = _mjpeg_generator_analysis(
+            session_id, pipeline, input_path, req.roi_normalized, req.config
+        )
+
     return StreamingResponse(
-        _mjpeg_generator_analysis(session_id, pipeline, input_path,
-                                  req.roi_normalized, req.config),
+        generator_fn,
         media_type='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -286,6 +297,50 @@ def close_stream(stream_id: str):
 @app.get("/api/alerts/{session_id}")
 def get_alerts(session_id: str):
     return {"alerts": session_alerts.get(session_id, [])}
+
+
+# ── Vehicle Recognition: per-session detection cache ────────────────────────
+# Maps session_id -> list of unique {plate, total_visits} dicts seen so far.
+vr_detections: Dict[str, List[Dict[str, Any]]] = {}
+vr_detected_plates: Dict[str, set] = {}   # session_id -> set of plate strings
+
+
+def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, config):
+    """Annotated MJPEG generator that also captures plate detections for the log."""
+    stop_ev = stop_events.get(session_id)
+    vr_detections[session_id] = []
+    vr_detected_plates[session_id] = set()
+
+    generator = pipeline.run_on_video(
+        input_path=input_path,
+        output_dir=ALERTS_DIR,
+        roi_normalized=roi_normalized,
+        config=config,
+    )
+    for frame, metadata in generator:
+        if stop_ev and stop_ev.is_set():
+            break
+        # Harvest newly confirmed plates from frame metadata
+        if metadata and metadata.get("detections"):
+            for det in metadata["detections"]:
+                plate = det.get("plate")
+                if plate and plate not in vr_detected_plates[session_id]:
+                    vr_detected_plates[session_id].add(plate)
+                    vr_detections[session_id].append({
+                        "plate":        plate,
+                        "total_visits": det.get("total_visits", 1),
+                    })
+        if frame is not None:
+            ok, buf = cv2.imencode('.jpg', frame)
+            if ok:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+
+
+@app.get("/api/vr_detections/{session_id}")
+def get_vr_detections(session_id: str):
+    """Return the list of confirmed unique plates detected in a VR session."""
+    return {"detections": vr_detections.get(session_id, [])}
 
 
 # Mount static root last

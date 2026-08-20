@@ -65,8 +65,15 @@
             </section>
         </aside>
 
-        <!-- Main center display area -->
         <main class="main-content">
+            <!-- Tab navigation -->
+            <nav class="tab-nav" id="tab-nav">
+                <button class="tab-btn active" id="tab-analysis-btn" data-tab="analysis">🔍 Analysis</button>
+                <button class="tab-btn" id="tab-vehicle-btn" data-tab="vehicle_recognition">🚗 Vehicle Recognition</button>
+            </nav>
+
+            <!-- ── Analysis tab (original content) ── -->
+            <div class="tab-panel" id="panel-analysis">
             <div class="header-title">
                 <h2>AI-powered Detection Dashboard:</h2>
             </div>
@@ -90,10 +97,39 @@
                     <p class="placeholder">No alerts detected yet.</p>
                 </div>
             </div>
+            </div> <!-- /panel-analysis -->
+
+            <!-- ── Vehicle Recognition tab ── -->
+            <div class="tab-panel hidden" id="panel-vehicle_recognition">
+                <div class="header-title">
+                    <h2 style="background-color:#0d9488;">🚗 Vehicle Recognition &amp; Visit Counting</h2>
+                </div>
+
+                <div class="vr-controls">
+                    <button class="btn secondary" id="vr-connect-btn">Connect Source</button>
+                    <button class="btn primary" id="vr-run-btn" disabled>▶ Start Recognition</button>
+                    <button class="btn secondary hidden" id="vr-stop-btn" style="background:#7f1d1d;border-color:#dc2626;">⏹ Stop</button>
+                    <span class="status-msg" id="vr-status-msg" style="margin-left:8px;">No source selected</span>
+                </div>
+
+                <div class="content-wrapper" id="vr-content-wrapper">
+                    <div id="vr-placeholder" class="placeholder-msg">Upload a video or connect an RTSP stream above to begin</div>
+                    <img id="vr-stream-img" class="hidden" style="max-width:100%;max-height:100%;object-fit:contain;" alt="Vehicle Recognition Stream">
+                </div>
+
+                <!-- Visit log table -->
+                <div class="reports-section" style="margin-top:1rem;">
+                    <h3>📋 Detected Vehicles Log</h3>
+                    <div id="vr-log-container" class="alerts-container">
+                        <p class="placeholder">No vehicles detected yet.</p>
+                    </div>
+                </div>
+            </div> <!-- /panel-vehicle_recognition -->
+
         </main>
     </div>
 
-    <script src="app.js?v=11"></script>
+    <script src="app.js?v=12"></script>
 </body>
 
 </html>
