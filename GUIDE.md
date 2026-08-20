@@ -62,21 +62,28 @@ This folder contains the mobile application that turns an Android phone into an 
 - Docker Desktop (recommended for team deploy)
 - (Optional) NVIDIA GPU for faster YOLO inference.
 
-### Team base branch
-Shared integration branch: **`develop`**  
-https://github.com/Subhankar-Das07/camera_Intelligence_System/tree/develop
+### Team main repository (endevs)
+**Source of truth:** https://github.com/endevs/camera_Intelligence  
+**Base branch for all feature work:** `main`  
+https://github.com/endevs/camera_Intelligence/tree/main
 
-Feature branches from `develop`:
-- `feature/zone-safety`
-- `feature/vehicle`
-- `feature/face`
+Clone and start a feature branch:
 
 ```bash
-git fetch origin
-git checkout develop
+git clone https://github.com/endevs/camera_Intelligence.git
+cd camera_Intelligence
+git checkout main
 git pull
 git checkout -b feature/<name>
 ```
+
+| Area | Branch |
+|------|--------|
+| Zone Safety | `feature/zone-safety` |
+| Vehicle | `feature/vehicle` |
+| Face | `feature/face` |
+
+Primary folders: `static/features/zone-safety/`, `static/features/vehicle/`, `static/features/face/`
 
 ### Docker Hub image (no local build)
 Image: **`drpinfotech/camera-intelligence:develop`** (also tagged `0.1.0`)  
