@@ -40,10 +40,12 @@ The codebase is highly modularized so different teams (AI, Web, Mobile) can work
   - Uses `supervision.ByteTrack` for stable identity tracking and temporal consensus for high-confidence matching.
 
 ### 2. UI / UX Web Developers (`static/`)
-This folder contains the Admin Web Dashboard that manages cameras and views live RTSP streams.
-- **`index.html` & `app.js`**: The main layout and DOM structure for the primary vision pipeline.
-- **`style.css`**: All styling. Uses a modern, dark-mode, flexbox-driven design.
-- **`face_recognition/`**: A dedicated sub-dashboard for managing face identities, FAISS embeddings, and viewing the live recognition stream (contains its own `index.html`, `fr_app.js`, and `fr_style.css`).
+Unified product shell with per-feature folders (branch-friendly):
+- **`static/shell/`** — shared top nav and design tokens
+- **`static/features/zone-safety/`** — intrusion / danger zone / fall UI
+- **`static/features/vehicle/`** — vehicle recognition UI
+- **`static/features/face/`** — face recognition UI
+- **`static/shared/`** — shared upload/RTSP helpers
 
 ### 3. Android / Flutter Developers (`edge_vision_app/`)
 This folder contains the mobile application that turns an Android phone into an edge-streaming camera.
@@ -57,14 +59,44 @@ This folder contains the mobile application that turns an Android phone into an 
 
 ### Prerequisites
 - Windows 10/11 or Linux with **Python 3.10+**
+- Docker Desktop (recommended for team deploy)
 - (Optional) NVIDIA GPU for faster YOLO inference.
 
-### 1. Install Dependencies
+### Team base branch
+Shared integration branch: **`develop`**  
+https://github.com/Subhankar-Das07/camera_Intelligence_System/tree/develop
+
+Feature branches from `develop`:
+- `feature/zone-safety`
+- `feature/vehicle`
+- `feature/face`
+
+```bash
+git fetch origin
+git checkout develop
+git pull
+git checkout -b feature/<name>
+```
+
+### Docker Hub image (no local build)
+Image: **`drpinfotech/camera-intelligence:develop`** (also tagged `0.1.0`)  
+https://hub.docker.com/r/drpinfotech/camera-intelligence
+
+```bat
+docker pull drpinfotech/camera-intelligence:develop
+docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
+```
+Open http://localhost:8000
+
+Local rebuild from source: run `docker-refresh.bat`  
+Publish new Hub tags (maintainers): run `docker-publish.bat`
+
+### 1. Install Dependencies (local Python)
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run the Server
+### 2. Run the Server (local Python)
 ```bash
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```

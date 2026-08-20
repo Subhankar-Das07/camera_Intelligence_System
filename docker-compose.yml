@@ -14,6 +14,7 @@ services:
       retries: 10
 
   app:
+    image: drpinfotech/camera-intelligence:develop
     build: .
     ports:
       - "8000:8000"
