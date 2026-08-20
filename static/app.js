@@ -403,3 +403,240 @@ document.addEventListener("DOMContentLoaded", () => {
         alertsContainer.prepend(card);
     }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Tab switching + Vehicle Recognition pipeline controller
+// ═══════════════════════════════════════════════════════════════════════════
+document.addEventListener("DOMContentLoaded", () => {
+
+    // ── Tab switcher ──────────────────────────────────────────────────────
+    const tabBtns   = document.querySelectorAll(".tab-btn");
+    const tabPanels = document.querySelectorAll(".tab-panel");
+
+    tabBtns.forEach(btn => {
+        btn.addEventListener("click", () => {
+            const target = btn.dataset.tab;
+
+            tabBtns.forEach(b => b.classList.toggle("active", b.dataset.tab === target));
+            tabPanels.forEach(p => {
+                const isTarget = p.id === `panel-${target}`;
+                p.classList.toggle("hidden", !isTarget);
+            });
+        });
+    });
+
+    // ── Vehicle Recognition DOM refs ──────────────────────────────────────
+    const vrConnectBtn = document.getElementById("vr-connect-btn");
+    const vrRunBtn     = document.getElementById("vr-run-btn");
+    const vrStopBtn    = document.getElementById("vr-stop-btn");
+    const vrStatusMsg  = document.getElementById("vr-status-msg");
+    const vrStreamImg  = document.getElementById("vr-stream-img");
+    const vrPlaceholder = document.getElementById("vr-placeholder");
+    const vrLogContainer = document.getElementById("vr-log-container");
+
+    // ── VR State ──────────────────────────────────────────────────────────
+    let vrVideoData    = null;  // {video_id, filename, width, height}
+    let vrStreamId     = null;  // RTSP stream_id (if using live camera)
+    let vrSessionId    = null;  // analysis session_id
+    let vrIsRtsp       = false;
+    let vrPollInterval = null;
+    const vrSeenPlates = new Set();
+
+    // ── Connect Source (re-uses main upload flow via a hidden file input) ─
+    // We create a one-off file input so the VR tab has its own upload button
+    const vrFileInput = document.createElement("input");
+    vrFileInput.type  = "file";
+    vrFileInput.accept = "video/mp4,video/avi,video/quicktime";
+    vrFileInput.style.display = "none";
+    document.body.appendChild(vrFileInput);
+
+    vrConnectBtn.addEventListener("click", () => {
+        // Offer: file OR rtsp prompt
+        const choice = confirm(
+            "Click OK to upload a video file.\nClick Cancel to enter an RTSP URL."
+        );
+        if (choice) {
+            vrFileInput.click();
+        } else {
+            const url = prompt("Enter RTSP / webcam URL (or 0 for local webcam):");
+            if (url !== null && url.trim() !== "") {
+                vrConnectRtsp(url.trim());
+            }
+        }
+    });
+
+    vrFileInput.addEventListener("change", (e) => {
+        if (!e.target.files.length) return;
+        vrUploadFile(e.target.files[0]);
+        vrFileInput.value = "";   // reset so re-selecting same file triggers change
+    });
+
+    function vrUploadFile(file) {
+        vrStatusMsg.textContent = "Uploading...";
+        vrStatusMsg.style.color = "#94a3b8";
+        vrConnectBtn.disabled = true;
+
+        const fd = new FormData();
+        fd.append("file", file);
+
+        fetch("/api/upload", { method: "POST", body: fd })
+            .then(r => { if (!r.ok) throw new Error("Upload failed."); return r.json(); })
+            .then(data => {
+                vrVideoData = data;
+                vrIsRtsp    = false;
+                vrStreamId  = null;
+                vrStatusMsg.textContent = `✔ ${file.name}`;
+                vrStatusMsg.style.color = "#10b981";
+                vrConnectBtn.disabled   = false;
+                vrRunBtn.disabled       = false;
+
+                // Show static preview
+                vrPlaceholder.classList.add("hidden");
+                vrStreamImg.src = data.preview_url + "?t=" + Date.now();
+                vrStreamImg.classList.remove("hidden");
+            })
+            .catch(err => {
+                vrStatusMsg.textContent = "Upload error";
+                vrStatusMsg.style.color = "#ef4444";
+                vrConnectBtn.disabled   = false;
+                console.error(err);
+            });
+    }
+
+    function vrConnectRtsp(url) {
+        vrStatusMsg.textContent = "Connecting...";
+        vrStatusMsg.style.color = "#94a3b8";
+        vrConnectBtn.disabled = true;
+
+        fetch("/api/connect_stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url })
+        })
+        .then(r => { if (!r.ok) return r.json().then(e => { throw new Error(e.detail); }); return r.json(); })
+        .then(data => {
+            vrStreamId  = data.stream_id;
+            vrVideoData = { video_id: data.stream_id, filename: url,
+                            width: data.width, height: data.height };
+            vrIsRtsp    = true;
+            vrStatusMsg.textContent = "✔ RTSP connected";
+            vrStatusMsg.style.color = "#10b981";
+            vrConnectBtn.disabled   = false;
+            vrRunBtn.disabled       = false;
+
+            // Show raw preview stream
+            vrPlaceholder.classList.add("hidden");
+            vrStreamImg.src = `/api/raw_stream/${data.stream_id}`;
+            vrStreamImg.classList.remove("hidden");
+        })
+        .catch(err => {
+            vrStatusMsg.textContent = "Connection failed";
+            vrStatusMsg.style.color = "#ef4444";
+            vrConnectBtn.disabled   = false;
+            alert("❌ " + err.message);
+        });
+    }
+
+    // ── Run ───────────────────────────────────────────────────────────────
+    vrRunBtn.addEventListener("click", () => {
+        if (!vrVideoData) return;
+
+        const payload = {
+            video_id:       vrVideoData.video_id,
+            filename:       vrVideoData.filename,
+            pipeline_name:  "vehicle_recognition",
+            roi_normalized: [],   // vehicle recognition needs no ROI polygon
+            config:         {},
+            stream_id:      vrStreamId || null
+        };
+
+        vrRunBtn.disabled = true;
+
+        fetch("/api/start_analysis", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        })
+        .then(r => { if (!r.ok) throw new Error("Failed to start."); return r.json(); })
+        .then(data => {
+            vrSessionId = data.session_id;
+            vrStartMode();
+        })
+        .catch(err => {
+            console.error(err);
+            alert("Error starting vehicle recognition: " + err.message);
+            vrRunBtn.disabled = false;
+        });
+    });
+
+    // ── Stop ──────────────────────────────────────────────────────────────
+    vrStopBtn.addEventListener("click", () => vrStopMode(true));
+
+    function vrStartMode() {
+        vrRunBtn.classList.add("hidden");
+        vrStopBtn.classList.remove("hidden");
+        vrStatusMsg.textContent = "🔴 Live";
+        vrStatusMsg.style.color = "#ef4444";
+
+        // Switch img to the annotated AI stream
+        vrStreamImg.src = `/api/stream/${vrSessionId}`;
+        vrStreamImg.classList.remove("hidden");
+        vrPlaceholder.classList.add("hidden");
+
+        vrLogContainer.innerHTML = '<p class="placeholder">Scanning…</p>';
+        vrSeenPlates.clear();
+
+        // Poll the session metadata for new detections
+        vrPollInterval = setInterval(vrPollDetections, 2000);
+    }
+
+    function vrStopMode(callApi = true) {
+        if (vrPollInterval) { clearInterval(vrPollInterval); vrPollInterval = null; }
+
+        if (callApi && vrSessionId) {
+            fetch(`/api/stop_analysis/${vrSessionId}`, { method: "POST" }).catch(() => {});
+        }
+        vrSessionId = null;
+
+        vrRunBtn.classList.remove("hidden");
+        vrRunBtn.disabled = false;
+        vrStopBtn.classList.add("hidden");
+        vrStatusMsg.textContent = vrVideoData ? "⏹ Stopped" : "No source selected";
+        vrStatusMsg.style.color = "#94a3b8";
+    }
+
+    // ── Detection polling (reads frame_metadata via /api/alerts endpoint) ─
+    // VehicleRecognitionPipeline emits no "alert" events; instead we parse
+    // the detections out of a lightweight dedicated endpoint below.
+    function vrPollDetections() {
+        if (!vrSessionId) return;
+
+        // We re-use the existing /api/alerts endpoint which returns []
+        // for vehicle_recognition (no alert events). For actual detection
+        // cards we call a thin metadata endpoint we add to main.py.
+        fetch(`/api/vr_detections/${vrSessionId}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (!data || !data.detections) return;
+                const placeholder = vrLogContainer.querySelector(".placeholder");
+                data.detections.forEach(det => {
+                    if (!det.plate || vrSeenPlates.has(det.plate)) return;
+                    vrSeenPlates.add(det.plate);
+                    if (placeholder) placeholder.remove();
+                    vrLogContainer.prepend(createVrCard(det));
+                });
+            })
+            .catch(() => {});
+    }
+
+    function createVrCard(det) {
+        const card = document.createElement("div");
+        card.className = "vr-card";
+        card.innerHTML = `
+            <div class="vr-plate">🚗 ${det.plate}</div>
+            <div class="vr-visits">Total Visits: <strong>${det.total_visits}</strong></div>
+            <div class="vr-time">${new Date().toLocaleTimeString()}</div>
+        `;
+        return card;
+    }
+});

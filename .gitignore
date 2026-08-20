@@ -8,6 +8,8 @@ dist/
 
 # ── Environment / Secrets ─────────────────────────────
 .env
+.venv/
+venv/
 *.pem
 
 # ── Session logs (generated at runtime) ───────────────
