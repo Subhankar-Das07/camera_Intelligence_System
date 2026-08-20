@@ -18,3 +18,7 @@ faiss-cpu
 supervision
 # Image I/O for face crop saving
 Pillow
+
+# ── Vehicle Recognition module (Pratyush) ────────────────────────────────────
+# RapidOCR (ONNX) for license plate text reading
+rapidocr-onnxruntime
