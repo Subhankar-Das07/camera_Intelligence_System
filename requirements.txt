@@ -22,3 +22,6 @@ Pillow
 # ── Vehicle Recognition module (Pratyush) ────────────────────────────────────
 # RapidOCR (ONNX) for license plate text reading
 rapidocr-onnxruntime
+
+# ── Redis (single application database) ──────────────────────────────────────
+redis
