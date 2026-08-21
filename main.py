@@ -333,7 +333,7 @@ async def guardian_scan(request: GuardianScanRequest):
     The frontend uses these to draw the Phase-1 selection overlay.
     """
     import numpy as _np
-    from ultralytics import YOLO as _YOLO
+    from ultralytics import FastSAM as _FastSAM
 
     # Resolve the video source
     if request.stream_id and request.stream_id in rtsp_streams:
@@ -363,10 +363,11 @@ async def guardian_scan(request: GuardianScanRequest):
 
     # Run YOLO inference in a thread pool to avoid blocking the event loop
     loop = asyncio.get_running_loop()
-    _model = _YOLO("yolov8n.pt")
+    _model = _FastSAM("FastSAM-s.pt")
 
     def _infer():
-        return _model(frame, verbose=False)[0]
+        # FastSAM standard inference
+        return _model(frame, conf=0.25, verbose=False)[0]
 
     results = await loop.run_in_executor(None, _infer)
 
@@ -375,7 +376,7 @@ async def guardian_scan(request: GuardianScanRequest):
         for i, box in enumerate(results.boxes):
             cls_id  = int(box.cls[0])
             conf    = float(box.conf[0])
-            label   = _model.names[cls_id]
+            label   = "Object"
             xywh    = box.xywh[0].cpu().numpy()
             cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
             # Normalise to [0,1] range, xywh format (top-left x,y + w,h)

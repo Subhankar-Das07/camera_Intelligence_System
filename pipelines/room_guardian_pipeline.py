@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from collections import deque
 
-from ultralytics import YOLO
+from ultralytics import FastSAM
 
 from core.base_pipeline import BaseVideoPipeline
 from core.video_source import get_video_source
@@ -63,7 +63,6 @@ class WatchedObject:
     label: str                          # class name or "Unknown-N"
     yolo_class_id: Optional[int]        # None for custom objects
     last_bbox: List[int]                # [x, y, w, h] pixels (absolute)
-    csrt_tracker: Any = field(default=None, repr=False)   # cv2 tracker or None
     template_bank: deque = field(default_factory=lambda: deque(maxlen=5), repr=False)
     frames_since_bank_update: int = 0
     missing_frames: int = 0
@@ -116,79 +115,38 @@ def _write_clip(frames: deque, output_path: str, fps: float, size: tuple) -> boo
     return True
 
 
-def _template_match(
-    frame: np.ndarray,
-    template: np.ndarray,
-    threshold: float = 0.50
-) -> tuple:
-    """
-    Try to re-locate a custom object by template matching.
-    Returns (found: bool, bbox: [x, y, w, h] | None).
-
-    Uses TM_CCOEFF_NORMED (normalised cross-correlation) which is robust to
-    lighting changes and works well for small-to-medium appearance patches.
-    Threshold 0.50 is intentionally permissive — CSRT takes over after
-    re-detection so precision is handled there.
-    """
-    if template is None or template.size == 0:
-        return False, None
+def _color_hist_match(frame, box, template_bank, threshold=0.45):
+    """Compare HSV histogram of a bounding box patch against the template bank."""
+    bx, by, bw, bh = box
     fh, fw = frame.shape[:2]
-    th, tw = template.shape[:2]
-    # Template must be smaller than the frame
-    if tw >= fw or th >= fh:
-        return False, None
+    
+    # Safe extract patch
+    bx = max(0, min(bx, fw - 1))
+    by = max(0, min(by, fh - 1))
+    bw = max(1, min(bw, fw - bx))
+    bh = max(1, min(bh, fh - by))
+    patch = frame[by:by+bh, bx:bx+bw]
+    if patch.size == 0:
+        return False
+        
     try:
-        gray_frame = cv2.cvtColor(frame,    cv2.COLOR_BGR2GRAY)
-        gray_tmpl  = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-        result = cv2.matchTemplate(gray_frame, gray_tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val >= threshold:
-            tx, ty = max_loc
-            return True, [tx, ty, tw, th]
-    except Exception as exc:
-        log.debug("[Guardian] Template match error: %s", exc)
-    return False, None
+        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        hist_patch = cv2.calcHist([hsv_patch], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        cv2.normalize(hist_patch, hist_patch, 0, 1, cv2.NORM_MINMAX)
+        
+        for template in reversed(template_bank):
+            hsv_tmpl = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+            hist_tmpl = cv2.calcHist([hsv_tmpl], [0, 1], None, [50, 60], [0, 180, 0, 256])
+            cv2.normalize(hist_tmpl, hist_tmpl, 0, 1, cv2.NORM_MINMAX)
+            
+            dist = cv2.compareHist(hist_tmpl, hist_patch, cv2.HISTCMP_BHATTACHARYYA)
+            if dist < threshold:
+                return True
+    except Exception as e:
+        log.debug(f"[Guardian] Hist match err: {e}")
+            
+    return False
 
-
-def _feature_match_scaled(frame, template, scales=(1.0, 0.8, 1.25), min_matches=8):
-    """ORB match against one template at a few scales, to catch size change."""
-    orb = cv2.ORB_create(nfeatures=500)
-    kp2, des2 = orb.detectAndCompute(frame, None)
-    if des2 is None:
-        return False, None
-    best = None
-    for s in scales:
-        th, tw = template.shape[:2]
-        resized = cv2.resize(template, (max(1, int(tw * s)), max(1, int(th * s))))
-        kp1, des1 = orb.detectAndCompute(resized, None)
-        if des1 is None:
-            continue
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = sorted(bf.match(des1, des2), key=lambda m: m.distance)
-        good = matches[:min_matches]
-        if len(good) < min_matches:
-            continue
-        src = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-        if H is None:
-            continue
-        h, w = resized.shape[:2]
-        corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-        proj = cv2.perspectiveTransform(corners, H)
-        x, y, w2, h2 = cv2.boundingRect(proj)
-        score = len(good)
-        if best is None or score > best[0]:
-            best = (score, [max(0, int(x)), max(0, int(y)), max(1, int(w2)), max(1, int(h2))])
-    return (True, best[1]) if best else (False, None)
-
-def _multi_template_match(frame, template_bank, **kwargs):
-    """Try the most recent templates first — recent appearance is most likely to still match."""
-    for template in reversed(template_bank):
-        found, bbox = _feature_match_scaled(frame, template, **kwargs)
-        if found:
-            return True, bbox
-    return False, None
 
 # Environment Profiles configuration
 ENV_PROFILES = {
@@ -221,9 +179,9 @@ class RoomGuardianPipeline(BaseVideoPipeline):
     Inherits BaseVideoPipeline; tracked via the standard registry + session system.
     """
 
-    def initialize(self, model_weight: str = "yolov8n.pt", **kwargs) -> None:
-        """Load the YOLO detection model."""
-        self.model = YOLO(model_weight)
+    def initialize(self, model_weight: str = "FastSAM-s.pt", **kwargs) -> None:
+        """Load the FastSAM detection model."""
+        self.model = FastSAM(model_weight)
         self.model_name = model_weight
         log.info("[Guardian] Initialized with model: %s", model_weight)
 
@@ -257,16 +215,16 @@ class RoomGuardianPipeline(BaseVideoPipeline):
         # Parse environment profile
         env_profile_name = config.get("environment_profile", "home")
         profile = ENV_PROFILES.get(env_profile_name, ENV_PROFILES["home"])
-        absence_threshold = int(fps * profile["absence_seconds"])
+        absence_threshold = 20  # Hardcoded to 20 frames per user request
         ring_buf_size     = max(1, int(fps * 2))  # 2 second ring buffer
         yolo_tracker_cfg  = config.get("tracker", profile["yolo_tracker"])
         custom_tracker_cfg= config.get("custom_tracker", profile["custom_tracker"])
         conf_threshold    = profile["conf_threshold"]
 
-        # Ensure correct model is loaded for this session
-        req_model_weight = config.get("model_weight", "yolo11n.pt")
+        # FastSAM is class-agnostic, always use FastSAM-s.pt
+        req_model_weight = config.get("model_weight", "FastSAM-s.pt")
         if not hasattr(self, "model_name") or self.model_name != req_model_weight:
-            self.model = YOLO(req_model_weight)
+            self.model = FastSAM(req_model_weight)
             self.model_name = req_model_weight
             log.info("[Guardian] Loaded model specific to session: %s", req_model_weight)
 
@@ -294,9 +252,6 @@ class RoomGuardianPipeline(BaseVideoPipeline):
             )
             watched.append(wo)
 
-        # Initialise CSRT trackers on the first valid frame
-        trackers_initialised = False
-
         # Rolling ring buffer of raw (un-annotated) frames
         ring_buffer: deque = deque(maxlen=ring_buf_size)
 
@@ -309,147 +264,118 @@ class RoomGuardianPipeline(BaseVideoPipeline):
 
             raw_frame = frame.copy()   # un-annotated copy for ring buffer
 
-            # ── Initialise CSRT trackers + extract appearance templates ────────
-            if not trackers_initialised:
+            # Extract initial templates on Frame 0
+            if frame_idx == 0:
                 for wo in watched:
-                    if wo.obj_type == "custom":
-                        x, y, w, h = wo.last_bbox
-                        # Clamp to frame bounds
-                        x = max(0, min(x, width  - 1))
-                        y = max(0, min(y, height - 1))
-                        w = max(1, min(w, width  - x))
-                        h = max(1, min(h, height - y))
-                        wo.last_bbox = [x, y, w, h]
+                    x, y, w, h = wo.last_bbox
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    w = max(1, min(w, width - x))
+                    h = max(1, min(h, height - y))
+                    wo.last_bbox = [x, y, w, h]
+                    patch = frame[y:y + h, x:x + w]
+                    if patch.size > 0:
+                        wo.template_bank.append(patch.copy())
 
-                        # Extract appearance template for re-detection fallback
-                        patch = frame[y:y + h, x:x + w]
-                        if patch.size > 0:
-                            wo.template_bank.append(patch.copy())
-                            log.debug("[Guardian] Template extracted for %s — size %dx%d",
-                                      wo.id, w, h)
+            # ── FastSAM inference (tracked) ──────────────────────────────────────
+            # FastSAM tracks all distinct objects it segments
+            yolo_results = self.model.track(frame, persist=True, tracker=yolo_tracker_cfg, conf=conf_threshold, verbose=False)[0]
 
-                        # Initialise configurable custom tracker
-                        if custom_tracker_cfg == "nano" and hasattr(cv2, "TrackerNano_create"):
-                            tracker = cv2.TrackerNano_create()
-                        elif custom_tracker_cfg == "vit" and hasattr(cv2, "TrackerVit_create"):
-                            tracker = cv2.TrackerVit_create()
-                        else:
-                            tracker = cv2.TrackerCSRT_create()
-                        tracker.init(frame, (x, y, w, h))
-                        wo.csrt_tracker = tracker
-                        log.debug("[Guardian] %s init for %s @ %s", custom_tracker_cfg.upper(), wo.id, (x, y, w, h))
-                trackers_initialised = True
+            # Collect all tracked bounding boxes
+            tracked_boxes = []
+            if yolo_results.boxes is not None:
+                for box in yolo_results.boxes:
+                    if box.id is None:
+                        continue
+                    xywh    = box.xywh[0].cpu().numpy()
+                    cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
+                    bx = int(cx - bw / 2)
+                    by = int(cy - bh / 2)
+                    track_id = int(box.id[0])
+                    det_box = [bx, by, int(bw), int(bh)]
+                    tracked_boxes.append({
+                        "bbox": det_box,
+                        "track_id": track_id
+                    })
 
-            # ── YOLO inference (tracked) ──────────────────────────────────────
-            yolo_results = None
-            detections_by_class: Dict[int, List[dict]] = {}
-            has_yolo_objects = any(wo.obj_type == "yolo" for wo in watched)
+            # Track which IDs have been assigned to watched objects in this frame
+            claimed_track_ids = set()
 
-            if has_yolo_objects:
-                yolo_results = self.model.track(frame, persist=True, tracker=yolo_tracker_cfg, conf=conf_threshold, verbose=False)[0]
+            # ── 1. Update watched objects by their existing track_id ────────
+            for wo in watched:
+                wo._found_this_frame = False
+                if wo.track_id is not None:
+                    for det in tracked_boxes:
+                        if det["track_id"] == wo.track_id:
+                            wo.last_bbox = det["bbox"]
+                            wo._found_this_frame = True
+                            claimed_track_ids.add(wo.track_id)
+                            break
 
-                if yolo_results.boxes is not None:
-                    for box in yolo_results.boxes:
-                        cls_id  = int(box.cls[0])
-                        xywh    = box.xywh[0].cpu().numpy()
-                        cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
-                        bx = int(cx - bw / 2)
-                        by = int(cy - bh / 2)
-                        track_id = int(box.id[0]) if box.id is not None else None
-                        det_box = [bx, by, int(bw), int(bh)]
-                        detections_by_class.setdefault(cls_id, []).append({
-                            "bbox": det_box,
-                            "track_id": track_id
-                        })
+            # ── 2. Spatial Re-association & Frame 0 Enrollment ──────────────
+            for wo in watched:
+                if wo._found_this_frame:
+                    continue
+                
+                # If the object lost its track ID (occlusion) OR it's Frame 0 (needs initial assignment),
+                # we do a spatial association: find the unassigned box with the highest IoU to last_bbox.
+                best_iou = 0.0
+                best_match = None
+                
+                for det in tracked_boxes:
+                    # Allow multiple watched objects to claim the same track_id if they merge
+                    iou = _iou(wo.last_bbox, det["bbox"])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match = det
+                
+                # For initial assignment (Frame 0), threshold is permissive (0.10).
+                # For occlusion recovery (Frame N), threshold is strict (0.65) to avoid swapping IDs with walking people.
+                req_iou = 0.10 if wo.track_id is None else 0.65
+                
+                if best_iou >= req_iou and best_match is not None:
+                    wo.track_id = best_match["track_id"]
+                    wo.last_bbox = best_match["bbox"]
+                    wo._found_this_frame = True
+                    claimed_track_ids.add(wo.track_id)
+                    log.debug(f"[Guardian] Re-associated {wo.id} to track_id {wo.track_id} (IoU {best_iou:.2f})")
 
-            # ── Per-object presence check ─────────────────────────────────────
+                # 2. Appearance Re-association (for moving objects)
+                if not wo._found_this_frame and len(wo.template_bank) > 0:
+                    best_match_tmpl = None
+                    for det in tracked_boxes:
+                        # We specifically do NOT check claimed_track_ids here.
+                        # If two objects are moved together (e.g. on a tray), FastSAM might merge them 
+                        # into a single track_id. Both WatchedObjects should be allowed to attach to it!
+                        
+                        # Compare color histograms to see if this FastSAM box is our object
+                        if _color_hist_match(frame, det["bbox"], wo.template_bank):
+                            best_match_tmpl = det
+                            break
+                            
+                    if best_match_tmpl is not None:
+                        wo.track_id = best_match_tmpl["track_id"]
+                        wo.last_bbox = best_match_tmpl["bbox"]
+                        wo._found_this_frame = True
+                        claimed_track_ids.add(wo.track_id)
+                        log.debug(f"[Guardian] Appearance re-associated {wo.id} to track_id {wo.track_id}")
+
+            # ── Countdown logic ───────────────────────────────────────────
             alert_event = None
 
             for wo in watched:
-                found = False
-
-                if wo.obj_type == "yolo" and wo.yolo_class_id is not None:
-                    candidates = detections_by_class.get(wo.yolo_class_id, [])
-                    best_match = None
-
-                    if wo.track_id is None:
-                        # First frame: Assign track ID based on highest IoU
-                        best_iou = 0.0
-                        for det in candidates:
-                            iou = _iou(wo.last_bbox, det["bbox"])
-                            if iou > best_iou:
-                                best_iou = iou
-                                best_match = det
-                        if best_iou >= 0.10 and best_match is not None:
-                            wo.track_id = best_match["track_id"]
-                            wo.last_bbox = best_match["bbox"]
-                            found = True
-                    else:
-                        # Subsequent frames: Find by track_id
-                        for det in candidates:
-                            if det["track_id"] == wo.track_id:
-                                best_match = det
-                                break
-                        if best_match is not None:
-                            wo.last_bbox = best_match["bbox"]
-                            found = True
-                        else:
-                            # Fallback: tracker lost ID (fast motion / occlusion). 
-                            # Re-acquire closest detection of same class that isn't claimed by another watched object.
-                            claimed_track_ids = {other_wo.track_id for other_wo in watched if other_wo != wo and other_wo.track_id is not None}
-                            
-                            best_iou = 0.0
-                            for det in candidates:
-                                if det["track_id"] in claimed_track_ids:
-                                    continue
-                                iou = _iou(wo.last_bbox, det["bbox"])
-                                if iou > best_iou:
-                                    best_iou = iou
-                                    best_match = det
-                            
-                            if best_iou >= 0.10 and best_match is not None:
-                                wo.track_id = best_match["track_id"]
-                                wo.last_bbox = best_match["bbox"]
-                                found = True
-
-                elif wo.obj_type == "custom" and wo.csrt_tracker is not None:
-                    # Primary: CSRT tracker update
-                    success, bbox = wo.csrt_tracker.update(frame)
-                    if success:
-                        x, y, w, h   = [int(v) for v in bbox]
-                        wo.last_bbox = [x, y, w, h]
-                        found        = True
-                    else:
-                        # Fallback: ORB feature matching — actively re-locate the object
-                        tm_found, new_bbox = _multi_template_match(frame, wo.template_bank)
-                        if tm_found and new_bbox is not None:
-                            nx, ny, nw, nh = new_bbox
-                            wo.last_bbox   = [nx, ny, nw, nh]
-                            # Re-init tracker at the re-detected location
-                            if custom_tracker_cfg == "nano" and hasattr(cv2, "TrackerNano_create"):
-                                new_tracker = cv2.TrackerNano_create()
-                            elif custom_tracker_cfg == "vit" and hasattr(cv2, "TrackerVit_create"):
-                                new_tracker = cv2.TrackerVit_create()
-                            else:
-                                new_tracker = cv2.TrackerCSRT_create()
-                            new_tracker.init(frame, (nx, ny, nw, nh))
-                            wo.csrt_tracker = new_tracker
-                            found = True
-                            log.debug("[Guardian] %s re-detected via ORB match @ %s",
-                                      wo.id, new_bbox)
-
-                # ── Countdown logic ───────────────────────────────────────────
+                found = wo._found_this_frame
+                
                 if found:
                     x, y, w, h = wo.last_bbox
                     wo.center_history.append((x + w/2, y + h/2))
                     
-                    if wo.obj_type == "custom":
-                        wo.frames_since_bank_update += 1
-                        if wo.frames_since_bank_update >= int(fps * 1.5):  # refresh ~every 1.5s
-                            patch = frame[y:y+h, x:x+w]
-                            if patch.size > 0:
-                                wo.template_bank.append(patch.copy())
-                            wo.frames_since_bank_update = 0
+                    wo.frames_since_bank_update += 1
+                    if wo.frames_since_bank_update >= int(fps * 1.5):  # refresh ~every 1.5s
+                        patch = frame[y:y+h, x:x+w]
+                        if patch.size > 0:
+                            wo.template_bank.append(patch.copy())
+                        wo.frames_since_bank_update = 0
                     
                     was_missing = wo.missing_frames > 0
                     wo.missing_frames = 0

@@ -2,8 +2,6 @@ from typing import Dict, Type
 from core.base_pipeline import BaseVideoPipeline
 from pipelines.intrusion_pipeline import IntrusionDetectionPipeline
 from pipelines.danger_zone_pipeline import DangerZonePipeline
-from pipelines.fall_detection_pipeline import FallDetectionPipeline
-
 class PipelineRegistry:
     def __init__(self):
         self._registry: Dict[str, Type[BaseVideoPipeline]] = {}
@@ -35,8 +33,6 @@ registry = PipelineRegistry()
 # Register out-of-the-box pipelines
 registry.register("intrusion_detection", IntrusionDetectionPipeline)
 registry.register("danger_zone", DangerZonePipeline)
-registry.register("fall_detection", FallDetectionPipeline)
-
 # Room Guardian pipeline (decoupled — tracks user-selected objects, alerts on disappearance)
 from pipelines.room_guardian_pipeline import RoomGuardianPipeline
 registry.register("room_guardian", RoomGuardianPipeline)
