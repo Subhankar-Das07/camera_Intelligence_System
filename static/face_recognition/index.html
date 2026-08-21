@@ -55,6 +55,15 @@
 
         <!-- ── Left Panel: Live Feed + Source Control ───────────────────────── -->
         <aside class="fr-sidebar">
+            <!-- Mode Selector -->
+            <section class="fr-panel">
+                <label class="fr-hint" style="display:block; margin-bottom:0.3rem">Operation Mode</label>
+                <select id="mode-selector" class="fr-input" style="font-weight:600; margin-bottom:0">
+                    <option value="visitor">Visitor Identification</option>
+                    <option value="attendance">Attendance Tracker</option>
+                </select>
+            </section>
+
             <section class="fr-panel">
                 <h2 class="fr-panel-title">📹 Live Source</h2>
 
@@ -90,39 +99,62 @@
                 </div>
             </section>
 
-            <!-- Register New Person -->
-            <section class="fr-panel">
-                <h2 class="fr-panel-title">➕ Register Person</h2>
-                <p class="fr-hint">Optional: upload a clear front-facing photo to pre-register a person with a real name.
-                The system <strong>auto-saves every unique face</strong> it sees from live video too — they appear as <em>Unknown_NNN</em> and can be renamed below.</p>
+            <!-- Visitor Controls -->
+            <div id="fr-visitor-controls">
+                <section class="fr-panel">
+                    <h2 class="fr-panel-title">➕ Register Person</h2>
+                    <p class="fr-hint">Optional: upload a clear front-facing photo to pre-register a person with a real name.
+                    The system <strong>auto-saves every unique face</strong> it sees from live video too — they appear as <em>Unknown_NNN</em> and can be renamed below.</p>
 
-                <input type="text" id="reg-name" class="fr-input" placeholder="Name (leave blank for auto-label)" />
+                    <input type="text" id="reg-name" class="fr-input" placeholder="Name (leave blank for auto-label)" />
 
-                <div class="fr-reg-methods">
-                    <div class="fr-reg-method" id="reg-upload-method">
-                        <label class="fr-upload-drop" id="reg-drop-zone">
-                            <input type="file" id="reg-photo" accept="image/*" hidden>
-                            <span class="fr-upload-icon">📷</span>
-                            <span>Drop photo or click</span>
-                        </label>
-                        <div class="fr-reg-preview hidden" id="reg-preview">
-                            <img id="reg-preview-img" alt="Preview" />
+                    <div class="fr-reg-methods">
+                        <div class="fr-reg-method" id="reg-upload-method">
+                            <label class="fr-upload-drop" id="reg-drop-zone">
+                                <input type="file" id="reg-photo" accept="image/*" hidden>
+                                <span class="fr-upload-icon">📷</span>
+                                <span>Drop photo or click</span>
+                            </label>
+                            <div class="fr-reg-preview hidden" id="reg-preview">
+                                <img id="reg-preview-img" alt="Preview" />
+                            </div>
                         </div>
+
+                        <div class="fr-divider-or">— OR —</div>
+
+                        <button class="fr-btn fr-btn-secondary" id="reg-snapshot-btn" disabled title="Start a stream first, then click to capture">
+                            📸 Snapshot from Live Feed
+                        </button>
                     </div>
 
-                    <div class="fr-divider-or">— OR —</div>
-
-                    <button class="fr-btn fr-btn-secondary" id="reg-snapshot-btn" disabled title="Start a stream first, then click to capture">
-                        📸 Snapshot from Live Feed
+                    <button class="fr-btn fr-btn-register" id="reg-submit-btn" disabled>
+                        ✓ Register Identity
                     </button>
-                </div>
 
-                <button class="fr-btn fr-btn-register" id="reg-submit-btn" disabled>
-                    ✓ Register Identity
-                </button>
+                    <div class="fr-reg-feedback hidden" id="reg-feedback"></div>
+                </section>
+            </div>
 
-                <div class="fr-reg-feedback hidden" id="reg-feedback"></div>
-            </section>
+            <!-- Attendance Controls -->
+            <div id="fr-attendance-controls" class="hidden">
+                <section class="fr-panel">
+                    <h2 class="fr-panel-title">➕ Register for Attendance</h2>
+                    <p class="fr-hint">Explicitly register people for attendance tracking. Unknown faces will <strong>NOT</strong> be auto-registered.</p>
+                    
+                    <input type="text" id="att-reg-name" class="fr-input" placeholder="Full Name" />
+                    
+                    <div class="fr-reg-methods">
+                        <button class="fr-btn fr-btn-secondary" id="att-reg-snapshot-btn" disabled title="Start a stream first, then click to capture">
+                            📸 Snapshot from Live Feed
+                        </button>
+                    </div>
+
+                    <button class="fr-btn fr-btn-register" id="att-reg-submit-btn" disabled>
+                        ✓ Register Identity
+                    </button>
+                    <div class="fr-reg-feedback hidden" id="att-reg-feedback"></div>
+                </section>
+            </div>
         </aside>
 
         <!-- ── Center Panel: Live Recognition Feed ──────────────────────────── -->
@@ -157,12 +189,12 @@
         <!-- ── Right Panel: Identity Manager ────────────────────────────────── -->
         <aside class="fr-identity-panel">
             <div class="fr-panel-header">
-                <h2 class="fr-panel-title">🗂️ Identity Manager</h2>
+                <h2 class="fr-panel-title" id="right-panel-title">🗂️ Identity Manager</h2>
                 <button class="fr-btn fr-btn-icon" id="refresh-identities-btn" title="Refresh">↻</button>
             </div>
 
             <div class="fr-identity-filter">
-                <button class="fr-filter-tab active" data-filter="known">Known</button>
+                <button class="fr-filter-tab active" data-filter="known" id="filter-known-btn">Known</button>
                 <button class="fr-filter-tab" data-filter="blank">&nbsp;</button>
             </div>
 

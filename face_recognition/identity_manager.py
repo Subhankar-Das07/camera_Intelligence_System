@@ -51,8 +51,14 @@ class IdentityManager:
     All persons are treated the same — no known/unknown split.
     """
 
-    def __init__(self):
+    def __init__(self, base_dir: str = BASE_DIR):
         self._lock = threading.RLock()
+        self._base_dir = base_dir
+
+        self._persons_dir = os.path.join(self._base_dir, PERSONS_DIR)
+        self._identities_file = os.path.join(self._base_dir, IDENTITIES_FILE)
+        self._embeddings_file = os.path.join(self._base_dir, EMBEDDINGS_FILE)
+        self._faiss_index_file = os.path.join(self._base_dir, FAISS_INDEX_FILE)
 
         # {person_id: {"label": str, "created_at": float, "named": bool, "face_count": int}}
         self._identities: Dict[str, dict] = {}
@@ -73,8 +79,8 @@ class IdentityManager:
 
     def _ensure_dirs(self):
         """Create storage directories if they don't exist."""
-        os.makedirs(BASE_DIR, exist_ok=True)
-        os.makedirs(PERSONS_DIR, exist_ok=True)
+        os.makedirs(self._base_dir, exist_ok=True)
+        os.makedirs(self._persons_dir, exist_ok=True)
 
     # ── Disk I/O ───────────────────────────────────────────────────────────────
 
@@ -82,9 +88,9 @@ class IdentityManager:
         """Load all persisted data into memory on startup."""
         with self._lock:
             # Load identities metadata
-            if os.path.exists(IDENTITIES_FILE):
+            if os.path.exists(self._identities_file):
                 try:
-                    with open(IDENTITIES_FILE, "r", encoding="utf-8") as f:
+                    with open(self._identities_file, "r", encoding="utf-8") as f:
                         self._identities = json.load(f)
                     log.info("[IdentityManager] Loaded %d identities from disk.", len(self._identities))
                 except Exception as e:
@@ -94,9 +100,9 @@ class IdentityManager:
                 self._identities = {}
 
             # Load embeddings
-            if os.path.exists(EMBEDDINGS_FILE):
+            if os.path.exists(self._embeddings_file):
                 try:
-                    data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
+                    data = np.load(self._embeddings_file, allow_pickle=False)
                     self._embeddings = {k: data[k] for k in data.files}
                     log.info("[IdentityManager] Loaded embeddings for %d persons.", len(self._embeddings))
                 except Exception as e:
@@ -111,7 +117,7 @@ class IdentityManager:
     def _save_identities(self):
         """Flush identity metadata to disk."""
         try:
-            with open(IDENTITIES_FILE, "w", encoding="utf-8") as f:
+            with open(self._identities_file, "w", encoding="utf-8") as f:
                 json.dump(self._identities, f, indent=2)
         except Exception as e:
             log.error("[IdentityManager] Failed to save identities.json: %s", e)
@@ -119,7 +125,7 @@ class IdentityManager:
     def _save_embeddings(self):
         """Flush all embeddings to disk."""
         try:
-            np.savez(EMBEDDINGS_FILE, **self._embeddings)
+            np.savez(self._embeddings_file, **self._embeddings)
         except Exception as e:
             log.error("[IdentityManager] Failed to save embeddings.npz: %s", e)
 
@@ -127,7 +133,7 @@ class IdentityManager:
         """Write FAISS index to disk."""
         if self._faiss_index is not None:
             try:
-                faiss.write_index(self._faiss_index, FAISS_INDEX_FILE)
+                faiss.write_index(self._faiss_index, self._faiss_index_file)
             except Exception as e:
                 log.error("[IdentityManager] Failed to save FAISS index: %s", e)
 
@@ -224,7 +230,7 @@ class IdentityManager:
 
             # Save face crops to persons/PID/
             if face_crops:
-                person_dir = os.path.join(PERSONS_DIR, pid)
+                person_dir = os.path.join(self._persons_dir, pid)
                 os.makedirs(person_dir, exist_ok=True)
                 for i, crop in enumerate(face_crops):
                     crop_path = os.path.join(person_dir, f"face_{i + 1:03d}.jpg")
@@ -318,13 +324,19 @@ class IdentityManager:
 
     def get_face_thumbnail_url(self, person_id: str) -> Optional[str]:
         """Return URL to first saved face crop for this person."""
-        person_dir = os.path.join(PERSONS_DIR, person_id)
+        person_dir = os.path.join(self._persons_dir, person_id)
         if not os.path.isdir(person_dir):
             return None
         crops = sorted(os.listdir(person_dir))
         if not crops:
             return None
-        rel = os.path.join("face_data", "persons", person_id, crops[0])
+        # We need to construct the URL. `face_data` maps to BASE_DIR. `attendance_data` is separate?
+        # Let's check how main.py serves this.
+        # It's better to just use relative mapping, but since it depends on the mount point...
+        if "attendance_data" in self._base_dir:
+            rel = os.path.join("attendance_data", "persons", person_id, crops[0])
+        else:
+            rel = os.path.join("face_data", "persons", person_id, crops[0])
         return "/" + rel.replace("\\", "/")
 
     def get_stats(self) -> dict:

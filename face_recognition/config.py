@@ -23,10 +23,11 @@ import os
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR             = os.path.join("face_recognition", "data")
-PERSONS_DIR          = os.path.join(BASE_DIR, "persons")   # ONE folder for everyone
-IDENTITIES_FILE      = os.path.join(BASE_DIR, "identities.json")
-EMBEDDINGS_FILE      = os.path.join(BASE_DIR, "embeddings.npz")
-FAISS_INDEX_FILE     = os.path.join(BASE_DIR, "faces.faiss")
+ATTENDANCE_DIR       = os.path.join("face_recognition", "attendance_data")
+PERSONS_DIR          = "persons"   # Relative to base_dir
+IDENTITIES_FILE      = "identities.json"
+EMBEDDINGS_FILE      = "embeddings.npz"
+FAISS_INDEX_FILE     = "faces.faiss"
 MODELS_CACHE_DIR     = os.path.join("face_recognition", "models")
 
 # ── InsightFace / Detection ───────────────────────────────────────────────────

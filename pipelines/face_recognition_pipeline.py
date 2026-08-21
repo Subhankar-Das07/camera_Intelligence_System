@@ -34,7 +34,7 @@ from core.video_source import get_video_source
 from face_recognition.config import (
     COLOR_KNOWN, COLOR_UNKNOWN, COLOR_LOW_QUALITY, COLOR_CANDIDATE,
     RECOGNITION_EVERY_N_FRAMES,
-    AUTO_LABEL_PREFIX,
+    AUTO_LABEL_PREFIX, BASE_DIR, ATTENDANCE_DIR
 )
 from face_recognition.embedder import FaceEmbedder
 from face_recognition.tracker import FaceTracker, TrackedFace
@@ -57,8 +57,10 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
     def __init__(self):
         self._embedder: Optional[FaceEmbedder] = None
         self._tracker: Optional[FaceTracker] = None
-        self._recognizer: Optional[FaceRecognizer] = None
-        self._identity_manager: Optional[IdentityManager] = None
+        self._visitor_recognizer: Optional[FaceRecognizer] = None
+        self._attendance_recognizer: Optional[FaceRecognizer] = None
+        self._visitor_manager: Optional[IdentityManager] = None
+        self._attendance_manager: Optional[IdentityManager] = None
         self._initialized = False
 
     # ── BaseVideoPipeline interface ────────────────────────────────────────────
@@ -69,13 +71,16 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
         InsightFace models are downloaded on first call (cached after).
         """
         log.info("[FaceRecognitionPipeline] Initializing sub-modules…")
-        self._identity_manager = IdentityManager()
+        self._visitor_manager   = IdentityManager(BASE_DIR)
+        self._attendance_manager = IdentityManager(ATTENDANCE_DIR)
         self._embedder         = FaceEmbedder()
         self._tracker          = FaceTracker()
-        self._recognizer       = FaceRecognizer(self._identity_manager)
+        self._visitor_recognizer = FaceRecognizer(self._visitor_manager)
+        self._attendance_recognizer = FaceRecognizer(self._attendance_manager)
         self._initialized = True
-        log.info("[FaceRecognitionPipeline] Ready. Identities in DB: %d",
-                 len(self._identity_manager.get_all_identities()))
+        log.info("[FaceRecognitionPipeline] Ready. Visitor IDs: %d | Attendance IDs: %d",
+                 len(self._visitor_manager.get_all_identities()),
+                 len(self._attendance_manager.get_all_identities()))
 
     def process_frame(
         self,
@@ -141,6 +146,7 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
         Returns:
             (annotated_frame, alert_event_or_None)
         """
+        mode = config.get("mode", "visitor")
         do_recognition = (frame_idx % RECOGNITION_EVERY_N_FRAMES == 0)
 
         # Step 1: Detect + embed (every frame, but embedding gated by quality)
@@ -155,12 +161,18 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
 
         for tf in tracked_faces:
             if do_recognition and tf.is_quality and tf.embedding is not None:
-                rec = self._recognizer.classify(tf.track_id, tf.embedding, self._tracker)
+                if mode == "attendance":
+                    rec = self._attendance_recognizer.classify(tf.track_id, tf.embedding, self._tracker, auto_register=False)
+                    active_recognizer = self._attendance_recognizer
+                else:
+                    rec = self._visitor_recognizer.classify(tf.track_id, tf.embedding, self._tracker, auto_register=True)
+                    active_recognizer = self._visitor_recognizer
+                
                 results_map[tf.track_id] = rec
 
                 # Fire alert event on fresh commitment (within 0.5s of commit)
                 if rec.status == "recognised" and rec.person_id:
-                    state = self._recognizer._track_states.get(tf.track_id)
+                    state = active_recognizer._track_states.get(tf.track_id)
                     if state and state.committed_at and (time.time() - state.committed_at) < 0.5:
                         alert_event = {
                             "id":        str(uuid.uuid4()),
@@ -171,14 +183,16 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
                             "timestamp": time.strftime("%H:%M:%S"),
                             "type":      "face_recognised",
                         }
-            elif tf.track_id in self._recognizer._track_states:
-                # Reuse last result for non-recognition frames
-                state = self._recognizer._track_states[tf.track_id]
-                if state.last_result:
-                    results_map[tf.track_id] = state.last_result
+            else:
+                active_recognizer = self._attendance_recognizer if mode == "attendance" else self._visitor_recognizer
+                if tf.track_id in active_recognizer._track_states:
+                    # Reuse last result for non-recognition frames
+                    state = active_recognizer._track_states[tf.track_id]
+                    if state.last_result:
+                        results_map[tf.track_id] = state.last_result
 
         # Step 4: Annotate frame
-        annotated = self._annotate(frame, tracked_faces, results_map)
+        annotated = self._annotate(frame, tracked_faces, results_map, mode)
 
         # Step 5: Draw HUD stats
         annotated = self._draw_hud(annotated)
@@ -192,6 +206,7 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
         frame: np.ndarray,
         tracked_faces: List[TrackedFace],
         results_map: Dict[int, RecognitionResult],
+        mode: str = "visitor",
     ) -> np.ndarray:
         """Draw bounding boxes and labels on frame. Returns new annotated copy."""
         out = frame.copy()
@@ -214,12 +229,16 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
                 # If confidence == 0, they were just auto-saved for the first time in this session (unknown)
                 is_known_to_system = (rec.confidence > 0.0)
 
-                if is_known_to_system:
+                if mode == "attendance":
                     color = COLOR_KNOWN      # Green
-                    prefix = "Known: "
+                    prefix = "Present: "
                 else:
-                    color = COLOR_UNKNOWN    # Orange
-                    prefix = "Unknown: "
+                    if is_known_to_system:
+                        color = COLOR_KNOWN      # Green
+                        prefix = "Known: "
+                    else:
+                        color = COLOR_UNKNOWN    # Orange
+                        prefix = "Unknown: "
                 
                 pct   = int(rec.confidence * 100)
                 base_label = f"{rec.label} ({pct}%)" if pct > 0 else rec.label
@@ -228,6 +247,10 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
             elif rec.status == "scanning":
                 color = COLOR_CANDIDATE  # Blue
                 label = rec.label        # "Scanning... (N/3)"
+
+            elif rec.status == "unknown":
+                color = (0, 0, 255)      # Red for unregistered in attendance
+                label = "Unregistered"
 
             else:
                 color = COLOR_LOW_QUALITY
@@ -259,7 +282,7 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
 
     def _draw_hud(self, frame: np.ndarray) -> np.ndarray:
         """Draw top-left status overlay on the frame."""
-        stats   = self.get_identity_manager().get_stats()
+        stats   = self.get_visitor_manager().get_stats()
         total   = stats["total_identities"]
 
         pad = 10
@@ -272,10 +295,16 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
 
         return frame
 
-    # ── Utility: expose identity_manager for API endpoints ────────────────────
+    # ── Utility: expose identity_managers for API endpoints ────────────────────
 
-    def get_identity_manager(self) -> IdentityManager:
-        """Allow main.py API endpoints to access the shared identity store."""
+    def get_visitor_manager(self) -> IdentityManager:
+        """Allow main.py API endpoints to access the visitor identity store."""
         if not self._initialized:
             self.initialize()
-        return self._identity_manager
+        return self._visitor_manager
+
+    def get_attendance_manager(self) -> IdentityManager:
+        """Allow main.py API endpoints to access the attendance identity store."""
+        if not self._initialized:
+            self.initialize()
+        return self._attendance_manager
