@@ -1,5 +1,7 @@
 # 📖 Camera Intelligence System — Setup & Developer Guide
 
+**New teammates:** start here → [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) (Docker install, Hub pull, Git feature branches, merge & conflicts).
+
 A robust, real-time computer vision platform designed to run AI pipelines on both **RTSP IP Cameras (NVRs)** and **Android smartphones**. The system uses a FastAPI Python backend to perform YOLO object detection and tracking, serving a responsive Web Dashboard for management and a Flutter Mobile App for edge camera streaming.
 
 ---
