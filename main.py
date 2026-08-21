@@ -124,6 +124,24 @@ class ProcessRequest(BaseModel):
     config: Dict[str, Any] = {}
     stream_id: Optional[str] = None   # set when sourcing from a live RTSP session
 
+# ── Guardian Models ──────────────────────────────────────────────────────────
+class GuardianScanRequest(BaseModel):
+    stream_id: Optional[str] = None
+    filename: Optional[str] = None
+
+class WatchedObject(BaseModel):
+    id: str
+    type: str
+    label: str
+    class_id: Optional[int] = None
+    bbox_normalized: List[float]
+
+class GuardianStartRequest(BaseModel):
+    stream_id: Optional[str] = None
+    video_id: Optional[str] = None
+    filename: Optional[str] = None
+    watched_objects: List[WatchedObject]
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _socket_check(url: str, timeout: float = 3.0) -> Optional[str]:
     """Return None if host:port is reachable, or an error string if not.
@@ -591,6 +609,130 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
 def get_vr_detections(session_id: str):
     """Return the list of confirmed unique plates detected in a VR session."""
     return {"detections": _get_vr_detections(session_id)}
+
+
+# ── Guardian endpoints ────────────────────────────────────────────────────────
+# These are fully decoupled from the existing pipeline endpoints.
+# They use the same session/alert infrastructure but are namespaced under /api/guardian/.
+
+@app.post("/api/guardian/scan")
+async def guardian_scan(request: GuardianScanRequest):
+    """
+    Run a one-shot YOLO detection on a single frame and return bounding boxes.
+    The frontend uses these to draw the Phase-1 selection overlay.
+    """
+    import numpy as _np
+    from ultralytics import FastSAM as _FastSAM
+
+    # Resolve the video source
+    if request.stream_id and request.stream_id in rtsp_streams:
+        cam = rtsp_streams[request.stream_id]
+        ret, frame = cam.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=503, detail="Could not read frame from stream.")
+        width, height = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    elif request.filename:
+        file_path = os.path.join(UPLOAD_DIR, request.filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Video file not found.")
+        cap = cv2.VideoCapture(file_path)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise HTTPException(status_code=400, detail="Could not read video frame.")
+        height, width = frame.shape[:2]
+    else:
+        raise HTTPException(status_code=400, detail="Provide stream_id or filename.")
+
+    # Save a preview still for the frontend to display
+    scan_preview_id = str(uuid.uuid4())
+    preview_fn      = f"guardian_scan_{scan_preview_id}.jpg"
+    preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
+    cv2.imwrite(preview_path, frame)
+
+    # Run YOLO inference in a thread pool to avoid blocking the event loop
+    loop = asyncio.get_running_loop()
+    _model = _FastSAM("FastSAM-s.pt")
+
+    def _infer():
+        # FastSAM standard inference
+        return _model(frame, conf=0.25, verbose=False)[0]
+
+    results = await loop.run_in_executor(None, _infer)
+
+    detections = []
+    if results.boxes is not None:
+        for i, box in enumerate(results.boxes):
+            cls_id  = int(box.cls[0])
+            conf    = float(box.conf[0])
+            label   = "Object"
+            xywh    = box.xywh[0].cpu().numpy()
+            cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
+            # Normalise to [0,1] range, xywh format (top-left x,y + w,h)
+            nx = (cx - bw / 2) / width
+            ny = (cy - bh / 2) / height
+            nw = bw / width
+            nh = bh / height
+            detections.append({
+                "id":             f"yolo-{i}-{str(uuid.uuid4())[:8]}",
+                "label":          label,
+                "class_id":       cls_id,
+                "confidence":     round(conf, 2),
+                "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
+            })
+
+    return {
+        "preview_url": f"/storage/previews/{preview_fn}",
+        "width":       width,
+        "height":      height,
+        "detections":  detections,
+    }
+
+
+@app.post("/api/guardian/start")
+async def guardian_start(request: GuardianStartRequest):
+    """
+    Start a guardian analysis session.
+    Returns a session_id compatible with /api/stream/{session_id} and /api/alerts/{session_id}.
+    """
+    if not request.watched_objects:
+        raise HTTPException(status_code=400, detail="No watched_objects provided.")
+
+    # Serialise watched objects for the pipeline config
+    watched_list = [
+        {
+            "id":              wo.id,
+            "type":            wo.type,
+            "label":           wo.label,
+            "class_id":        wo.class_id,
+            "bbox_normalized": wo.bbox_normalized,
+        }
+        for wo in request.watched_objects
+    ]
+
+    # Build a ProcessRequest-compatible record so the existing /api/stream endpoint works
+    session_id = str(uuid.uuid4())
+
+    # Determine source
+    filename  = request.filename or ""
+    stream_id = request.stream_id or None
+
+    # We store a ProcessRequest-like object (dict is fine — stream_video reads .pipeline_name etc.)
+    from types import SimpleNamespace
+    fake_req = SimpleNamespace(
+        video_id      = request.video_id or session_id,
+        filename      = filename,
+        pipeline_name = "room_guardian",
+        roi_normalized= [],
+        config        = {"watched_objects": watched_list},
+        stream_id     = stream_id,
+    )
+
+    active_sessions[session_id] = fake_req
+    session_alerts[session_id]  = []
+    stop_events[session_id]     = threading.Event()
+
+    return {"session_id": session_id}
 
 
 # Mount static root last
