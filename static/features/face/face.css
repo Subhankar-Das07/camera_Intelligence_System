@@ -563,8 +563,12 @@
 }
 .fr-identity-type.known   { background: var(--known-bg);   color: var(--known);   }
 .fr-identity-type.unknown { background: var(--unknown-bg); color: var(--unknown); }
+.fr-identity-type.present { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+.fr-identity-type.absent  { background: rgba(239, 68, 68, 0.15);  color: #ef4444; }
+.fr-identity-type.not-seen{ background: rgba(100, 116, 139, 0.15); color: #94a3b8; }
 
-.fr-identity-rename-btn {
+.fr-identity-rename-btn,
+.fr-identity-delete-btn {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--text-muted);
@@ -576,6 +580,7 @@
     flex-shrink: 0;
 }
 .fr-identity-rename-btn:hover { border-color: var(--fr-accent-2); color: var(--fr-accent-2); }
+.fr-identity-delete-btn:hover { border-color: var(--danger, #ef4444); color: var(--danger, #ef4444); }
 
 /* ── Rename Modal ────────────────────────────────────────────────────────── */
 .fr-modal {

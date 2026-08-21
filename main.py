@@ -112,6 +112,13 @@ def _get_vr_detections(session_id: str) -> List[Dict[str, Any]]:
             continue
     return out
 
+# Attendance Session state
+attendance_session = {
+    "active": False,
+    "start_time": None,
+    "present_ids": set()
+}
+
 # ── Pydantic models ──────────────────────────────────────────────────────────
 class RtspConnectRequest(BaseModel):
     url: str
@@ -196,6 +203,9 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
             break
         if alert_event:
             _append_session_alert(session_id, alert_event)
+            if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
+                if attendance_session["active"]:
+                    attendance_session["present_ids"].add(alert_event["person_id"])
         if frame is not None:
             ok, buf = cv2.imencode('.jpg', frame)
             if not ok:
@@ -438,24 +448,29 @@ def _get_fr_pipeline():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Face recognition pipeline unavailable: {e}")
 
+def _get_identity_manager(mode: str = "visitor"):
+    pipeline = _get_fr_pipeline()
+    if mode == "attendance":
+        return pipeline.get_attendance_manager()
+    return pipeline.get_visitor_manager()
+
 
 @app.get("/api/faces/status")
-async def face_status():
+async def face_status(mode: str = "visitor"):
     """Return stats about the face identity database."""
-    pipeline = _get_fr_pipeline()
-    return pipeline.get_identity_manager().get_stats()
+    im = _get_identity_manager(mode)
+    return im.get_stats()
 
 
 @app.get("/api/faces/identities")
-async def list_identities():
+async def list_identities(mode: str = "visitor"):
     """Return all registered identities with metadata and thumbnail URLs."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     identities = im.get_all_identities()
     result = []
     for pid, meta in identities.items():
         entry = {"person_id": pid, **meta}
-        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid)
+        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid, mode)
         result.append(entry)
     result.sort(key=lambda x: x.get("created_at", 0))
     return {"identities": result}
@@ -464,12 +479,13 @@ async def list_identities():
 @app.post("/api/faces/register")
 async def register_face(
     label: Optional[str] = None,
+    mode: str = "visitor",
     file: UploadFile = File(...),
 ):
     """Register a new known person from an uploaded face image."""
     import numpy as np
     pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
     contents = await file.read()
@@ -497,7 +513,7 @@ async def register_face(
 
 
 @app.post("/api/faces/snapshot/{stream_id}")
-async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
+async def snapshot_and_register(stream_id: str, label: Optional[str] = None, mode: str = "visitor"):
     """Grab current frame from live RTSP stream, detect face, register it."""
     import numpy as np
     cam = rtsp_streams.get(stream_id)
@@ -509,7 +525,7 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
         raise HTTPException(status_code=503, detail="Could not read frame from stream.")
 
     pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
     faces = embedder.detect_and_embed(frame)
@@ -528,10 +544,9 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
 
 
 @app.patch("/api/faces/identity/{person_id}")
-async def rename_identity(person_id: str, body: FaceRenameRequest):
+async def rename_identity(person_id: str, body: FaceRenameRequest, mode: str = "visitor"):
     """Rename an existing identity."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     success = im.rename_identity(person_id, body.new_label)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
@@ -539,21 +554,40 @@ async def rename_identity(person_id: str, body: FaceRenameRequest):
 
 
 @app.delete("/api/faces/identity/{person_id}")
-async def delete_identity(person_id: str):
+async def delete_identity(person_id: str, mode: str = "visitor"):
     """Delete a person from the database entirely."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     success = im.delete_identity(person_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
     return {"person_id": person_id, "status": "deleted"}
 
+# ── Attendance Session Management ────────────────────────────────────────────
+
+@app.post("/api/attendance/start")
+def start_attendance_session():
+    attendance_session["active"] = True
+    attendance_session["start_time"] = time.time()
+    attendance_session["present_ids"] = set()
+    return {"status": "started"}
+
+@app.post("/api/attendance/stop")
+def stop_attendance_session():
+    attendance_session["active"] = False
+    return {"status": "stopped", "present_ids": list(attendance_session["present_ids"])}
+
+@app.get("/api/attendance/status")
+def get_attendance_status():
+    return {
+        "active": attendance_session["active"],
+        "present_ids": list(attendance_session["present_ids"])
+    }
+
 
 @app.get("/api/faces/image/{person_id}/{index}")
-def face_image(person_id: str, index: int = 1):
+async def face_image(person_id: str, index: int, mode: str = "visitor"):
     """Serve a face crop JPEG stored in Redis."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     data = im.get_face_bytes(person_id, index)
     if not data:
         raise HTTPException(status_code=404, detail="Face image not found.")
@@ -573,6 +607,11 @@ def vr_image(kind: str, plate: str, visit: int):
         raise HTTPException(status_code=404, detail="Image not found.")
     return Response(content=data, media_type="image/jpeg")
 
+
+_ATT_DATA_DIR = os.path.join("face_recognition", "attendance_data")
+os.makedirs(_ATT_DATA_DIR, exist_ok=True)
+os.makedirs(os.path.join(_ATT_DATA_DIR, "persons"), exist_ok=True)
+app.mount("/attendance_data", StaticFiles(directory=_ATT_DATA_DIR), name="attendance_data")
 
 # Serve face recognition dashboard (separate sub-page)
 _FR_STATIC_DIR = os.path.join("static", "face_recognition")

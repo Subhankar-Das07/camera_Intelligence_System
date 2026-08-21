@@ -133,3 +133,20 @@ face_recognition/data/
 | `SHARPNESS_THRESHOLD` | 50.0 | Laplacian variance gate |
 | `CANDIDATE_MIN_EMBEDDINGS` | 3 | embeddings before new ID |
 | `RECOGNITION_EVERY_N_FRAMES` | 3 | 1-in-N frame recognition |
+
+---
+
+## Session: 2026-08-20 — Attendance Tracking Implementation
+
+### What was added
+1. **Dual Identity Databases**: Separated identity storage (`attendance_data`) for the Attendance mode. `IdentityManager` now accepts a `base_dir` initialization parameter.
+2. **Attendance Tracker Mode**: Added an Operation Mode selector to the UI. When enabled:
+   - Auto-registration of unknown faces is disabled via a new `auto_register=False` flag in `FaceRecognizer.classify()`.
+   - Known users (students) are marked as `Present` (green bounding box).
+   - Unknown people are marked as `Unknown` (red bounding box) but not saved.
+   - When the session completes, any registered student that was not seen is marked as `Absent` (red).
+3. **Session APIs**: Added `/api/attendance/start`, `/api/attendance/stop`, and `/api/attendance/status` endpoints to `main.py` to track active attendance sessions.
+4. **UI Updates**: 
+   - Operation Mode dropdown added to the sidebar.
+   - Dynamic Registration Panel based on active mode.
+   - Bounding box and identity label colors adapted for attendance context (Green for Present, Red for Absent/Unknown, Grey for Not Seen).

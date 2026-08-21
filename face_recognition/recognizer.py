@@ -61,6 +61,7 @@ class TrackState:
     vote_window: Deque = field(default_factory=lambda: deque(maxlen=TEMPORAL_WINDOW_SIZE))
 
     # Committed identity — set once and never changed for this track
+    committed_status:     Optional[str] = None
     committed_person_id:  Optional[str] = None
     committed_label:      Optional[str] = None
     committed_confidence: float = 0.0
@@ -86,17 +87,19 @@ class FaceRecognizer:
         track_id: int,
         embedding: Optional[np.ndarray],
         tracker,
+        auto_register: bool = True,
     ) -> RecognitionResult:
         """
         Classify a face given its current embedding and track history.
         Returns a RecognitionResult with status, label and confidence.
+        If auto_register is False, unknown faces will not be added to the IdentityManager.
         """
         state = self._get_or_create_state(track_id)
 
         # ── Already committed this track → return stable cached result ─────────
         if state.committed_person_id:
             return RecognitionResult(
-                status="recognised",
+                status=state.committed_status or "recognised",
                 label=state.committed_label,
                 person_id=state.committed_person_id,
                 confidence=state.committed_confidence,
@@ -133,7 +136,7 @@ class FaceRecognizer:
         if consensus_pid is not None:
             id_meta = self._identity_manager.get_identity(consensus_pid)
             label   = id_meta["label"] if id_meta else consensus_pid
-            self._commit(state, consensus_pid, label, best_confidence, tracker, track_id)
+            self._commit(state, "recognised", consensus_pid, label, best_confidence, tracker, track_id)
             log.info("[Recognizer] Track %d → RECOGNISED '%s' (%s) conf=%.2f",
                      track_id, label, consensus_pid, best_confidence)
             result = RecognitionResult("recognised", label, consensus_pid, best_confidence)
@@ -153,7 +156,7 @@ class FaceRecognizer:
                 id_meta2 = self._identity_manager.get_identity(best_pid2)
                 label2   = id_meta2["label"] if id_meta2 else best_pid2
                 conf2    = round(float(best_score2), 3)
-                self._commit(state, best_pid2, label2, conf2, tracker, track_id)
+                self._commit(state, "recognised", best_pid2, label2, conf2, tracker, track_id)
                 log.info("[Recognizer] Track %d → RECOGNISED '%s' via mean embedding. conf=%.2f",
                          track_id, label2, conf2)
                 result = RecognitionResult("recognised", label2, best_pid2, conf2)
@@ -161,20 +164,27 @@ class FaceRecognizer:
                 return result
 
             else:
-                # New person — never seen before. Save immediately to persons DB.
-                new_pid = self._identity_manager.add_identity(
-                    embeddings=emb_matrix,
-                    face_crops=crops[:3],
-                )
-                id_meta_new = self._identity_manager.get_identity(new_pid)
-                new_label   = id_meta_new["label"] if id_meta_new else new_pid
-                # confidence=0.0 because this is the first save (no prior FAISS match)
-                self._commit(state, new_pid, new_label, 0.0, tracker, track_id)
-                log.info("[Recognizer] Track %d → NEW person saved: '%s' (%s).",
-                         track_id, new_label, new_pid)
-                result = RecognitionResult("recognised", new_label, new_pid, 0.0)
-                state.last_result = result
-                return result
+                if auto_register:
+                    # New person — never seen before. Save immediately to persons DB.
+                    new_pid = self._identity_manager.add_identity(
+                        embeddings=emb_matrix,
+                        face_crops=crops[:3],
+                    )
+                    id_meta_new = self._identity_manager.get_identity(new_pid)
+                    new_label   = id_meta_new["label"] if id_meta_new else new_pid
+                    # confidence=0.0 because this is the first save (no prior FAISS match)
+                    self._commit(state, "recognised", new_pid, new_label, 0.0, tracker, track_id)
+                    log.info("[Recognizer] Track %d → NEW person saved: '%s' (%s).",
+                             track_id, new_label, new_pid)
+                    result = RecognitionResult("recognised", new_label, new_pid, 0.0)
+                    state.last_result = result
+                    return result
+                else:
+                    # Auto register is false (e.g. Attendance Mode). Return unknown.
+                    self._commit(state, "unknown", "unknown", "Unregistered", 0.0, tracker, track_id)
+                    result = RecognitionResult("unknown", "Unregistered", None, 0.0)
+                    state.last_result = result
+                    return result
 
         # ── Still collecting frames ────────────────────────────────────────────
         buf = tracker._candidate_buffers.get(track_id, [])
@@ -196,9 +206,10 @@ class FaceRecognizer:
             self._track_states[track_id] = TrackState(track_id=track_id)
         return self._track_states[track_id]
 
-    def _commit(self, state: TrackState, pid: str, label: str,
+    def _commit(self, state: TrackState, status: str, pid: str, label: str,
                 confidence: float, tracker, track_id: int):
         """Lock in a committed identity for this track."""
+        state.committed_status     = status
         state.committed_person_id  = pid
         state.committed_label      = label
         state.committed_confidence = confidence

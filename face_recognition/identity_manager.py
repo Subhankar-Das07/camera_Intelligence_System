@@ -38,8 +38,12 @@ FR_IDENTITIES_KEY = b"fr:identities"
 class IdentityManager:
     """Thread-safe face identity manager backed only by Redis + in-memory FAISS."""
 
-    def __init__(self):
+    def __init__(self, redis_prefix: str = "fr:visitor"):
         self._lock = threading.RLock()
+        self._redis_prefix = redis_prefix
+        if self._redis_prefix.endswith('/'):
+            self._redis_prefix = self._redis_prefix[:-1]
+
         self._identities: Dict[str, dict] = {}
         self._embeddings: Dict[str, np.ndarray] = {}
         self._faiss_index: Optional[faiss.IndexFlatIP] = None
@@ -47,14 +51,16 @@ class IdentityManager:
         self.r = get_redis()
         self._load_from_redis()
 
+    # ── Redis I/O ───────────────────────────────────────────────────────────────
+
     def _load_from_redis(self):
         with self._lock:
-            raw = self.r.get(FR_IDENTITIES_KEY)
+            raw = self.r.get(f"{self._redis_prefix}:identities")
             if raw:
                 try:
                     self._identities = json.loads(redis_str(raw))
                 except json.JSONDecodeError as e:
-                    log.error("[IdentityManager] Bad fr:identities JSON: %s", e)
+                    log.error("[IdentityManager] Bad %s:identities JSON: %s", self._redis_prefix, e)
                     self._identities = {}
             else:
                 self._identities = {}
@@ -72,8 +78,8 @@ class IdentityManager:
             )
 
     def _load_embedding(self, person_id: str) -> Optional[np.ndarray]:
-        meta_raw = self.r.get(f"fr:embmeta:{person_id}")
-        data = self.r.get(f"fr:emb:{person_id}")
+        meta_raw = self.r.get(f"{self._redis_prefix}:embmeta:{person_id}")
+        data = self.r.get(f"{self._redis_prefix}:emb:{person_id}")
         if not meta_raw or not data:
             return None
         try:
@@ -88,44 +94,43 @@ class IdentityManager:
 
     def _save_identities(self):
         try:
-            self.r.set(FR_IDENTITIES_KEY, json.dumps(self._identities).encode())
+            self.r.set(f"{self._redis_prefix}:identities", json.dumps(self._identities).encode())
         except Exception as e:
             log.error("[IdentityManager] Failed to save identities to Redis: %s", e)
-
     def _save_embedding(self, person_id: str):
         arr = self._embeddings.get(person_id)
         if arr is None:
-            self.r.delete(f"fr:emb:{person_id}", f"fr:embmeta:{person_id}")
+            self.r.delete(f"{self._redis_prefix}:emb:{person_id}", f"{self._redis_prefix}:embmeta:{person_id}")
             return
         meta = {"shape": list(arr.shape), "dtype": "float32"}
         pipe = self.r.pipeline()
-        pipe.set(f"fr:emb:{person_id}", np.ascontiguousarray(arr, dtype=np.float32).tobytes())
-        pipe.set(f"fr:embmeta:{person_id}", json.dumps(meta).encode())
+        pipe.set(f"{self._redis_prefix}:emb:{person_id}", np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+        pipe.set(f"{self._redis_prefix}:embmeta:{person_id}", json.dumps(meta).encode())
         pipe.execute()
 
     def _save_face_crops(self, person_id: str, face_crops: List[np.ndarray]):
         if not face_crops:
             return
-        existing = int(redis_str(self.r.get(f"fr:face_count:{person_id}"), "0") or "0")
+        existing = int(redis_str(self.r.get(f"{self._redis_prefix}:face_count:{person_id}"), "0") or "0")
         pipe = self.r.pipeline()
         for i, crop in enumerate(face_crops):
             idx = existing + i + 1
             ok, buf = cv2.imencode(".jpg", crop)
             if ok:
-                pipe.set(f"fr:face:{person_id}:{idx}", buf.tobytes())
-        pipe.set(f"fr:face_count:{person_id}", str(existing + len(face_crops)).encode())
+                pipe.set(f"{self._redis_prefix}:face:{person_id}:{idx}", buf.tobytes())
+        pipe.set(f"{self._redis_prefix}:face_count:{person_id}", str(existing + len(face_crops)).encode())
         pipe.execute()
 
     def _delete_face_crops(self, person_id: str):
-        count = int(redis_str(self.r.get(f"fr:face_count:{person_id}"), "0") or "0")
+        count = int(redis_str(self.r.get(f"{self._redis_prefix}:face_count:{person_id}"), "0") or "0")
         pipe = self.r.pipeline()
         for i in range(1, count + 1):
-            pipe.delete(f"fr:face:{person_id}:{i}")
-        pipe.delete(f"fr:face_count:{person_id}")
+            pipe.delete(f"{self._redis_prefix}:face:{person_id}:{i}")
+        pipe.delete(f"{self._redis_prefix}:face_count:{person_id}")
         pipe.execute()
 
     def get_face_bytes(self, person_id: str, index: int = 1) -> Optional[bytes]:
-        return self.r.get(f"fr:face:{person_id}:{index}")
+        return self.r.get(f"{self._redis_prefix}:face:{person_id}:{index}")
 
     def _rebuild_faiss_index(self):
         self._faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
@@ -269,11 +274,11 @@ class IdentityManager:
                 results.append((pid, label, score))
             return results
 
-    def get_face_thumbnail_url(self, person_id: str) -> Optional[str]:
-        count = int(redis_str(self.r.get(f"fr:face_count:{person_id}"), "0") or "0")
+    def get_face_thumbnail_url(self, person_id: str, mode: str = "visitor") -> Optional[str]:
+        count = int(redis_str(self.r.get(f"{self._redis_prefix}:face_count:{person_id}"), "0") or "0")
         if count < 1:
             return None
-        return f"/api/faces/image/{person_id}/1"
+        return f"/api/faces/image/{person_id}/1?mode={mode}"
 
     def get_stats(self) -> dict:
         with self._lock:
