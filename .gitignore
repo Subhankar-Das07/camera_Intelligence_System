@@ -42,3 +42,9 @@ smart_vision_assistant/.pytest_cache/
 smart_vision_assistant/data/
 smart_vision_assistant/database/
 smart_vision_assistant/reports/
+
+# -- Video Analytics App -----------------------------
+storage/alerts/
+storage/uploads/
+storage/outputs/
+*.pt
