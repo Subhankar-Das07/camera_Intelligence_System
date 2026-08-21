@@ -8,7 +8,13 @@ dist/
 
 # ── Environment / Secrets ─────────────────────────────
 .env
+.venv/
+venv/
 *.pem
+
+# ── Legacy on-disk DBs (Redis is canonical now) ───────
+storage/vehicle_intelligence.db
+face_recognition/data/
 
 # ── Session logs (generated at runtime) ───────────────
 reports/*.log

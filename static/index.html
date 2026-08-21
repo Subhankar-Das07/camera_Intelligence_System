@@ -1,103 +1,80 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Analytics Platform</title>
-    <link rel="stylesheet" href="style.css?v=7">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <title>Camera Intelligence System</title>
+    <link rel="stylesheet" href="/shell/shell.css">
 </head>
-
 <body>
-    <div class="app-layout">
-        <!-- Sidebar controls -->
-        <aside class="sidebar">
-            <header>
-                <h1>Video Analytics</h1>
-                <p>Live Intrusion Detection</p>
-            </header>
+    <nav class="cis-nav">
+        <a class="cis-brand" href="/">
+            <strong>Camera Intelligence</strong>
+            <span>Unified vision platform</span>
+        </a>
+        <div class="cis-nav-links">
+            <a href="/" data-nav="overview">Overview</a>
+            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
+            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
+            <a href="/features/face/" data-nav="face">Face Recognition</a>
+        </div>
+    </nav>
 
-            <section class="control-group">
-                <h3>1. Source (Upload or RTSP)</h3>
-                <div class="upload-area" id="upload-area">
-                    <input type="file" id="video-upload" accept="video/mp4,video/avi,video/quicktime" hidden>
-                    <button class="btn secondary" id="upload-btn">Choose File</button>
-                    <span id="upload-status" class="status-msg">No file chosen</span>
-                </div>
-                <div class="divider" style="text-align:center;margin:10px 0;font-size:0.8rem;color:#888;">— OR —</div>
-                <div class="rtsp-area">
-                    <input type="text" id="rtsp-url" placeholder="rtsp://user:pass@192.168.x.x:554/..." style="width:100%;padding:8px;border-radius:4px;border:1px solid #475569;background:#1e293b;color:white;font-family:inherit;box-sizing:border-box;">
-                    <button class="btn secondary" id="connect-rtsp-btn" style="margin-top:8px;width:100%;">Connect Stream</button>
-                    <button class="btn secondary hidden" id="disconnect-rtsp-btn" style="margin-top:4px;width:100%;background:#7f1d1d;border-color:#dc2626;">✕ Disconnect</button>
-                </div>
-            </section>
+    <main class="cis-page overview-wrap">
+        <section class="overview-hero">
+            <h1>Camera Intelligence System</h1>
+            <p>
+                One product shell for zone safety analytics, vehicle plate recognition,
+                and face identity management. Use the top navigation to open a feature
+                workspace. Each feature keeps its own UI folder so developers can own a branch.
+            </p>
+        </section>
 
-            <section class="control-group">
-                <h3>2. Vision Pipeline</h3>
-                <div class="form-group">
-                    <select id="pipeline-select">
-                        <option value="" disabled selected>Loading pipelines...</option>
-                    </select>
-                </div>
-                <!-- Face Recognition module — opens dedicated page -->
-                <a href="/face_recognition/" target="_blank" class="btn fr-nav-btn" id="fr-nav-btn" title="Open Face Recognition Dashboard">
-                    👤 Face Recognition →
-                </a>
-            </section>
+        <div class="guidance">
+            <h3>How to use</h3>
+            <ul>
+                <li>Pick a feature from the top bar — you stay inside the same product chrome.</li>
+                <li>On each page, read the Guidance panel for short setup notes.</li>
+                <li>Connect a video file or RTSP camera, then run that feature’s pipeline.</li>
+                <li>Structured data (vehicles, faces, sessions) is stored in Redis.</li>
+            </ul>
+        </div>
 
-            <section class="control-group" id="machine-settings">
-                <h3>3. Machine Settings</h3>
-                <div class="toggle-container">
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="machine-active-toggle">
-                        <span class="slider round"></span>
-                    </label>
-                    <span>Simulate Machine Active</span>
-                </div>
-            </section>
+        <div class="feature-grid">
+            <a class="feature-card" href="/features/zone-safety/">
+                <h2>Zone Safety</h2>
+                <p>Intrusion detection, danger-zone proximity, and fall detection with ROI drawing and live alerts.</p>
+                <div class="path">static/features/zone-safety/</div>
+            </a>
+            <a class="feature-card" href="/features/vehicle/">
+                <h2>Vehicle Recognition</h2>
+                <p>Detect plates, count visits, and review the detection log. Persistence is Redis-backed.</p>
+                <div class="path">static/features/vehicle/</div>
+            </a>
+            <a class="feature-card" href="/features/face/">
+                <h2>Face Recognition</h2>
+                <p>Live recognition, register identities, rename people, and manage the identity gallery.</p>
+                <div class="path">static/features/face/</div>
+            </a>
+            <a class="feature-card" href="/features/zone-safety/">
+                <h2>Quick start</h2>
+                <p>Start with Zone Safety: upload a clip or connect RTSP, choose a pipeline, draw ROI (except fall), then Run.</p>
+                <div class="path">Recommended first tab</div>
+            </a>
+        </div>
 
-            <section class="control-group roi-tools" id="roi-controls">
-                <h3>4. ROI Controls</h3>
-                <p>Draw a polygon in the center preview area.</p>
-                <button class="btn secondary" id="clear-roi-btn">Clear ROI</button>
-            </section>
+        <section class="dev-note">
+            <h3>Developer note — branch ownership</h3>
+            <p>Keep feature work isolated under one folder so merges stay clean:</p>
+            <ul>
+                <li><code>static/features/zone-safety/</code> — intrusion / danger zone / fall UI</li>
+                <li><code>static/features/vehicle/</code> — vehicle UI</li>
+                <li><code>static/features/face/</code> — face UI</li>
+                <li><code>static/shell/</code> + <code>static/shared/</code> — shared chrome only</li>
+            </ul>
+        </section>
+    </main>
 
-            <section class="control-actions">
-                <button class="btn primary run-btn" id="run-btn" disabled>Run Live Analysis</button>
-                <button class="btn secondary hidden" id="stop-btn">Stop Analysis</button>
-            </section>
-        </aside>
-
-        <!-- Main center display area -->
-        <main class="main-content">
-            <div class="header-title">
-                <h2>AI-powered Detection Dashboard:</h2>
-            </div>
-
-            <div class="content-wrapper" id="content-wrapper">
-                <div id="placeholder-msg" class="placeholder-msg">
-                    Upload a video or connect an RTSP stream to start
-                </div>
-
-                <!-- Unified display container (shrink-wraps the image perfectly) -->
-                <div id="video-container" class="hidden" style="position:relative; display:flex; max-width:100%; max-height:100%;">
-                    <img id="main-video-img" style="max-width:100%; max-height:100%; object-fit:contain; display:block;" alt="Video Stream">
-                    <canvas id="roi-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair;"></canvas>
-                </div>
-            </div>
-
-            <!-- Live Reports Section -->
-            <div class="reports-section">
-                <h3>Live Alerts / Reports</h3>
-                <div id="alerts-container" class="alerts-container">
-                    <p class="placeholder">No alerts detected yet.</p>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <script src="app.js?v=11"></script>
+    <script src="/shell/shell.js"></script>
 </body>
-
 </html>

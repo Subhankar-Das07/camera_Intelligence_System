@@ -13,6 +13,8 @@ class ThreadedCamera:
     and always yields the most recent frame, dropping intermediate frames to prevent lag.
     """
     def __init__(self, src):
+        if isinstance(src, str) and src.isdigit():
+            src = int(src)
         self.src = src
         
         # Use DirectShow on Windows for local webcams (integers) to prevent MSMF hangs
@@ -77,6 +79,9 @@ def get_video_source(input_path):
     """
     if hasattr(input_path, 'read') and hasattr(input_path, 'isOpened'):
         return input_path
+        
+    if isinstance(input_path, str) and input_path.isdigit():
+        input_path = int(input_path)
 
     if str(input_path).startswith(('rtsp://', 'http://', 'https://')):
         cam = ThreadedCamera(input_path)

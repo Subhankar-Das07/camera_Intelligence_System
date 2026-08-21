@@ -9,17 +9,24 @@ import asyncio
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import List, Tuple, Dict, Any, Optional
+import json
 
 from core.registry import registry
+from core.redis_client import get_redis, redis_str
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
+from pipelines.vehicle_recognition import VehicleRecognitionPipeline
+from pipelines.vehicle_recognition.database import VehicleDatabase
+
+# Register the vehicle recognition pipeline into the shared singleton registry
+registry.register("vehicle_recognition", VehicleRecognitionPipeline)
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
-# ── Storage directories ──────────────────────────────────────────────────────
+# ── Storage directories (uploads / alerts only — DBs are Redis) ───────────────
 STORAGE_DIR = "storage"
 UPLOAD_DIR  = os.path.join(STORAGE_DIR, "uploads")
 PREVIEW_DIR = os.path.join(STORAGE_DIR, "previews")
@@ -34,18 +41,76 @@ app.include_router(mobile_router)
 
 @app.on_event("startup")
 async def _on_startup():
+    # Fail fast if Redis is unreachable
+    get_redis().ping()
     loop = asyncio.get_running_loop()
     start_mobile_worker(loop)
 
-# ── In-memory session state ──────────────────────────────────────────────────
-# RTSP live streams: stream_id -> ThreadedCamera (raw, no AI)
+# ── Live stream handles stay in-process; DB/session data is Redis ─────────────
 rtsp_streams: Dict[str, ThreadedCamera] = {}
-rtsp_dims:    Dict[str, Tuple[int, int]] = {}  # stream_id -> (width, height)
-
-# Analysis sessions
+rtsp_dims:    Dict[str, Tuple[int, int]] = {}
 active_sessions: Dict[str, Any] = {}
-session_alerts:  Dict[str, List[Dict[str, Any]]] = {}
-stop_events:     Dict[str, threading.Event] = {}   # session_id -> Event
+stop_events:     Dict[str, threading.Event] = {}
+
+
+def _alerts_key(session_id: str) -> str:
+    return f"sess:alerts:{session_id}"
+
+
+def _vr_det_key(session_id: str) -> str:
+    return f"vr:det:{session_id}"
+
+
+def _vr_plates_key(session_id: str) -> str:
+    return f"vr:detplates:{session_id}"
+
+
+def _append_session_alert(session_id: str, alert_event: Dict[str, Any]) -> None:
+    get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event).encode())
+
+
+def _get_session_alerts(session_id: str) -> List[Dict[str, Any]]:
+    items = get_redis().lrange(_alerts_key(session_id), 0, -1)
+    out: List[Dict[str, Any]] = []
+    for raw in items:
+        try:
+            out.append(json.loads(redis_str(raw)))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _clear_session_alerts(session_id: str) -> None:
+    get_redis().delete(_alerts_key(session_id))
+
+
+def _reset_vr_detections(session_id: str) -> None:
+    r = get_redis()
+    r.delete(_vr_det_key(session_id), _vr_plates_key(session_id))
+
+
+def _vr_add_detection(session_id: str, plate: str, total_visits: int) -> bool:
+    """Return True if this plate is newly recorded for the session."""
+    r = get_redis()
+    added = r.sadd(_vr_plates_key(session_id), plate)
+    if not added:
+        return False
+    r.rpush(
+        _vr_det_key(session_id),
+        json.dumps({"plate": plate, "total_visits": total_visits}).encode(),
+    )
+    return True
+
+
+def _get_vr_detections(session_id: str) -> List[Dict[str, Any]]:
+    items = get_redis().lrange(_vr_det_key(session_id), 0, -1)
+    out: List[Dict[str, Any]] = []
+    for raw in items:
+        try:
+            out.append(json.loads(redis_str(raw)))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 # Attendance Session state
 attendance_session = {
@@ -119,7 +184,7 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
         if stop_ev and stop_ev.is_set():
             break
         if alert_event:
-            session_alerts[session_id].append(alert_event)
+            _append_session_alert(session_id, alert_event)
             if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
                 if attendance_session["active"]:
                     attendance_session["present_ids"].add(alert_event["person_id"])
@@ -240,8 +305,8 @@ async def get_pipelines():
 async def start_analysis(request: ProcessRequest):
     session_id = str(uuid.uuid4())
     active_sessions[session_id] = request
-    session_alerts[session_id]  = []
-    stop_events[session_id]     = threading.Event()
+    _clear_session_alerts(session_id)
+    stop_events[session_id] = threading.Event()
     return {"session_id": session_id}
 
 
@@ -261,15 +326,22 @@ def stream_video(session_id: str):
         raise HTTPException(status_code=400, detail="Pipeline not found.")
 
     if req.stream_id and req.stream_id in rtsp_streams:
-        # Pass the existing live camera object instead of reopening a second connection
-        # This prevents NVRs from throttling/rejecting the duplicate connection.
         input_path = rtsp_streams[req.stream_id]
     else:
         input_path = os.path.join(UPLOAD_DIR, req.filename)
 
+    # Vehicle recognition uses a specialised generator that harvests plate metadata
+    if req.pipeline_name == "vehicle_recognition":
+        generator_fn = _vr_mjpeg_generator(
+            session_id, pipeline, input_path, req.roi_normalized, req.config
+        )
+    else:
+        generator_fn = _mjpeg_generator_analysis(
+            session_id, pipeline, input_path, req.roi_normalized, req.config
+        )
+
     return StreamingResponse(
-        _mjpeg_generator_analysis(session_id, pipeline, input_path,
-                                  req.roi_normalized, req.config),
+        generator_fn,
         media_type='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -337,7 +409,7 @@ async def connect_webcam(index: int = 0):
 
 @app.get("/api/alerts/{session_id}")
 def get_alerts(session_id: str):
-    return {"alerts": session_alerts.get(session_id, [])}
+    return {"alerts": _get_session_alerts(session_id)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -494,13 +566,30 @@ def get_attendance_status():
     }
 
 
-# ── Static file mounts (additive) ────────────────────────────────────────────
+@app.get("/api/faces/image/{person_id}/{index}")
+def face_image(person_id: str, index: int = 1):
+    """Serve a face crop JPEG stored in Redis."""
+    pipeline = _get_fr_pipeline()
+    im = pipeline.get_identity_manager()
+    data = im.get_face_bytes(person_id, index)
+    if not data:
+        raise HTTPException(status_code=404, detail="Face image not found.")
+    return Response(content=data, media_type="image/jpeg")
 
-# Serve face crop images for the identity manager UI
-_FR_DATA_DIR = os.path.join("face_recognition", "data")
-os.makedirs(_FR_DATA_DIR, exist_ok=True)
-os.makedirs(os.path.join(_FR_DATA_DIR, "persons"), exist_ok=True)  # persons/ always exists
-app.mount("/face_data", StaticFiles(directory=_FR_DATA_DIR), name="face_data")
+
+_vr_db = VehicleDatabase()
+
+
+@app.get("/api/vr/image/{kind}/{plate}/{visit}")
+def vr_image(kind: str, plate: str, visit: int):
+    """Serve vehicle snapshot or plate-crop JPEG stored in Redis."""
+    if kind not in ("snap", "crop"):
+        raise HTTPException(status_code=400, detail="kind must be snap or crop")
+    data = _vr_db.get_image_bytes(kind, plate, visit)
+    if not data:
+        raise HTTPException(status_code=404, detail="Image not found.")
+    return Response(content=data, media_type="image/jpeg")
+
 
 _ATT_DATA_DIR = os.path.join("face_recognition", "attendance_data")
 os.makedirs(_ATT_DATA_DIR, exist_ok=True)
@@ -510,6 +599,39 @@ app.mount("/attendance_data", StaticFiles(directory=_ATT_DATA_DIR), name="attend
 # Serve face recognition dashboard (separate sub-page)
 _FR_STATIC_DIR = os.path.join("static", "face_recognition")
 os.makedirs(_FR_STATIC_DIR, exist_ok=True)
+
+
+def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, config):
+    """Annotated MJPEG generator that also captures plate detections for the log."""
+    stop_ev = stop_events.get(session_id)
+    _reset_vr_detections(session_id)
+
+    generator = pipeline.run_on_video(
+        input_path=input_path,
+        output_dir=ALERTS_DIR,
+        roi_normalized=roi_normalized,
+        config=config,
+    )
+    for frame, metadata in generator:
+        if stop_ev and stop_ev.is_set():
+            break
+        if metadata and metadata.get("detections"):
+            for det in metadata["detections"]:
+                plate = det.get("plate")
+                if plate:
+                    _vr_add_detection(session_id, plate, det.get("total_visits", 1))
+        if frame is not None:
+            ok, buf = cv2.imencode('.jpg', frame)
+            if ok:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+
+
+@app.get("/api/vr_detections/{session_id}")
+def get_vr_detections(session_id: str):
+    """Return the list of confirmed unique plates detected in a VR session."""
+    return {"detections": _get_vr_detections(session_id)}
+
 
 # Mount static root last
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

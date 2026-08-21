@@ -20,7 +20,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const statTotal      = document.getElementById("stat-total");
     const statKnown      = document.getElementById("stat-known");
-    const statUnknown    = document.getElementById("stat-unknown");
+    const statUnknown    = document.getElementById("stat-unknown"); // optional
     const statVectors    = document.getElementById("stat-vectors");
 
     const tabs           = document.querySelectorAll(".fr-tab");

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zone Safety — Camera Intelligence</title>
+    <link rel="stylesheet" href="/shell/shell.css">
+    <link rel="stylesheet" href="zone-safety.css">
+</head>
+<body>
+    <nav class="cis-nav">
+        <a class="cis-brand" href="/">
+            <strong>Camera Intelligence</strong>
+            <span>Unified vision platform</span>
+        </a>
+        <div class="cis-nav-links">
+            <a href="/" data-nav="overview">Overview</a>
+            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
+            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
+            <a href="/features/face/" data-nav="face">Face Recognition</a>
+        </div>
+    </nav>
+
+    <div class="feature-layout">
+        <aside class="feature-sidebar">
+            <h1>Zone Safety</h1>
+            <p class="subtitle">Intrusion · Danger zone · Fall</p>
+
+            <section class="control-group">
+                <h3>1. Source</h3>
+                <div class="upload-area">
+                    <input type="file" id="video-upload" accept="video/mp4,video/avi,video/quicktime" hidden>
+                    <button class="btn secondary" id="upload-btn" type="button">Choose File</button>
+                    <span id="upload-status" class="status-msg">No file chosen</span>
+                </div>
+                <div class="divider-or">— OR —</div>
+                <input type="text" id="rtsp-url" class="text-input" placeholder="rtsp://user:pass@host:554/...">
+                <button class="btn secondary" id="connect-rtsp-btn" type="button" style="margin-top:8px;width:100%;">Connect Stream</button>
+                <button class="btn danger hidden" id="disconnect-rtsp-btn" type="button" style="margin-top:4px;width:100%;">Disconnect</button>
+            </section>
+
+            <section class="control-group">
+                <h3>2. Pipeline</h3>
+                <div class="form-group">
+                    <select id="pipeline-select">
+                        <option value="" disabled selected>Loading...</option>
+                    </select>
+                </div>
+            </section>
+
+            <section class="control-group" id="machine-settings">
+                <h3>3. Machine Settings</h3>
+                <div class="toggle-container">
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="machine-active-toggle">
+                        <span class="slider round"></span>
+                    </label>
+                    <span>Simulate Machine Active</span>
+                </div>
+            </section>
+
+            <section class="control-group" id="roi-controls">
+                <h3>4. ROI</h3>
+                <p>Click on the preview to draw a polygon (3+ points).</p>
+                <button class="btn secondary" id="clear-roi-btn" type="button">Clear ROI</button>
+            </section>
+
+            <section class="control-actions">
+                <button class="btn primary" id="run-btn" type="button" disabled>Run Live Analysis</button>
+                <button class="btn secondary hidden" id="stop-btn" type="button">Stop Analysis</button>
+            </section>
+        </aside>
+
+        <main class="feature-main">
+            <div class="guidance">
+                <h3>Guidance</h3>
+                <ul>
+                    <li><strong>intrusion_detection</strong> — alert when a person enters the ROI polygon.</li>
+                    <li><strong>danger_zone</strong> — proximity / severity around a machine ROI; use Machine Active when simulating.</li>
+                    <li><strong>fall_detection</strong> — no ROI required; watches posture across the full frame.</li>
+                    <li>Developer folder: <code>static/features/zone-safety/</code></li>
+                </ul>
+            </div>
+
+            <div class="header-title">
+                <h2>Zone Safety Live View</h2>
+            </div>
+
+            <div class="content-wrapper" id="content-wrapper">
+                <div id="placeholder-msg" class="placeholder-msg">Upload a video or connect an RTSP stream to start</div>
+                <div id="video-container" class="hidden" style="position:relative;display:flex;max-width:100%;max-height:100%;">
+                    <img id="main-video-img" style="max-width:100%;max-height:100%;object-fit:contain;display:block;" alt="Video Stream">
+                    <canvas id="roi-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair;"></canvas>
+                </div>
+            </div>
+
+            <div class="reports-section">
+                <h3>Live Alerts</h3>
+                <div id="alerts-container" class="alerts-container">
+                    <p class="placeholder">No alerts detected yet.</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/shell/shell.js"></script>
+    <script src="/shared/source-controls.js"></script>
+    <script src="zone-safety.js"></script>
+</body>
+</html>

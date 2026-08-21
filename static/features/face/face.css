@@ -1,23 +1,18 @@
 /*
- * fr_style.css — Face Recognition Dashboard Styles
- * Inherits design language from the parent project (dark mode, Inter font).
- * Purple/violet accent distinguishes FR module visually.
- * No existing styles are modified — this file is standalone.
+ * Face Recognition feature styles — aligned with Camera Intelligence shell tokens.
  */
-
-/* ── CSS Variables (extends parent design system) ───────────────────────── */
 :root {
-    --bg:          #0f172a;
-    --surface:     #1e293b;
-    --surface-2:   #263349;
-    --border:      #334155;
-    --text:        #f1f5f9;
-    --text-muted:  #94a3b8;
+    --bg:          var(--main-bg, #0f172a);
+    --surface:     var(--bg-color, #1e293b);
+    --surface-2:   var(--sidebar-bg, #334155);
+    --border:      var(--border, #475569);
+    --text:        var(--text-primary, #f8fafc);
+    --text-muted:  var(--text-secondary, #cbd5e1);
     --text-dim:    #64748b;
 
-    --fr-accent:   #7c3aed;
-    --fr-accent-2: #8b5cf6;
-    --fr-glow:     rgba(139, 92, 246, 0.25);
+    --fr-accent:   var(--accent, #3b82f6);
+    --fr-accent-2: #60a5fa;
+    --fr-glow:     rgba(59, 130, 246, 0.22);
 
     --known:       #10b981;
     --known-bg:    rgba(16, 185, 129, 0.12);
@@ -32,20 +27,20 @@
     --radius-sm:   4px;
 }
 
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    font-family: 'Inter', sans-serif;
-}
-
-body {
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
+.fr-page {
     display: flex;
     flex-direction: column;
-    overflow-x: hidden;
+    min-height: calc(100vh - var(--nav-height, 56px));
+}
+
+.fr-guidance {
+    margin: 1rem 1.25rem 0;
+}
+
+.fr-stat-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
 }
 
 /* ── Navbar ──────────────────────────────────────────────────────────────── */
