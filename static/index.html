@@ -70,6 +70,7 @@
             <nav class="tab-nav" id="tab-nav">
                 <button class="tab-btn active" id="tab-analysis-btn" data-tab="analysis">🔍 Analysis</button>
                 <button class="tab-btn" id="tab-vehicle-btn" data-tab="vehicle_recognition">🚗 Vehicle Recognition</button>
+                <button class="tab-btn" id="tab-admin-btn" data-tab="admin">🛡️ Admin Portal</button>
             </nav>
 
             <!-- ── Analysis tab (original content) ── -->
@@ -126,10 +127,24 @@
                 </div>
             </div> <!-- /panel-vehicle_recognition -->
 
+            <!-- ── Admin Portal tab ── -->
+            <div class="tab-panel hidden" id="panel-admin">
+                <div class="header-title">
+                    <h2 style="background-color:#7c3aed;">🛡️ Admin Portal — Vehicle Management</h2>
+                </div>
+                <div class="reports-section" style="margin-top:1rem;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem;">
+                        <h3>📋 All Registered Vehicles</h3>
+                        <button class="btn secondary" onclick="loadAdminPortal()" style="padding:6px 14px;">🔄 Refresh</button>
+                    </div>
+                    <div id="admin-table-container"><p class="placeholder">Loading vehicle records...</p></div>
+                </div>
+            </div> <!-- /panel-admin -->
+
         </main>
     </div>
 
-    <script src="app.js?v=12"></script>
+    <script src="app.js?v=99999"></script>
 </body>
 
 </html>

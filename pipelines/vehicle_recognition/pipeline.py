@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import logging
+import os
+import time
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from ultralytics import YOLO
@@ -15,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 # COCO class IDs that represent vehicles
 _VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+
+# Map COCO class IDs to human-readable vehicle type labels
+_VEHICLE_TYPE_MAP: dict = {
+    2: "Car",
+    3: "Motorcycle",
+    5: "Bus",
+    7: "Truck",
+}
 
 # Visual style constants
 _BOX_COLOR       = (0, 220, 60)      # Bright green — confirmed plate
@@ -73,6 +83,7 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
         logger.info("Initializing VehicleRecognitionPipeline…")
 
         # ── Sub-component setup ────────────────────────────────────────
+        os.makedirs("storage/vehicle_images", exist_ok=True)
         self.db = VehicleDatabase(db_path=db_path)
         self.plate_reader = PlateReader(blur_threshold=blur_threshold)
         self.visit_manager = VisitManager(
@@ -151,6 +162,7 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
 
             boxes     = results[0].boxes.xyxy.cpu().numpy().astype(int)   # (N, 4)
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)     # (N,)
+            cls_ids   = results[0].boxes.cls.cpu().numpy().astype(int)    # (N,)
 
             # ── 2. Stale-track cleanup ────────────────────────────────
             active_track_ids: List[int] = track_ids.tolist()
@@ -159,7 +171,7 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
             # ── 3. Per-vehicle processing ─────────────────────────────
             h_frame, w_frame = annotated.shape[:2]
 
-            for box, track_id in zip(boxes, track_ids):
+            for box, track_id, cls_id in zip(boxes, track_ids, cls_ids):
                 try:
                     x1, y1, x2, y2 = box
                     # Clamp to frame boundaries
@@ -170,7 +182,8 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
                     if car_crop.size == 0:
                         continue
 
-                    tid = int(track_id)
+                    tid          = int(track_id)
+                    vehicle_type = _VEHICLE_TYPE_MAP.get(int(cls_id), "Vehicle")
 
                     # ── OCR throttling ─────────────────────────────
                     # Skip OCR if: track already finalized  OR  not on the Nth frame
@@ -188,17 +201,31 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
                                     confidence=conf,
                                     car_crop=car_crop.copy(),
                                     plate_crop=plate_crop.copy(),
+                                    vehicle_type=vehicle_type,
                                 )
 
                     # ── Consensus check ────────────────────────────
                     status = self.visit_manager.process_track(tid)
+                    
+                    if status and not already_finalized:
+                        try:
+                            if car_crop is not None and car_crop.size > 0:
+                                plate_text = status["plate"]
+                                filename = f"storage/vehicle_images/{plate_text}_{int(time.time())}.jpg"
+                                cv2.imwrite(filename, car_crop)
+                                self.db.update_vehicle_image(plate_text, filename)
+                                # Save into the state dict so it persists for this track
+                                status["image_path"] = filename
+                        except Exception as e:
+                            logger.error(f"Error saving image/DB for plate {status.get('plate')}: {e}")
+                            print(f"Error saving image/DB: {e}")
 
                     # ── Draw annotations directly on annotated frame ──
                     box_color = _BOX_COLOR if status else _SCAN_COLOR
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, _BOX_THICKNESS)
 
                     if status:
-                        label    = f"Plate: {status['plate']}  |  Visits: {status['total_visits']}"
+                        label    = f"{status.get('vehicle_type', 'Vehicle')}: {status['plate']}  |  Visits: {status['total_visits']}"
                         bg_color = _LABEL_BG_COLOR
                     else:
                         label    = f"ID: {tid}  |  Scanning..."
@@ -222,8 +249,10 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
                     frame_metadata["detections"].append({
                         "track_id":     tid,
                         "box":          [x1, y1, x2, y2],
-                        "plate":        status["plate"]        if status else None,
-                        "total_visits": status["total_visits"] if status else None,
+                        "plate":        status["plate"]                    if status else None,
+                        "total_visits": status["total_visits"]             if status else None,
+                        "image_path":   status.get("image_path")           if status else None,
+                        "vehicle_type": status.get("vehicle_type", "Car") if status else None,
                     })
 
                 except Exception as e:
@@ -270,18 +299,36 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
             logger.error(f"Cannot open video source: {input_path}")
             return
 
-        frame_idx = 0
+        frame_idx       = 0
+        skip_rate       = 3   # Process 1 frame, skip the next 2
+        last_valid_frame = None
+        metadata         = {"detections": []}
+
         try:
             while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
+                # 1. ALWAYS grab to drain the RTSP buffer and prevent timestamp lag
+                grabbed = cap.grab()
+                if not grabbed:
                     break
 
-                annotated_frame, metadata = self.process_frame(
-                    frame, frame_idx=frame_idx, config=config
-                )
-                yield annotated_frame, metadata
                 frame_idx += 1
+
+                # 2. Only decode + run heavy AI on every Nth frame
+                if frame_idx % skip_rate == 0:
+                    ret, frame = cap.retrieve()
+                    if not ret:
+                        break
+
+                    annotated_frame, metadata = self.process_frame(
+                        frame, frame_idx=frame_idx, config=config
+                    )
+                    last_valid_frame = annotated_frame   # update memory buffer
+
+                # 3. Yield on EVERY iteration — re-broadcast last frame on skipped ticks
+                #    so the MJPEG stream never stalls or drops.
+                if last_valid_frame is not None:
+                    yield last_valid_frame, metadata
+
         finally:
             cap.release()
 

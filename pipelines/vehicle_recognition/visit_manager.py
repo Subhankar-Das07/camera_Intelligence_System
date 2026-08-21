@@ -21,7 +21,7 @@ class VisitManager:
     def __init__(
         self,
         db_manager,
-        min_consensus_frames: int = 3,
+        min_consensus_frames: int = 1,
         session_cooldown_seconds: int = 120,
     ):
         """
@@ -52,7 +52,7 @@ class VisitManager:
         self.finalized_tracks: Dict[int, dict] = {}
 
         # Thread safety: a single lock guards all shared state.
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,6 +65,7 @@ class VisitManager:
         confidence: float,
         car_crop: np.ndarray,
         plate_crop: np.ndarray,
+        vehicle_type: str = "Car",
     ) -> None:
         """
         Append a single-frame OCR reading to the track's rolling buffer.
@@ -78,6 +79,7 @@ class VisitManager:
             confidence (float): OCR confidence score [0.0 – 1.0].
             car_crop (np.ndarray): Full vehicle snapshot image.
             plate_crop (np.ndarray): Cropped license plate image.
+            vehicle_type (str): Human-readable YOLO class label (e.g. "Car", "Truck").
         """
         if not plate_text or not plate_text.strip():
             return
@@ -96,11 +98,12 @@ class VisitManager:
                     "conf": confidence,
                     "car_crop": car_crop,
                     "plate_crop": plate_crop,
+                    "vehicle_type": vehicle_type,
                 }
             )
             logger.debug(
                 f"Track {track_id}: buffered reading '{plate_text}' "
-                f"(conf={confidence:.2f}, total frames={len(self.track_buffers[track_id])})"
+                f"(conf={confidence:.2f}, type={vehicle_type}, total frames={len(self.track_buffers[track_id])})"
             )
 
     def process_track(self, track_id: int) -> Optional[dict]:
@@ -127,6 +130,12 @@ class VisitManager:
                 return self.finalized_tracks[track_id]
 
             buffer = self.track_buffers.get(track_id, [])
+            
+            # If force_finalize is true (e.g. on exit), we accept whatever is in the buffer.
+            # Otherwise we require min_consensus_frames.
+            # But process_track doesn't take force_finalize argument currently.
+            # We will just check if buffer length is >= min_consensus_frames.
+            
             if len(buffer) < self.min_consensus_frames:
                 return None
 
@@ -142,18 +151,24 @@ class VisitManager:
             # ── Best Crop Selection (highest confidence for winning plate) ─
             candidates = [e for e in buffer if e["plate"] == winning_plate]
             best_entry = max(candidates, key=lambda e: e["conf"])
-            best_car_crop: np.ndarray = best_entry["car_crop"]
+            best_car_crop: np.ndarray   = best_entry["car_crop"]
             best_plate_crop: np.ndarray = best_entry["plate_crop"]
-            best_confidence: float = best_entry["conf"]
+            best_confidence: float      = best_entry["conf"]
+            best_vehicle_type: str      = best_entry.get("vehicle_type", "Car")
 
             # ── Cooldown & Session Check ──────────────────────────────────
             current_time = time.time()
             total_visits = self._resolve_session(
-                winning_plate, best_car_crop, best_plate_crop, best_confidence, current_time
+                winning_plate, best_car_crop, best_plate_crop, best_confidence,
+                current_time, best_vehicle_type
             )
 
             # ── Finalize and free buffer memory ──────────────────────────
-            result = {"plate": winning_plate, "total_visits": total_visits}
+            result = {
+                "plate":        winning_plate,
+                "total_visits": total_visits,
+                "vehicle_type": best_vehicle_type,
+            }
             self.finalized_tracks[track_id] = result
             self.track_buffers.pop(track_id, None)
 
@@ -174,8 +189,18 @@ class VisitManager:
 
             stale_buffer_ids = [tid for tid in self.track_buffers if tid not in active_set]
             for tid in stale_buffer_ids:
-                logger.debug(f"Track {tid}: removing stale buffer entry.")
-                del self.track_buffers[tid]
+                if len(self.track_buffers[tid]) > 0:
+                    logger.info(f"Track {tid} lost/exited. Forcing Finalize on Exit with {len(self.track_buffers[tid])} buffered frames.")
+                    # Temporarily drop threshold to 1 to force finalization
+                    original_min = self.min_consensus_frames
+                    self.min_consensus_frames = 1
+                    try:
+                        self.process_track(tid)
+                    finally:
+                        self.min_consensus_frames = original_min
+                else:
+                    logger.debug(f"Track {tid}: removing stale buffer entry (empty).")
+                    del self.track_buffers[tid]
 
             stale_final_ids = [tid for tid in self.finalized_tracks if tid not in active_set]
             for tid in stale_final_ids:
@@ -193,6 +218,7 @@ class VisitManager:
         plate_crop: np.ndarray,
         confidence: float,
         current_time: float,
+        vehicle_type: str = "Car",
     ) -> int:
         """
         Determine whether this detection constitutes a new visit or a continuation
@@ -206,6 +232,7 @@ class VisitManager:
             plate_crop (np.ndarray): Best plate crop.
             confidence (float): OCR confidence of the best crop.
             current_time (float): Current UNIX timestamp.
+            vehicle_type (str): YOLO-derived vehicle type label.
 
         Returns:
             int: The total visit count for this plate.
@@ -233,7 +260,9 @@ class VisitManager:
         else:
             # New vehicle or returning after cooldown → record in DB.
             try:
-                total_visits = self.db.record_visit(plate, car_crop, plate_crop, confidence)
+                total_visits = self.db.record_visit(
+                    plate, car_crop, plate_crop, confidence, vehicle_type=vehicle_type
+                )
                 self.active_sessions[plate] = current_time
                 logger.info(
                     f"Plate '{plate}': new visit recorded. Total visits = {total_visits}"

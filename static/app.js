@@ -421,6 +421,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 const isTarget = p.id === `panel-${target}`;
                 p.classList.toggle("hidden", !isTarget);
             });
+
+            // Auto-load admin table when switching to admin tab
+            if (target === "admin") loadAdminPortal();
         });
     });
 
@@ -544,7 +547,7 @@ document.addEventListener("DOMContentLoaded", () => {
             video_id:       vrVideoData.video_id,
             filename:       vrVideoData.filename,
             pipeline_name:  "vehicle_recognition",
-            roi_normalized: [],   // vehicle recognition needs no ROI polygon
+            roi_normalized: [],
             config:         {},
             stream_id:      vrStreamId || null
         };
@@ -577,7 +580,6 @@ document.addEventListener("DOMContentLoaded", () => {
         vrStatusMsg.textContent = "🔴 Live";
         vrStatusMsg.style.color = "#ef4444";
 
-        // Switch img to the annotated AI stream
         vrStreamImg.src = `/api/stream/${vrSessionId}`;
         vrStreamImg.classList.remove("hidden");
         vrPlaceholder.classList.add("hidden");
@@ -585,7 +587,6 @@ document.addEventListener("DOMContentLoaded", () => {
         vrLogContainer.innerHTML = '<p class="placeholder">Scanning…</p>';
         vrSeenPlates.clear();
 
-        // Poll the session metadata for new detections
         vrPollInterval = setInterval(vrPollDetections, 2000);
     }
 
@@ -604,25 +605,35 @@ document.addEventListener("DOMContentLoaded", () => {
         vrStatusMsg.style.color = "#94a3b8";
     }
 
-    // ── Detection polling (reads frame_metadata via /api/alerts endpoint) ─
-    // VehicleRecognitionPipeline emits no "alert" events; instead we parse
-    // the detections out of a lightweight dedicated endpoint below.
     function vrPollDetections() {
         if (!vrSessionId) return;
 
-        // We re-use the existing /api/alerts endpoint which returns []
-        // for vehicle_recognition (no alert events). For actual detection
-        // cards we call a thin metadata endpoint we add to main.py.
         fetch(`/api/vr_detections/${vrSessionId}`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
                 if (!data || !data.detections) return;
                 const placeholder = vrLogContainer.querySelector(".placeholder");
+
                 data.detections.forEach(det => {
-                    if (!det.plate || vrSeenPlates.has(det.plate)) return;
-                    vrSeenPlates.add(det.plate);
-                    if (placeholder) placeholder.remove();
-                    vrLogContainer.prepend(createVrCard(det));
+                    if (!det.plate) return;
+
+                    let existingCard = document.getElementById(`vr-card-${det.plate}`);
+
+                    if (existingCard) {
+                        existingCard.querySelector('.vr-visits strong').textContent = det.total_visits;
+
+                        if (det.image_path) {
+                            let imgEl = existingCard.querySelector("img");
+                            let newFileName = det.image_path.split(/[\\/]/).pop();
+
+                            if (imgEl && !imgEl.src.includes(newFileName)) {
+                                imgEl.src = '/vehicle_images/' + newFileName;
+                            }
+                        }
+                    } else {
+                        if (placeholder) placeholder.remove();
+                        vrLogContainer.prepend(createVrCard(det));
+                    }
                 });
             })
             .catch(() => {});
@@ -631,11 +642,91 @@ document.addEventListener("DOMContentLoaded", () => {
     function createVrCard(det) {
         const card = document.createElement("div");
         card.className = "vr-card";
+        card.id = `vr-card-${det.plate}`;
+
+        const isKnown = det.status === "Known";
+        const statusBadge = isKnown
+            ? `<span style="color:#10b981;font-size:0.75rem;font-weight:600;margin-left:6px;">[Known]</span>`
+            : `<span style="color:#ef4444;font-size:0.75rem;font-weight:600;margin-left:6px;">[Unknown]</span>`;
+
+        const typeEmojiMap = { "Truck": "🚚", "Motorcycle": "🏍️", "Bus": "🚌" };
+        const emoji = typeEmojiMap[det.vehicle_type] || "🚗";
+
         card.innerHTML = `
-            <div class="vr-plate">🚗 ${det.plate}</div>
-            <div class="vr-visits">Total Visits: <strong>${det.total_visits}</strong></div>
-            <div class="vr-time">${new Date().toLocaleTimeString()}</div>
+            <div style="display: flex; align-items: center; width: 100%;">
+                <img src="${det.image_path ? '/vehicle_images/' + det.image_path.split(/[\\/]/).pop() : ''}" alt="Vehicle Image" style="width: 120px; height: 90px; object-fit: cover; border-radius: 8px; margin-right: 15px; background-color: #333;">
+                <div style="flex-grow: 1;">
+                    <div class="vr-plate">${emoji} ${det.vehicle_type || 'Vehicle'} — ${det.plate} ${statusBadge}</div>
+                    <div class="vr-visits">Total Visits: <strong>${det.total_visits}</strong></div>
+                    <div class="vr-time">${new Date().toLocaleTimeString()}</div>
+                </div>
+            </div>
         `;
         return card;
     }
 });
+
+// ── Admin Portal (global scope so onclick= attributes can reach these) ────────
+function loadAdminPortal() {
+    const container = document.getElementById("admin-table-container");
+    if (!container) return;
+    container.innerHTML = '<p class="placeholder">Loading...</p>';
+
+    fetch("/api/vehicles")
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+            if (!data || !data.vehicles || data.vehicles.length === 0) {
+                container.innerHTML = '<p class="placeholder">No vehicles in the database yet.</p>';
+                return;
+            }
+
+            const rows = data.vehicles.map(v => {
+                const imgHtml = v.image_path
+                    ? `<img src="/vehicle_images/${v.image_path.split(/[\\/]/).pop()}" style="width:80px;height:60px;object-fit:cover;border-radius:6px;background:#333;">`
+                    : `<div style="width:80px;height:60px;background:#334155;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:0.7rem;">No Image</div>`;
+
+                const typeEmojiMap = { "Truck": "🚚", "Motorcycle": "🏍️", "Bus": "🚌" };
+                const typeEmoji    = typeEmojiMap[v.vehicle_type] || "🚗";
+                const statusColor  = v.status === "Known" ? "#10b981" : "#ef4444";
+                const actionBtn    = v.status !== "Known"
+                    ? `<button onclick="registerVehicle('${v.plate_number}')" style="background:#10b981;color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:0.8rem;">✔ Register</button>`
+                    : `<span style="color:#10b981;font-weight:600;">✔ Registered</span>`;
+
+                return `<tr style="border-bottom:1px solid #1e293b;">
+                    <td style="padding:10px;">${imgHtml}</td>
+                    <td style="padding:10px;font-weight:600;">${v.plate_number}</td>
+                    <td style="padding:10px;">${typeEmoji} ${v.vehicle_type || 'Car'}</td>
+                    <td style="padding:10px;">${v.total_visits}</td>
+                    <td style="padding:10px;color:${statusColor};font-weight:600;">${v.status || 'Unknown'}</td>
+                    <td style="padding:10px;">${actionBtn}</td>
+                </tr>`;
+            }).join("");
+
+            container.innerHTML = `
+                <table style="width:100%;border-collapse:collapse;font-size:0.9rem;">
+                    <thead>
+                        <tr style="color:#94a3b8;border-bottom:2px solid #334155;">
+                            <th style="padding:10px;text-align:left;">Thumbnail</th>
+                            <th style="padding:10px;text-align:left;">Plate</th>
+                            <th style="padding:10px;text-align:left;">Type</th>
+                            <th style="padding:10px;text-align:left;">Visits</th>
+                            <th style="padding:10px;text-align:left;">Status</th>
+                            <th style="padding:10px;text-align:left;">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            `;
+        })
+        .catch(() => {
+            container.innerHTML = '<p class="placeholder" style="color:#ef4444;">Failed to load vehicles.</p>';
+        });
+}
+
+function registerVehicle(plate) {
+    fetch(`/api/register_vehicle/${encodeURIComponent(plate)}`, { method: "POST" })
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(() => loadAdminPortal())
+        .catch(() => alert("Failed to register vehicle: " + plate));
+}
+

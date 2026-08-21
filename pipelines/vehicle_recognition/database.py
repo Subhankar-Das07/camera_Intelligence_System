@@ -63,7 +63,10 @@ class VehicleDatabase:
                         plate_number TEXT PRIMARY KEY,
                         total_visits INTEGER DEFAULT 1,
                         first_seen DATETIME,
-                        last_seen DATETIME
+                        last_seen DATETIME,
+                        image_path TEXT,
+                        status TEXT DEFAULT 'Unknown',
+                        vehicle_type TEXT DEFAULT 'Car'
                     )
                 """)
                 
@@ -82,12 +85,41 @@ class VehicleDatabase:
                 """)
                 
                 self.conn.commit()
+                
+                # Safe migration: add image_path to existing tables
+                try:
+                    cursor.execute("ALTER TABLE vehicles ADD COLUMN image_path TEXT")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+                # Safe migration: add status column to existing tables
+                try:
+                    cursor.execute("ALTER TABLE vehicles ADD COLUMN status TEXT DEFAULT 'Unknown'")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+                # Safe migration: add vehicle_type column to existing tables
+                try:
+                    cursor.execute("ALTER TABLE vehicles ADD COLUMN vehicle_type TEXT DEFAULT 'Car'")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                    
                 logger.info("Database schema initialized successfully.")
             except sqlite3.Error as e:
                 logger.error(f"Database initialization error: {e}")
                 raise
 
-    def record_visit(self, plate_number: str, snapshot_img: np.ndarray, plate_crop_img: np.ndarray, confidence: float) -> int:
+    def record_visit(
+        self,
+        plate_number: str,
+        snapshot_img: np.ndarray,
+        plate_crop_img: np.ndarray,
+        confidence: float,
+        vehicle_type: str = "Car",
+    ) -> int:
         """
         Record a vehicle visit, save images to disk, and update the database.
         
@@ -96,6 +128,7 @@ class VehicleDatabase:
             snapshot_img (np.ndarray): The full snapshot image.
             plate_crop_img (np.ndarray): The cropped license plate image.
             confidence (float): The OCR confidence score.
+            vehicle_type (str): YOLO-derived vehicle type label.
             
         Returns:
             int: The total number of visits for this vehicle.
@@ -115,15 +148,15 @@ class VehicleDatabase:
                     visit_num = row['total_visits'] + 1
                     cursor.execute("""
                         UPDATE vehicles 
-                        SET total_visits = ?, last_seen = ? 
+                        SET total_visits = ?, last_seen = ?, vehicle_type = ?
                         WHERE plate_number = ?
-                    """, (visit_num, now, plate_number))
+                    """, (visit_num, now, vehicle_type, plate_number))
                 else:
                     visit_num = 1
                     cursor.execute("""
-                        INSERT INTO vehicles (plate_number, total_visits, first_seen, last_seen) 
-                        VALUES (?, ?, ?, ?)
-                    """, (plate_number, visit_num, now, now))
+                        INSERT INTO vehicles (plate_number, total_visits, first_seen, last_seen, vehicle_type) 
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (plate_number, visit_num, now, now, vehicle_type))
                     
                 # Define image paths
                 snapshot_filename = f"{plate_number}_visit{visit_num}_{timestamp_str}.jpg"
@@ -198,6 +231,67 @@ class VehicleDatabase:
             except sqlite3.Error as e:
                 logger.error(f"Database error while retrieving stats for {plate_number}: {e}")
                 return None
+
+    def update_vehicle_image(self, plate_number: str, image_path: str) -> None:
+        """
+        Equivalent update function to log the saved image_path for a vehicle.
+        
+        Args:
+            plate_number (str): The recognized license plate number.
+            image_path (str): The file path to the saved vehicle image.
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("UPDATE vehicles SET image_path = ? WHERE plate_number = ?", (image_path, plate_number))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Database error while updating image path for {plate_number}: {e}")
+
+    def get_vehicle(self, plate_number: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single vehicle record including status and vehicle_type."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT plate_number, total_visits, image_path, status, vehicle_type FROM vehicles WHERE plate_number = ?",
+                    (plate_number,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return dict(row)
+            except sqlite3.Error as e:
+                logger.error(f"Database error while retrieving vehicle {plate_number}: {e}")
+                return None
+
+    def get_all_vehicles(self) -> list:
+        """Return all vehicles with plate_number, total_visits, image_path, status, and vehicle_type."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT plate_number, total_visits, image_path, status, vehicle_type FROM vehicles ORDER BY last_seen DESC"
+                )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logger.error(f"Database error while retrieving all vehicles: {e}")
+                return []
+
+    def register_vehicle(self, plate_number: str) -> None:
+        """Mark a vehicle as Known in the database."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE vehicles SET status = 'Known' WHERE plate_number = ?",
+                    (plate_number,)
+                )
+                self.conn.commit()
+                logger.info(f"Vehicle {plate_number} registered as Known.")
+            except sqlite3.Error as e:
+                logger.error(f"Database error while registering vehicle {plate_number}: {e}")
 
     def __del__(self):
         """Ensure database connection is closed upon object destruction."""

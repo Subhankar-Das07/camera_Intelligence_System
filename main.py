@@ -34,6 +34,7 @@ for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
+app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
 app.include_router(mobile_router)
 
 @app.on_event("startup")
@@ -324,12 +325,36 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
         if metadata and metadata.get("detections"):
             for det in metadata["detections"]:
                 plate = det.get("plate")
-                if plate and plate not in vr_detected_plates[session_id]:
-                    vr_detected_plates[session_id].add(plate)
-                    vr_detections[session_id].append({
-                        "plate":        plate,
-                        "total_visits": det.get("total_visits", 1),
-                    })
+                if plate:
+                    existing_record = next((d for d in vr_detections[session_id] if d["plate"] == plate), None)
+
+                    # Fetch latest status and vehicle_type from DB for this plate
+                    db_status       = "Unknown"
+                    db_vehicle_type = det.get("vehicle_type", "Car")
+                    try:
+                        vehicle_row = pipeline.db.get_vehicle(plate)
+                        if vehicle_row:
+                            db_status       = vehicle_row.get("status", "Unknown")
+                            db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
+                    except Exception:
+                        pass
+
+                    if existing_record:
+                        existing_record["total_visits"]  = det.get("total_visits", existing_record.get("total_visits", 1))
+                        existing_record["status"]        = db_status
+                        existing_record["vehicle_type"]  = db_vehicle_type
+                        if det.get("image_path"):
+                            existing_record["image_path"] = det.get("image_path")
+                    else:
+                        if session_id in vr_detected_plates:
+                            vr_detected_plates[session_id].add(plate)
+                        vr_detections[session_id].append({
+                            "plate":        plate,
+                            "total_visits": det.get("total_visits", 1),
+                            "image_path":   det.get("image_path"),
+                            "status":       db_status,
+                            "vehicle_type": db_vehicle_type,
+                        })
         if frame is not None:
             ok, buf = cv2.imencode('.jpg', frame)
             if ok:
@@ -341,6 +366,27 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
 def get_vr_detections(session_id: str):
     """Return the list of confirmed unique plates detected in a VR session."""
     return {"detections": vr_detections.get(session_id, [])}
+
+@app.get("/api/vehicles")
+def get_all_vehicles():
+    """Return all vehicles from the database for the Admin Portal."""
+    try:
+        pipeline = registry.get_pipeline("vehicle_recognition")
+        vehicles = pipeline.db.get_all_vehicles()
+        return {"vehicles": vehicles}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/register_vehicle/{plate}")
+def register_vehicle(plate: str):
+    """Mark a vehicle plate as Known in the database."""
+    try:
+        pipeline = registry.get_pipeline("vehicle_recognition")
+        pipeline.db.register_vehicle(plate)
+        return {"status": "ok", "plate": plate}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Mount static root last

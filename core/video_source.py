@@ -59,6 +59,12 @@ class ThreadedCamera:
             grabbed = self.grabbed
         return grabbed, frame
 
+    def grab(self):
+        return self.grabbed
+
+    def retrieve(self):
+        return self.read()
+
     def isOpened(self):
         return self.cap.isOpened()
 
