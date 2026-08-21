@@ -1,0 +1,3 @@
+# This file ensures the face_recognition/data/ directory is tracked by git.
+# Actual data files (identities.json, embeddings.npz, faces.faiss, face crops)
+# are excluded via .gitignore and are generated at runtime.

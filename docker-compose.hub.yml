@@ -1,0 +1,13 @@
+# Pull-only override for Docker Hub image (no local Dockerfile build).
+#
+#   docker pull drpinfotech/camera-intelligence:develop
+#   docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
+#
+# Requires Compose v2.24+ for `!reset`. If your Compose is older, keep the
+# same command with `--no-build` so the Hub image is used.
+
+services:
+  app:
+    image: drpinfotech/camera-intelligence:develop
+    pull_policy: always
+    build: !reset null

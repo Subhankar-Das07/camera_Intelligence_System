@@ -56,27 +56,30 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         
-        # Verify Database contents
-        logger.info("Test finished. Querying database for summary...")
+        # Verify Database contents (Redis)
+        logger.info("Test finished. Querying Redis for summary...")
         db = VehicleDatabase()
-        
-        with db.lock:
-            try:
-                cursor = db.conn.cursor()
-                cursor.execute("SELECT plate_number, total_visits, first_seen, last_seen FROM vehicles ORDER BY last_seen DESC")
-                rows = cursor.fetchall()
-                
-                print("\n" + "="*70)
-                print("DATABASE SUMMARY: Logged Vehicles")
-                print("="*70)
-                if not rows:
-                    print("No vehicles logged in the database yet.")
-                else:
-                    for row in rows:
-                        print(f"Plate: {row['plate_number']:<15} | Visits: {row['total_visits']:<5} | First: {row['first_seen']} | Last: {row['last_seen']}")
-                print("="*70 + "\n")
-            except Exception as e:
-                logger.error(f"Error querying database: {e}")
+        try:
+            plates = [p.decode() if isinstance(p, bytes) else str(p)
+                      for p in db.r.smembers("vr:plates")]
+            print("\n" + "=" * 70)
+            print("DATABASE SUMMARY: Logged Vehicles (Redis)")
+            print("=" * 70)
+            if not plates:
+                print("No vehicles logged in the database yet.")
+            else:
+                for plate in sorted(plates):
+                    stats = db.get_vehicle_stats(plate)
+                    if not stats:
+                        continue
+                    print(
+                        f"Plate: {stats['plate_number']:<15} | "
+                        f"Visits: {stats['total_visits']:<5} | "
+                        f"First: {stats['first_seen']} | Last: {stats['last_seen']}"
+                    )
+            print("=" * 70 + "\n")
+        except Exception as e:
+            logger.error(f"Error querying database: {e}")
 
 if __name__ == "__main__":
     main()

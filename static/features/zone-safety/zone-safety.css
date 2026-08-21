@@ -1,0 +1,2 @@
+/* Zone Safety feature-only tweaks */
+#roi-canvas.hidden { display: none !important; }

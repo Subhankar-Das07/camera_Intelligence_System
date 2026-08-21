@@ -8,7 +8,13 @@ dist/
 
 # ── Environment / Secrets ─────────────────────────────
 .env
+.venv/
+venv/
 *.pem
+
+# ── Legacy on-disk DBs (Redis is canonical now) ───────
+storage/vehicle_intelligence.db
+face_recognition/data/
 
 # ── Session logs (generated at runtime) ───────────────
 reports/*.log
@@ -52,3 +58,12 @@ storage/previews/
 storage/snapshots/
 storage/vehicle_images/
 *.pt
+
+# ── Face Recognition (Ayush) ─────────────────────────
+# Downloaded ML models
+face_recognition/models/
+# Generated data / PII
+face_recognition/data/persons/
+face_recognition/data/embeddings.npz
+face_recognition/data/faces.faiss
+face_recognition/data/identities.json

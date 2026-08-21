@@ -1,4 +1,11 @@
-"""Vehicle recognition database backed entirely by Redis."""
+import os
+import re
+
+# 1. database.py
+with open("pipelines/vehicle_recognition/database.py", "r", encoding="utf-8") as f:
+    db_content = f.read()
+
+db_clean = """\"\"\"Vehicle recognition database backed entirely by Redis.\"\"\"
 
 from __future__ import annotations
 
@@ -17,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 
 class VehicleDatabase:
-    """
+    \"\"\"
     Redis-backed vehicle / visit store.
     Snapshot and plate-crop images are stored as Redis binary blobs.
-    """
+    \"\"\"
 
     def __init__(self, db_path: str = "storage/vehicle_intelligence.db"):
         self.db_path = db_path
@@ -156,3 +163,73 @@ class VehicleDatabase:
         plate = plate_number.strip().upper()
         prefix = "vr:snap" if kind == "snap" else "vr:crop"
         return self.r.get(f"{prefix}:{plate}:{visit_number}")
+"""
+with open("pipelines/vehicle_recognition/database.py", "w", encoding="utf-8") as f:
+    f.write(db_clean)
+
+# 2. index.html
+with open("static/index.html", "r", encoding="utf-8") as f:
+    index_content = f.read()
+
+# The conflict is resolved by taking the `=======` to `>>>>>>>` section.
+index_clean = re.sub(r'<<<<<<< HEAD.*?=======\n(.*?)\n>>>>>>> [a-f0-9]+', r'\1', index_content, flags=re.DOTALL)
+with open("static/index.html", "w", encoding="utf-8") as f:
+    f.write(index_clean)
+
+# 3. main.py
+with open("main.py", "r", encoding="utf-8") as f:
+    main_content = f.read()
+
+# Fix _vr_add_detection
+main_clean = main_content.replace(
+'''def _vr_add_detection(session_id: str, plate: str, total_visits: int) -> bool:
+    """Return True if this plate is newly recorded for the session."""
+    r = get_redis()
+    added = r.sadd(_vr_plates_key(session_id), plate)
+    if not added:
+        return False
+    r.rpush(
+        _vr_det_key(session_id),
+        json.dumps({"plate": plate, "total_visits": total_visits}).encode(),
+    )
+    return True''',
+'''def _vr_add_detection(session_id: str, plate: str, total_visits: int, status: str = "Unknown", vehicle_type: str = "Car", image_path: str = None) -> bool:
+    """Return True if this plate is newly recorded for the session."""
+    r = get_redis()
+    added = r.sadd(_vr_plates_key(session_id), plate)
+    if not added:
+        return False
+    r.rpush(
+        _vr_det_key(session_id),
+        json.dumps({
+            "plate": plate,
+            "total_visits": total_visits,
+            "status": status,
+            "vehicle_type": vehicle_type,
+            "image_path": image_path
+        }).encode(),
+    )
+    return True'''
+)
+
+# Resolve main.py conflict block
+main_conflict = re.search(r'<<<<<<< HEAD(.*?)=======.*?_vr_add_detection.*?>>>>>>> [a-f0-9]+', main_clean, re.DOTALL)
+if main_conflict:
+    merged_block = """
+                    # Fetch latest status and vehicle_type from DB for this plate
+                    db_status       = "Unknown"
+                    db_vehicle_type = det.get("vehicle_type", "Car")
+                    image_path      = det.get("image_path")
+                    try:
+                        vehicle_row = pipeline.db.get_vehicle_stats(plate)
+                        if vehicle_row:
+                            db_status       = vehicle_row.get("status", "Unknown")
+                            db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
+                    except Exception:
+                        pass
+                    _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
+"""
+    main_clean = main_clean[:main_conflict.start()] + merged_block + main_clean[main_conflict.end():]
+
+with open("main.py", "w", encoding="utf-8") as f:
+    f.write(main_clean)

@@ -24,26 +24,28 @@ A robust, real-time computer vision platform designed to run AI pipelines on bot
 
 The codebase is highly modularized so different teams (AI, Web, Mobile) can work independently without stepping on each other's toes.
 
-### 1. AI & Backend Developers (`core/` and `pipelines/`)
-- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard.
+### 1. AI & Backend Developers (`core/`, `pipelines/`, `face_recognition/`)
+- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard (including Face Recognition endpoints).
 - **`core/`**: Contains the engine logic.
   - `base_pipeline.py`: The abstract class all AI models must inherit from.
   - `registry.py`: Auto-discovers and registers pipelines.
   - `mobile_ws.py`: Handles WebSocket connections from the Flutter app.
   - `video_source.py`: Background thread manager for lag-free RTSP streaming.
-- **`pipelines/`**: **Add new AI models here!**
-  - To add a new AI capability (e.g., Face Detection, Fire Detection):
-    1. Create a new file (e.g., `fire_pipeline.py`).
-    2. Inherit from `BaseVideoPipeline`.
-    3. Implement `initialize()` to load your PyTorch/YOLO model.
-    4. Implement `run_on_video()` to yield frames and JSON alerts.
-    5. The server will automatically discover it and add it to the Web Dashboard dropdown!
+- **`pipelines/`**:
+  - `face_recognition_pipeline.py`: Integrates the dedicated face recognition module into the pipeline architecture. Yields frames with Known/Unknown bounding boxes.
+  - *To add a new AI capability (e.g., Fire Detection):* Inherit from `BaseVideoPipeline`, implement `initialize()` and `run_on_video()`.
+- **`face_recognition/` (Ayush Module)**: 
+  - A highly accurate module using InsightFace (SCRFD + ArcFace) and FAISS for vector search.
+  - Features a unified database (`data/persons/`) where all unique faces are auto-saved on their first visit.
+  - Uses `supervision.ByteTrack` for stable identity tracking and temporal consensus for high-confidence matching.
 
 ### 2. UI / UX Web Developers (`static/`)
-This folder contains the Admin Web Dashboard that manages cameras and views live RTSP streams.
-- **`index.html`**: The main layout and DOM structure.
-- **`style.css`**: All styling. Uses a modern, dark-mode, flexbox-driven design.
-- **`app.js`**: Handles API calls to `main.py`, manages the video player, and calculates the exact pixel mapping for the Region of Interest (ROI) drawing canvas.
+Unified product shell with per-feature folders (branch-friendly):
+- **`static/shell/`** — shared top nav and design tokens
+- **`static/features/zone-safety/`** — intrusion / danger zone / fall UI
+- **`static/features/vehicle/`** — vehicle recognition UI
+- **`static/features/face/`** — face recognition UI
+- **`static/shared/`** — shared upload/RTSP helpers
 
 ### 3. Android / Flutter Developers (`edge_vision_app/`)
 This folder contains the mobile application that turns an Android phone into an edge-streaming camera.
@@ -57,14 +59,51 @@ This folder contains the mobile application that turns an Android phone into an 
 
 ### Prerequisites
 - Windows 10/11 or Linux with **Python 3.10+**
+- Docker Desktop (recommended for team deploy)
 - (Optional) NVIDIA GPU for faster YOLO inference.
 
-### 1. Install Dependencies
+### Team main repository (endevs)
+**Source of truth:** https://github.com/endevs/camera_Intelligence  
+**Base branch for all feature work:** `main`  
+https://github.com/endevs/camera_Intelligence/tree/main
+
+Clone and start a feature branch:
+
+```bash
+git clone https://github.com/endevs/camera_Intelligence.git
+cd camera_Intelligence
+git checkout main
+git pull
+git checkout -b feature/<name>
+```
+
+| Area | Branch |
+|------|--------|
+| Zone Safety | `feature/zone-safety` |
+| Vehicle | `feature/vehicle` |
+| Face | `feature/face` |
+
+Primary folders: `static/features/zone-safety/`, `static/features/vehicle/`, `static/features/face/`
+
+### Docker Hub image (no local build)
+Image: **`drpinfotech/camera-intelligence:develop`** (also tagged `0.1.0`)  
+https://hub.docker.com/r/drpinfotech/camera-intelligence
+
+```bat
+docker pull drpinfotech/camera-intelligence:develop
+docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
+```
+Open http://localhost:8000
+
+Local rebuild from source: run `docker-refresh.bat`  
+Publish new Hub tags (maintainers): run `docker-publish.bat`
+
+### 1. Install Dependencies (local Python)
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run the Server
+### 2. Run the Server (local Python)
 ```bash
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
