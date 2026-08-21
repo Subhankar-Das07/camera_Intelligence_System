@@ -452,7 +452,7 @@ async def list_identities(mode: str = "visitor"):
     result = []
     for pid, meta in identities.items():
         entry = {"person_id": pid, **meta}
-        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid)
+        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid, mode)
         result.append(entry)
     result.sort(key=lambda x: x.get("created_at", 0))
     return {"identities": result}
@@ -567,10 +567,9 @@ def get_attendance_status():
 
 
 @app.get("/api/faces/image/{person_id}/{index}")
-def face_image(person_id: str, index: int = 1):
+async def face_image(person_id: str, index: int, mode: str = "visitor"):
     """Serve a face crop JPEG stored in Redis."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     data = im.get_face_bytes(person_id, index)
     if not data:
         raise HTTPException(status_code=404, detail="Face image not found.")

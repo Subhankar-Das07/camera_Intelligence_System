@@ -38,9 +38,9 @@ FR_IDENTITIES_KEY = b"fr:identities"
 class IdentityManager:
     """Thread-safe face identity manager backed only by Redis + in-memory FAISS."""
 
-    def __init__(self, base_dir: str = BASE_DIR):
+    def __init__(self, redis_prefix: str = "fr:visitor"):
         self._lock = threading.RLock()
-        self._redis_prefix = base_dir  # We repurpose base_dir parameter as redis_prefix
+        self._redis_prefix = redis_prefix
         if self._redis_prefix.endswith('/'):
             self._redis_prefix = self._redis_prefix[:-1]
 

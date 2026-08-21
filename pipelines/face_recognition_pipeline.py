@@ -34,7 +34,7 @@ from core.video_source import get_video_source
 from face_recognition.config import (
     COLOR_KNOWN, COLOR_UNKNOWN, COLOR_LOW_QUALITY, COLOR_CANDIDATE,
     RECOGNITION_EVERY_N_FRAMES,
-    AUTO_LABEL_PREFIX, BASE_DIR, ATTENDANCE_DIR
+    AUTO_LABEL_PREFIX
 )
 from face_recognition.embedder import FaceEmbedder
 from face_recognition.tracker import FaceTracker, TrackedFace
@@ -71,8 +71,8 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
         InsightFace models are downloaded on first call (cached after).
         """
         log.info("[FaceRecognitionPipeline] Initializing sub-modules…")
-        self._visitor_manager   = IdentityManager(BASE_DIR)
-        self._attendance_manager = IdentityManager(ATTENDANCE_DIR)
+        self._visitor_manager   = IdentityManager("fr:visitor")
+        self._attendance_manager = IdentityManager("fr:attendance")
         self._embedder         = FaceEmbedder()
         self._tracker          = FaceTracker()
         self._visitor_recognizer = FaceRecognizer(self._visitor_manager)
