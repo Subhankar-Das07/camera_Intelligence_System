@@ -389,13 +389,11 @@ async def connect_webcam(index: int = 0):
         h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
         return cam, w, h
 
-    loop = asyncio.get_running_loop()
     try:
-        cam, width, height = await asyncio.wait_for(
-            loop.run_in_executor(None, _open), timeout=10.0
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=400, detail="Webcam timed out. Check that no other app is using it.")
+        # Call directly on the main event loop thread to avoid COM/threading issues with DSHOW
+        cam, width, height = _open()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     if cam is None:
         raise HTTPException(status_code=400,

@@ -17,13 +17,11 @@ class ThreadedCamera:
             src = int(src)
         self.src = src
         
-        # Use DirectShow on Windows for local webcams (integers) to prevent MSMF hangs
-        if isinstance(self.src, int) and os.name == 'nt':
-            self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
-        else:
-            self.cap = cv2.VideoCapture(self.src)
+        self.cap = cv2.VideoCapture(self.src)
             
+        print(f"DEBUG: isOpened = {self.cap.isOpened()}")
         self.grabbed, self.frame = self.cap.read()
+        print(f"DEBUG: read() returned grabbed={self.grabbed}, frame={'None' if self.frame is None else 'Valid'}")
         self.started = False
         self.read_lock = threading.Lock()
         self.thread = None

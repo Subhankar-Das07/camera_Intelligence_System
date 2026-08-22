@@ -52,6 +52,60 @@ smart_vision_assistant/reports/
 # -- Video Analytics App -----------------------------
 storage/alerts/
 storage/uploads/
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# ── Environment / Secrets ─────────────────────────────
+.env
+.venv/
+venv/
+*.pem
+
+# ── Legacy on-disk DBs (Redis is canonical now) ───────
+storage/vehicle_intelligence.db
+face_recognition/data/
+
+# ── Session logs (generated at runtime) ───────────────
+reports/*.log
+
+# ── IDE / OS ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# ── Flutter / Android build artifacts ─────────────────
+edge_vision_app/build/
+edge_vision_app/.dart_tool/
+edge_vision_app/.flutter-plugins
+edge_vision_app/.flutter-plugins-dependencies
+edge_vision_app/.packages
+edge_vision_app/android/.gradle/
+edge_vision_app/android/local.properties
+edge_vision_app/android/app/build/
+edge_vision_app/ios/Pods/
+edge_vision_app/ios/.symlinks/
+
+# ── Node modules (never commit) ───────────────────────
+node_modules/
+
+# ── smart_vision_assistant caches ─────────────────────
+smart_vision_assistant/__pycache__/
+smart_vision_assistant/.pytest_cache/
+smart_vision_assistant/data/
+smart_vision_assistant/database/
+smart_vision_assistant/reports/
+
+# -- Video Analytics App -----------------------------
+storage/alerts/
+storage/uploads/
 storage/outputs/
 *.pt
 
@@ -63,3 +117,7 @@ face_recognition/data/persons/
 face_recognition/data/embeddings.npz
 face_recognition/data/faces.faiss
 face_recognition/data/identities.json
+
+# Native Windows Redis
+Redis/
+Redis.zip

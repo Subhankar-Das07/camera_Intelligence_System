@@ -13,20 +13,5 @@ services:
       timeout: 3s
       retries: 10
 
-  app:
-    image: drpinfotech/camera-intelligence:develop
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      REDIS_URL: redis://redis:6379/0
-    volumes:
-      - app_storage:/app/storage
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
 volumes:
   redis_data:
-  app_storage:
