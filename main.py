@@ -18,11 +18,15 @@ from core.registry import registry
 from core.redis_client import get_redis, redis_str
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
+from core.site_admin_api import router as site_admin_router
+from core.site_admin_runtime import start_runtime
 from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
+from pipelines.gate_analytics_pipeline import GateAnalyticsPipeline
 
 # Register the vehicle recognition pipeline into the shared singleton registry
 registry.register("vehicle_recognition", VehicleRecognitionPipeline)
+registry.register("gate_analytics", GateAnalyticsPipeline)
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -38,6 +42,7 @@ for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 app.include_router(mobile_router)
+app.include_router(site_admin_router)
 
 @app.on_event("startup")
 async def _on_startup():
@@ -45,6 +50,15 @@ async def _on_startup():
     get_redis().ping()
     loop = asyncio.get_running_loop()
     start_mobile_worker(loop)
+    try:
+        registry.get_pipeline("vehicle_recognition").initialize()
+    except Exception:
+        pass
+    try:
+        registry.get_pipeline("gate_analytics").initialize()
+    except Exception:
+        pass
+    start_runtime()
 
 # ── Live stream handles stay in-process; DB/session data is Redis ─────────────
 rtsp_streams: Dict[str, ThreadedCamera] = {}

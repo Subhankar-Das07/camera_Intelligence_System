@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Site Admin — Camera Intelligence</title>
+    <link rel="stylesheet" href="/shell/shell.css">
+    <link rel="stylesheet" href="site-admin.css">
+</head>
+<body>
+    <nav class="cis-nav">
+        <a class="cis-brand" href="/">
+            <strong>Camera Intelligence</strong>
+            <span>Unified vision platform</span>
+        </a>
+        <div class="cis-nav-links">
+            <a href="/" data-nav="overview">Overview</a>
+            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
+            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
+            <a href="/features/face/" data-nav="face">Face Recognition</a>
+            <a href="/features/site-admin/" data-nav="site-admin">Site Admin</a>
+        </div>
+        <div class="sa-role-switch" id="role-switch" title="Switch role on this browser">
+            <button type="button" class="sa-role-btn" data-role="admin">Admin</button>
+            <button type="button" class="sa-role-btn" data-role="viewer">Viewer</button>
+        </div>
+    </nav>
+
+    <div class="sa-layout">
+        <aside class="sa-subnav">
+            <p class="sa-kicker">Site Admin</p>
+            <h1>Operations</h1>
+            <p class="sa-lead">Configure once. Feeds scan by rules. Use Alerts and Reports every day.</p>
+            <nav class="sa-tabs">
+                <button type="button" data-view="wizard" class="active">Wizard</button>
+                <button type="button" data-view="cameras">Cameras</button>
+                <div class="sa-nav-group" data-nav-group="rules">
+                    <button type="button" data-view="rules" class="sa-nav-parent">Rules</button>
+                    <div class="sa-nav-sub">
+                        <button type="button" data-view="staff">Staff</button>
+                        <button type="button" data-view="vehicles">Vehicles</button>
+                    </div>
+                </div>
+                <button type="button" data-view="monitor">Monitor</button>
+                <button type="button" data-view="alerts">Alerts</button>
+                <button type="button" data-view="reports">Reports</button>
+                <button type="button" data-view="settings">Settings</button>
+            </nav>
+            <div class="sa-live" id="live-panel">
+                <span class="sa-dot" id="live-dot"></span>
+                <span id="live-label">Idle</span>
+            </div>
+        </aside>
+
+        <main class="sa-main" id="sa-main">
+            <!-- filled by JS -->
+        </main>
+    </div>
+
+    <script src="/shell/shell.js"></script>
+    <script src="site-admin.js"></script>
+</body>
+</html>

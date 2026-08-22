@@ -19,6 +19,8 @@ Product: **Camera Intelligence System** — unified web UI + FastAPI vision pipe
 | Vehicle | `feature/vehicle` | `static/features/vehicle/`, `pipelines/vehicle_recognition/` |
 | Face | `feature/face` | `static/features/face/`, `face_recognition/`, face pipeline |
 
+**Site Admin** (product ops UI) lives in `static/features/site-admin/` plus `/api/site-admin/`. Do **not** edit Zone Safety / Vehicle / Face UI to add product features — keep those folders isolated.
+
 **Shared areas** (coordinate before changing): `static/shell/`, `static/shared/`, `main.py`, `core/`, `docker-compose*.yml`, `requirements.txt`.
 
 ---
@@ -112,7 +114,19 @@ docker compose -f docker-compose.yml -f docker-compose.hub.yml down
 - Hub: https://hub.docker.com/r/drpinfotech/camera-intelligence  
 - Tags: `develop` (rolling) and `0.1.0` (release)
 
+### Local Docker scripts (after you have a running stack)
+
+Everyday **code** changes (`core/`, `pipelines/`, `static/`, `main.py`) → run **`docker-quick.bat`** (fast restart; no re-download).
+
+Full decision table and all bats: [`docs/DOCKER_DEV.md`](docs/DOCKER_DEV.md).
+
 ### Optional: rebuild from source (maintainers / advanced)
+
+```bat
+docker-rebuild.bat
+```
+
+Rare full / slow refresh (`build --pull`):
 
 ```bat
 docker-refresh.bat

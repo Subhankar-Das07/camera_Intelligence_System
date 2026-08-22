@@ -2,6 +2,8 @@
 
 **New teammates:** start here → [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) (Docker install, Hub pull, Git feature branches, merge & conflicts).
 
+**Site operations (clients):** [`docs/CLIENT_ONBOARDING.md`](docs/CLIENT_ONBOARDING.md) — use the **Site Admin** tab only. Existing Zone Safety / Vehicle / Face pages are unchanged demo workspaces.
+
 A robust, real-time computer vision platform designed to run AI pipelines on both **RTSP IP Cameras (NVRs)** and **Android smartphones**. The system uses a FastAPI Python backend to perform YOLO object detection and tracking, serving a responsive Web Dashboard for management and a Flutter Mobile App for edge camera streaming.
 
 ---
@@ -97,7 +99,8 @@ docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
 ```
 Open http://localhost:8000
 
-Local rebuild from source: run `docker-refresh.bat`  
+**Local Docker (developers):** see [`docs/DOCKER_DEV.md`](docs/DOCKER_DEV.md) for the bat-file cheat sheet.  
+Everyday code changes → `docker-quick.bat`. Deps/`Dockerfile` → `docker-rebuild.bat`. Rare full rebuild → `docker-refresh.bat`.  
 Publish new Hub tags (maintainers): run `docker-publish.bat`
 
 ### 1. Install Dependencies (local Python)

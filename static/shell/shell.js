@@ -9,10 +9,22 @@
     if (path.includes("/features/zone-safety")) return "zone-safety";
     if (path.includes("/features/vehicle")) return "vehicle";
     if (path.includes("/features/face")) return "face";
+    if (path.includes("/features/site-admin")) return "site-admin";
     return "";
   }
 
+  function ensureSiteAdminLink() {
+    const nav = document.querySelector(".cis-nav-links");
+    if (!nav || nav.querySelector('[data-nav="site-admin"]')) return;
+    const a = document.createElement("a");
+    a.href = "/features/site-admin/";
+    a.setAttribute("data-nav", "site-admin");
+    a.textContent = "Site Admin";
+    nav.appendChild(a);
+  }
+
   function highlightNav() {
+    ensureSiteAdminLink();
     const key = currentNavKey();
     document.querySelectorAll(".cis-nav-links a[data-nav]").forEach((a) => {
       a.classList.toggle("active", a.getAttribute("data-nav") === key);
