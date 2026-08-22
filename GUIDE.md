@@ -25,24 +25,26 @@ A robust, real-time computer vision platform designed to run AI pipelines on bot
 The codebase is highly modularized so different teams (AI, Web, Mobile) can work independently without stepping on each other's toes.
 
 ### 1. AI & Backend Developers (`core/`, `pipelines/`, `face_recognition/`)
-- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard (including Face Recognition endpoints).
+- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard.
 - **`core/`**: Contains the engine logic.
   - `base_pipeline.py`: The abstract class all AI models must inherit from.
   - `registry.py`: Auto-discovers and registers pipelines.
   - `mobile_ws.py`: Handles WebSocket connections from the Flutter app.
   - `video_source.py`: Background thread manager for lag-free RTSP streaming.
 - **`pipelines/`**:
-  - `face_recognition_pipeline.py`: Integrates the dedicated face recognition module into the pipeline architecture. Yields frames with Known/Unknown bounding boxes.
-  - *To add a new AI capability (e.g., Fire Detection):* Inherit from `BaseVideoPipeline`, implement `initialize()` and `run_on_video()`.
+  - `face_recognition_pipeline.py`: Dedicated face recognition module. Yields frames with Known/Unknown bounding boxes.
+  - `room_guardian_pipeline.py`: Advanced object protection tracking using ByteTrack identity verification.
+  - `intrusion_pipeline.py`, `danger_zone_pipeline.py`, `fall_detection_pipeline.py`, `vehicle_recognition/`.
+  - *To add a new AI capability:* Inherit from `BaseVideoPipeline`, implement `initialize()` and `run_on_video()`.
 - **`face_recognition/` (Ayush Module)**: 
   - A highly accurate module using InsightFace (SCRFD + ArcFace) and FAISS for vector search.
-  - Features a unified database (`data/persons/`) where all unique faces are auto-saved on their first visit.
-  - Uses `supervision.ByteTrack` for stable identity tracking and temporal consensus for high-confidence matching.
+  - Uses `supervision.ByteTrack` for stable identity tracking.
+  - All identities and faces are persistently stored in the centralized **Redis** database.
 
 ### 2. UI / UX Web Developers (`static/`)
 Unified product shell with per-feature folders (branch-friendly):
 - **`static/shell/`** — shared top nav and design tokens
-- **`static/features/zone-safety/`** — intrusion / danger zone / fall UI
+- **`static/features/zone-safety/`** — intrusion / danger zone / room guardian UI
 - **`static/features/vehicle/`** — vehicle recognition UI
 - **`static/features/face/`** — face recognition UI
 - **`static/shared/`** — shared upload/RTSP helpers
@@ -59,16 +61,14 @@ This folder contains the mobile application that turns an Android phone into an 
 
 ### Prerequisites
 - Windows 10/11 or Linux with **Python 3.10+**
-- Docker Desktop (recommended for team deploy)
-- (Optional) NVIDIA GPU for faster YOLO inference.
+- Redis Database
+- (Optional) Docker Desktop (for Linux deployment)
 
 ### Team main repository (endevs)
 **Source of truth:** https://github.com/endevs/camera_Intelligence  
 **Base branch for all feature work:** `main`  
-https://github.com/endevs/camera_Intelligence/tree/main
 
 Clone and start a feature branch:
-
 ```bash
 git clone https://github.com/endevs/camera_Intelligence.git
 cd camera_Intelligence
@@ -77,40 +77,33 @@ git pull
 git checkout -b feature/<name>
 ```
 
-| Area | Branch |
-|------|--------|
-| Zone Safety | `feature/zone-safety` |
-| Vehicle | `feature/vehicle` |
-| Face | `feature/face` |
+---
 
-Primary folders: `static/features/zone-safety/`, `static/features/vehicle/`, `static/features/face/`
+## 🚀 How to Run the Project
 
-### Docker Hub image (no local build)
-Image: **`drpinfotech/camera-intelligence:develop`** (also tagged `0.1.0`)  
-https://hub.docker.com/r/drpinfotech/camera-intelligence
+There are **two** distinct ways to run this project depending on what hardware you need to access.
 
-```bat
-docker pull drpinfotech/camera-intelligence:develop
-docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
-```
-Open http://localhost:8000
+### Method 1: Native Windows Execution (Required for USB Webcams)
+**Use this method if you want to use your local PC's built-in USB webcam.** Docker on Windows runs inside a Linux virtual machine and physically cannot access Windows USB webcams.
+1. Run the local startup script:
+   ```powershell
+   .\start-windows-app.bat
+   ```
+2. The script will automatically launch a native Windows Redis server in the background and start the FastAPI application on port `8000`.
+3. Open your browser to `http://127.0.0.1:8000`.
 
-Local rebuild from source: run `docker-refresh.bat`  
-Publish new Hub tags (maintainers): run `docker-publish.bat`
+### Method 2: Docker Execution (For Linux / RTSP streaming)
+**Use this method if you are deploying to a Linux server or only testing with RTSP IP cameras and uploaded video files.**
+1. Rebuild and launch the Docker containers:
+   ```powershell
+   .\docker-refresh.bat
+   ```
+2. The Docker engine will pull the `redis:7-alpine` database and build the `camera-intelligence:develop` python application.
+3. Open your browser to `http://localhost:8000`.
 
-### 1. Install Dependencies (local Python)
-```bash
-pip install -r requirements.txt
-```
+---
 
-### 2. Run the Server (local Python)
-```bash
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-- The server will start and automatically download the YOLO weights on the first run.
-- Open your browser to `http://localhost:8000` to view the **Admin Web Dashboard**.
+## 💾 Database Architecture (Redis)
+This project has been fully migrated to use **Redis** as the centralized canonical database for all features. Local SQLite files (`vehicle_intelligence.db`) and local `.json` / `.npz` storage files have been deprecated to support seamless, persistent, multi-container deployments. 
 
-### 3. Connecting the Mobile App
-1. Find your PC's IP address (e.g., `192.168.1.50`).
-2. Build and install the Flutter APK from `edge_vision_app/` onto your Android device.
-3. Open the app, enter the PC's IP address, and hit connect. The app will immediately begin streaming to the `core/mobile_ws.py` engine.
+Ensure Redis is running (either natively or via Docker) on port `6379` before launching the FastAPI application.
