@@ -1,4 +1,5 @@
 import cv2
+import time
 import numpy as np
 from ultralytics import YOLO
 from shapely.geometry import box, Polygon, Point
@@ -28,6 +29,7 @@ class DangerZonePipeline(BaseVideoPipeline):
         roi_poly = Polygon(roi_pixels)
 
         frame_idx = 0
+        start_time = time.time()
         intrusion_active = False
         intrusion_frames_without_detection = 0
         patience = int(fps * 2)
@@ -55,7 +57,7 @@ class DangerZonePipeline(BaseVideoPipeline):
             if cooldown_frames > 0:
                 cooldown_frames -= 1
 
-            results = self.model(frame, classes=[0], verbose=False)[0]
+            results = self.model(frame, classes=[0], conf=0.70, imgsz=480, verbose=False)[0]
             
             # Natively draw skeleton over all people
             frame = results.plot()
@@ -120,8 +122,11 @@ class DangerZonePipeline(BaseVideoPipeline):
                     alert_id = str(uuid.uuid4())
                     alert_start_frame = frame_idx
                     alert_path = os.path.join(output_dir, f"alert_{alert_id}.webm")
-                    fourcc = cv2.VideoWriter_fourcc(*'vp80')
-                    alert_writer = cv2.VideoWriter(alert_path, fourcc, fps, (width, height))
+                    # Dynamically calculate actual processing FPS to prevent fast-forwarding
+                    elapsed_time = time.time() - start_time
+                    actual_fps = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
+                    fourcc = cv2.VideoWriter_fourcc(*"vp80") if "'" not in "vp80" else cv2.VideoWriter_fourcc(*"vp80")
+                    alert_writer = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"vp80"), actual_fps, (width, height))
                 elif intrusion_active:
                     if current_severity == "SEVERE":
                         alert_severity = "SEVERE"
@@ -179,3 +184,4 @@ class DangerZonePipeline(BaseVideoPipeline):
             }
 
         cap.release()
+

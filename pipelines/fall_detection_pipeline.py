@@ -18,6 +18,7 @@ provides the false-positive rejection instead of tight individual thresholds.
 """
 
 import cv2
+import time
 import numpy as np
 from ultralytics import YOLO
 import uuid
@@ -160,7 +161,7 @@ class FallDetectionPipeline(BaseVideoPipeline):
                 cooldown -= 1
 
             results = self.model.track(
-                frame, classes=[0], conf=conf_thresh,
+                frame, classes=[0], conf=conf_thresh, imgsz=480,
                 persist=True, verbose=False,
             )[0]
             frame = results.plot()
@@ -310,8 +311,11 @@ class FallDetectionPipeline(BaseVideoPipeline):
                 alert_id          = str(uuid.uuid4())
                 alert_start_frame = frame_idx
                 alert_path        = os.path.join(output_dir, f"alert_{alert_id}.webm")
-                fourcc            = cv2.VideoWriter_fourcc(*"vp80")
-                alert_writer      = cv2.VideoWriter(alert_path, fourcc, fps, (width, height))
+                # Dynamically calculate actual processing FPS to prevent fast-forwarding
+                elapsed_time = time.time() - start_time
+                actual_fps = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
+                fourcc = cv2.VideoWriter_fourcc(*"vp80") if "'" not in "vp80" else cv2.VideoWriter_fourcc(*"vp80")
+                alert_writer = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"vp80"), actual_fps, (width, height))
                 for buf_frame in frame_buffer:
                     alert_writer.write(buf_frame)
                     
@@ -361,3 +365,4 @@ class FallDetectionPipeline(BaseVideoPipeline):
             }
 
         cap.release()
+
