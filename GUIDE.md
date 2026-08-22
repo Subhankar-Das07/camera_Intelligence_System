@@ -2,7 +2,7 @@
 
 A robust, real-time edge computer vision platform designed to run state-of-the-art AI pipelines on **RTSP IP Cameras (NVRs)**, local **USB Webcams**, and **Android smartphones**. 
 
-This system leverages a highly concurrent FastAPI Python backend to perform YOLO-based object detection, semantic segmentation, and biometric vector-search tracking. It serves a responsive Web Dashboard for management and interfaces with a Flutter Mobile App for remote edge-camera streaming.
+This system leverages a highly concurrent FastAPI Python backend to perform YOLO-based object detection, semantic segmentation, ALPR (License Plate Recognition), and biometric vector-search tracking. It serves a responsive Web Dashboard for management and interfaces with a Flutter Mobile App for remote edge-camera streaming.
 
 ---
 
@@ -31,6 +31,7 @@ graph TD
             Byte[Supervision ByteTrack]
             Face[InsightFace SCRFD + ArcFace]
             FastSAM[FastSAM Segmentation]
+            OCR[EasyOCR / ALPR]
         end
         
         API[RESTful API Endpoints]
@@ -70,56 +71,60 @@ graph TD
 
 ## 🛠️ 2. Technology Stack
 
-### Backend & AI Engine
+### Backend & Core Engine
 - **Core Framework**: [FastAPI](https://fastapi.tiangolo.com/) with Uvicorn (ASGI) for highly concurrent, asynchronous HTTP and WebSocket serving.
-- **Computer Vision**: [OpenCV](https://opencv.org/) (`cv2`) for frame manipulation and MJPEG stream encoding.
-- **Object Detection & Pose**: [Ultralytics](https://ultralytics.com/) (YOLOv8, YOLO-Pose) and FastSAM.
-- **Face Recognition**: [InsightFace](https://github.com/deepinsight/insightface) (SCRFD for face detection + ArcFace for 512-dim embedding extraction).
-- **Object Tracking**: [Supervision](https://supervision.roboflow.com/) (`ByteTrack`) integrated with Kalman Filters.
+- **Computer Vision**: [OpenCV](https://opencv.org/) (`cv2`) for video buffer manipulation, threading, and MJPEG stream encoding.
+- **State & Caching**: **Redis** (`redis-py`) is the sole persistence layer for alerts, detections, and identities.
 
-### State Management & Databases
-- **Primary Database**: **Redis** (`redis-py`). Used as the single source of truth for identity persistence, attendance tracking, and system state.
-- **Vector Search**: **FAISS** (`faiss-cpu`). Utilized by the Face Recognition module for lightning-fast \( L_2 \) distance / cosine similarity matching against embedded vectors. Built dynamically in-memory from Redis on startup.
+### AI & Machine Learning Models
+- **General Object Detection**: [Ultralytics](https://ultralytics.com/) YOLOv8 (nano/small variants for edge efficiency).
+- **Human Pose & Fall Detection**: YOLOv8-Pose for 17-keypoint human skeleton extraction.
+- **Semantic Segmentation**: FastSAM (Fast Segment Anything) for zero-shot object bounding and pixel masking.
+- **Face Recognition**: [InsightFace](https://github.com/deepinsight/insightface) (SCRFD for bounding box detection + ArcFace for 512-dim embedding extraction).
+- **Tracking**: [Supervision](https://supervision.roboflow.com/) (`ByteTrack`) combined with internal Kalman Filters to prevent ID switching during occlusion.
+- **Vector Search**: **FAISS** (`faiss-cpu`) for \( L_2 \) distance cosine similarity matching of face vectors in micro-seconds.
+- **License Plate OCR**: Built-in edge Optical Character Recognition routines (ALPR).
 
 ### Frontend & Mobile
-- **Web Dashboard**: Vanilla JavaScript (ES6 Modules), HTML5, and pure CSS. Designed to be lightweight and fast without requiring Node.js build pipelines.
-- **Mobile Edge App**: **Flutter** (Dart). Connects to the backend via WebSockets to stream mobile camera frames and receive JSON-formatted bounding boxes.
+- **Web Dashboard**: Vanilla JavaScript (ES6 Modules), HTML5, and pure CSS. Zero-build-step design for maximum stability and hot-reloading speed.
+- **Mobile Edge App**: **Flutter** (Dart). Broadcasts raw phone camera frames via WebSockets and renders returned AI JSON telemetry natively over the feed.
 
 ---
 
 ## 📁 3. Codebase Structure & Developer Workflow
 
-The repository is organized by feature domains to allow independent teams (AI, Web, Mobile) to work concurrently without merge conflicts.
+The repository is organized by feature domains so independent teams (AI, Security, Web, Mobile) can work concurrently.
 
 ### 🧠 Core Engine (`core/`)
 The foundational backend mechanics that keep the system running.
 - `base_pipeline.py`: The abstract base class (`ABC`). **All** AI models must inherit from this and implement `initialize()` and `run_on_video()`.
-- `registry.py`: Singleton registry that auto-discovers and instantiates enabled pipelines.
-- `video_source.py`: Background thread manager designed to clear OpenCV buffers, ensuring lag-free RTSP streaming.
+- `registry.py`: Singleton registry that auto-discovers and registers enabled AI pipelines.
+- `video_source.py`: Background thread manager designed to proactively clear OpenCV buffers, preventing lag in RTSP streams.
 - `redis_client.py`: The global connection pool and helper methods for Redis integration.
+- `mobile_ws.py`: Manages high-throughput WebSocket ingestion from the Flutter app.
 
-### 🏭 AI Pipelines (`pipelines/`)
-Specific computer vision use-cases that process frames and yield MJPEG bytes alongside alert metadata.
-- `face_recognition_pipeline.py`: Translates raw frames into Known/Unknown bounding boxes, driving the Attendance and Visitor tracking systems.
-- `room_guardian_pipeline.py`: Tracks static objects (e.g., bags, laptops) using FastSAM and ByteTrack. Emits alerts if an object is moved or removed.
-- `intrusion_pipeline.py`: Detects humans crossing forbidden boundary lines.
-- `danger_zone_pipeline.py`: Detects unauthorized entry into dynamically drawn polygon areas.
-- `fall_detection_pipeline.py`: Uses YOLOv8-Pose to map human skeletons and calculate fall angles based on bounding box aspect ratios and spine vectors.
-- `vehicle_recognition/`: Specialized sub-module for detecting vehicles, reading license plates (ALPR), and identifying vehicle color/type.
+### 🏭 Vision Pipelines (`pipelines/`)
+The specific computer vision use-cases. Each pipeline is a distinct module.
+- **`intrusion_pipeline.py`**: Detects humans crossing forbidden boundary lines (virtual tripwires).
+- **`danger_zone_pipeline.py`**: Detects unauthorized human entry into dynamically drawn polygon areas.
+- **`fall_detection_pipeline.py`**: Uses YOLO-Pose to map human skeletons, calculating fall angles based on bounding box aspect ratios and spine orientation vectors.
+- **`room_guardian_pipeline.py`**: Tracks static objects (e.g., backpacks, laptops) using FastSAM and ByteTrack. Emits alerts if an object is moved, removed, or occluded.
+- **`face_recognition_pipeline.py`**: Interacts with the `face_recognition/` package to translate raw frames into Known/Unknown identities, driving the Attendance and Visitor tracking systems.
+- **`vehicle_recognition/`**: A specialized sub-package dedicated to ALPR (reading license plates), tracking unique vehicle visits, and identifying vehicle color and type.
 
-### 👤 Face Recognition Domain (`face_recognition/`)
-A dedicated, highly-accurate sub-module built on InsightFace.
+### 👤 Face Recognition Engine (`face_recognition/`)
+A dedicated, highly-accurate biometric sub-module.
 - `embedder.py`: Handles raw facial extraction and embedding generation.
 - `tracker.py`: Wraps ByteTrack to maintain temporal continuity of a face across frames.
-- `recognizer.py`: Manages the sliding-window temporal consensus algorithm (requiring N/M votes to prevent false positives) and executes FAISS searches.
-- `identity_manager.py`: Directly interfaces with Redis to store/retrieve JSON metadata, base64 image crops, and float32 numpy arrays.
+- `recognizer.py`: Manages the sliding-window temporal consensus algorithm (requiring N/M votes to prevent false positives).
+- `identity_manager.py`: Interfaces with Redis to persist JSON metadata, base64 image crops, and float32 arrays.
 
 ### 🌐 Web Presentation (`static/`)
 Unified product shell with per-feature isolated folders.
 - `static/shell/`: Shared top navigation, sidebar, and CSS design tokens.
-- `static/features/zone-safety/`: UI for Intrusion, Danger Zone, Fall Detection, and Room Guardian.
-- `static/features/face/`: UI for Identity Management, Attendance logs, and Face Registration.
-- `static/features/vehicle/`: UI for Vehicle and License Plate tracking.
+- `static/features/zone-safety/`: UI control panels for Intrusion, Danger Zone, Fall Detection, and Room Guardian.
+- `static/features/face/`: UI for Identity Management, Attendance logs, and Registration.
+- `static/features/vehicle/`: UI for Vehicle monitoring and ALPR logs.
 
 ### 📱 Mobile Presentation (`edge_vision_app/`)
 The Flutter application codebase.
@@ -133,7 +138,6 @@ The Flutter application codebase.
 - Windows 10/11 or Linux.
 - **Python 3.10+**
 - **Docker Desktop** (For Redis and Linux containerization).
-- (Optional) NVIDIA GPU with CUDA for maximum YOLO inference speed.
 
 ### Installation
 1. Clone the repository and checkout the main branch:
@@ -187,17 +191,29 @@ To use an Android phone as a wireless edge camera:
 
 ---
 
-## 🗄️ 6. Redis Database Internals
+## 🗄️ 6. Redis Database Architecture
 
-Redis is the sole source of truth. All data is prefixed by domains to avoid collisions.
+This project uses **Redis** as the sole, centralized persistence layer for the *entire* system. Local SQLite databases and JSON flat-files have been entirely deprecated. 
 
-### Face Recognition Domain (`fr:`)
-- `fr:identities` → Hash map of `{person_id: json_metadata}`.
-- `fr:emb:{person_id}` → Raw `float32` numpy bytes containing the 512-dim ArcFace embedding.
-- `fr:embmeta:{person_id}` → Shape and dtype parameters for numpy reconstruction.
-- `fr:face:{person_id}:{n}` → Raw JPEG bytes of cropped face images for UI display.
-- `fr:face_count:{person_id}` → Integer tracking the number of crops stored.
+Data is logically separated using key prefixes to prevent collisions between modules:
 
-### Attendance Domain (`attendance:`)
-- `attendance:sessions` → Hash map tracking active classroom sessions, mode, and timestamps.
-- `attendance:present:{session_id}` → Redis Set (`SADD`) containing the `person_id`s of students who have been verified in front of the camera.
+### 🚨 Generic System Alerts (`alerts:`)
+Generated by the Zone Safety pipelines (Intrusion, Fall Detection, Danger Zone, Room Guardian).
+- `alerts:{session_id}` → Redis List (`RPUSH` / `LRANGE`) storing chronologically ordered JSON objects containing alert metadata, timestamps, and paths to saved `.webm` video clips.
+
+### 🚗 Vehicle Recognition (`vr:`)
+Generated by the ALPR and Vehicle Tracking module.
+- `vr:det:{session_id}` → Redis List containing raw chronological vehicle detection events (License plate string, color, vehicle type).
+- `vr:plates:{session_id}` → Redis Hash map storing aggregated statistics. Keys are license plate strings, values are total visit counts and last-seen timestamps.
+
+### 👤 Face Recognition & Identity (`fr:`)
+Generated by the InsightFace biometric engine.
+- `fr:identities` → Hash map of `{person_id: json_metadata}` (Name, first seen, last seen, confidence scores).
+- `fr:emb:{person_id}` → Raw `float32` numpy bytes containing the 512-dim ArcFace mathematical embedding.
+- `fr:embmeta:{person_id}` → Metadata for numpy reconstruction (shape, dtype).
+- `fr:face:{person_id}:{n}` → Raw JPEG bytes of cropped face images, retrieved by the UI for preview avatars.
+
+### 🎓 Attendance Tracking (`attendance:`)
+Generated by the specialized Classroom/Attendance operational mode.
+- `attendance:sessions` → Hash map tracking currently active classroom sessions, mode states, and start/stop timestamps.
+- `attendance:present:{session_id}` → Redis Set (`SADD`) containing the unique `person_id`s of students who have been biometrically verified in front of the camera during a given session window.
