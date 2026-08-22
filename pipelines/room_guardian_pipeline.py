@@ -292,6 +292,7 @@ class RoomGuardianPipeline(BaseVideoPipeline):
                 break
 
             raw_frame = frame.copy()   # for ring buffer — un-annotated
+            alert_event = None
 
             # 1. Run ByteTrack via FastSAM natively
             try:
