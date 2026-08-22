@@ -3,6 +3,7 @@ document.addEventListener("DOMContentLoaded", () => {
     "intrusion_detection",
     "danger_zone",
     "fall_detection",
+    "room_guardian",
   ]);
 
   const videoUpload = document.getElementById("video-upload");
@@ -38,10 +39,15 @@ document.addEventListener("DOMContentLoaded", () => {
       pipelineSelect.innerHTML = "";
       (data.pipelines || [])
         .filter((p) => ZONE_PIPELINES.has(p))
-        .forEach((p) => {
+                .forEach((p) => {
           const opt = document.createElement("option");
           opt.value = p;
-          opt.textContent = p;
+          let displayName = p;
+          if (p === "intrusion_detection") displayName = "Intrusion Detection";
+          if (p === "danger_zone") displayName = "Danger Zone";
+          if (p === "fall_detection") displayName = "Fall Detection";
+          if (p === "room_guardian") displayName = "Object Tracking";
+          opt.textContent = displayName;
           pipelineSelect.appendChild(opt);
         });
       if (!pipelineSelect.options.length) {
@@ -65,6 +71,10 @@ document.addEventListener("DOMContentLoaded", () => {
       await CISSource.disconnectStream(currentStreamId);
       currentStreamId = null;
       const data = await CISSource.uploadVideo(file);
+      if (window.__guardianSetSource) window.__guardianSetSource({
+          stream_id: null, filename: data.filename, video_id: data.video_id,
+          width: data.width, height: data.height,
+      });
       currentVideoData = data;
       isRtspMode = false;
       uploadStatus.textContent = file.name;
@@ -91,6 +101,10 @@ document.addEventListener("DOMContentLoaded", () => {
     connectRtspBtn.textContent = "Connecting...";
     try {
       const data = await CISSource.connectStream(url);
+      if (window.__guardianSetSource) window.__guardianSetSource({
+          stream_id: data.stream_id, filename: null, video_id: data.stream_id,
+          width: data.width, height: data.height,
+      });
       currentStreamId = data.stream_id;
       currentVideoData = {
         video_id: data.stream_id,
@@ -202,29 +216,33 @@ document.addEventListener("DOMContentLoaded", () => {
     ctx.strokeStyle = "#00ffff";
     ctx.lineWidth = 2;
     ctx.stroke();
-    roiPoints.forEach((p) => {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-      ctx.fillStyle = "#ff0044";
-      ctx.fill();
-    });
   }
 
   function checkRunReady() {
-    const needsRoi = pipelineSelect.value !== "fall_detection";
+    const pipeline = pipelineSelect.value;
+    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection";
     const hasRoi = roiPoints.length > 2;
-    runBtn.disabled = !((needsRoi ? hasRoi : true) && pipelineSelect.value && currentVideoData);
+    runBtn.disabled = !((needsRoi ? hasRoi : true) && pipeline && currentVideoData);
   }
 
   function updatePipelineUi() {
-    const isFall = pipelineSelect.value === "fall_detection";
+    const pipeline = pipelineSelect.value;
+    const isDangerZone = pipeline === "danger_zone";
+    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection";
+    const isGuardian = pipeline === "room_guardian";
+    
     const machineSettings = document.getElementById("machine-settings");
     const roiControls = document.getElementById("roi-controls");
-    if (machineSettings) machineSettings.style.display = isFall ? "none" : "block";
-    if (roiControls) {
-      roiControls.style.display = isFall ? "none" : "block";
-      roiCanvas.style.display = isFall ? "none" : "block";
+    const controlActions = document.querySelector(".control-actions");
+    
+    if (machineSettings) machineSettings.style.display = isDangerZone ? "block" : "none";
+    if (roiControls) roiControls.style.display = needsRoi ? "block" : "none";
+    if (controlActions) controlActions.style.display = isGuardian ? "none" : "block";
+    
+    if (!isGuardian) {
+      roiCanvas.style.display = needsRoi ? "block" : "none";
     }
+    
     checkRunReady();
   }
 
@@ -329,3 +347,5 @@ document.addEventListener("DOMContentLoaded", () => {
     alertsContainer.prepend(card);
   }
 });
+
+
