@@ -234,10 +234,21 @@ document.addEventListener("DOMContentLoaded", () => {
     const machineSettings = document.getElementById("machine-settings");
     const roiControls = document.getElementById("roi-controls");
     const controlActions = document.querySelector(".control-actions");
+    const guardianControls = document.getElementById("guardian-controls");
     
     if (machineSettings) machineSettings.style.display = isDangerZone ? "block" : "none";
     if (roiControls) roiControls.style.display = needsRoi ? "block" : "none";
     if (controlActions) controlActions.style.display = isGuardian ? "none" : "block";
+    
+    if (guardianControls) {
+      if (isGuardian) {
+        guardianControls.classList.remove("hidden");
+        guardianControls.style.display = "block";
+      } else {
+        guardianControls.classList.add("hidden");
+        guardianControls.style.display = "none";
+      }
+    }
     
     if (!isGuardian) {
       roiCanvas.style.display = needsRoi ? "block" : "none";
