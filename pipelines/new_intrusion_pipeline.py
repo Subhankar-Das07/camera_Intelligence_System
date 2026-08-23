@@ -72,7 +72,7 @@ def _ensure_openvino_model(pt_path: str) -> Optional[str]:
     try:
         from ultralytics import YOLO as _YOLO
         model       = _YOLO(pt_path)
-        export_path = model.export(format="openvino", half=True, imgsz=480)
+        export_path = model.export(format="openvino", half=True, imgsz=640)
         if isinstance(export_path, str) and export_path.endswith(".xml"):
             log.info("[NewIntrusion] Export complete: %s", export_path)
             return export_path
@@ -153,8 +153,8 @@ def _decode_pose_output(
     conf_thresh: float,
     img_w: int,
     img_h: int,
-    infer_w: int = 480,
-    infer_h: int = 480,
+    infer_w: int = 640,
+    infer_h: int = 640,
 ) -> List[Dict]:
     tensor = raw_outputs.get(output_names[0])
     if tensor is None:
@@ -198,7 +198,7 @@ def _decode_pose_output(
     return results
 
 
-def _preprocess_frame(frame: np.ndarray, target: int = 480) -> np.ndarray:
+def _preprocess_frame(frame: np.ndarray, target: int = 640) -> np.ndarray:
     resized = cv2.resize(frame, (target, target))
     rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     return rgb.transpose(2, 0, 1)[np.newaxis].astype(np.float32) / 255.0
@@ -272,7 +272,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                 raw = {n: infer_request.get_output_tensor(i).data
                        for i, n in enumerate(out_names)}
                 detections = _decode_pose_output(
-                    raw, out_names, conf_thresh=0.70,
+                    raw, out_names, conf_thresh=0.45,
                     img_w=frame_meta["img_w"], img_h=frame_meta["img_h"],
                 )
                 result_q.put({"frame_idx": frame_meta["frame_idx"],
@@ -332,7 +332,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
             if cooldown_frames > 0:
                 cooldown_frames -= 1
 
-            results = self._ul_model(frame, classes=[0], conf=0.70, imgsz=480, verbose=False)[0]
+            results = self._ul_model(frame, classes=[0], conf=0.45, imgsz=640, verbose=False)[0]
             frame   = results.plot()
             cv2.polylines(frame, [roi_pixels], isClosed=True, color=(0, 255, 255), thickness=2)
 
@@ -458,7 +458,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                 if self._ppp_enabled:
                     input_tensor = frame[np.newaxis]
                 else:
-                    input_tensor = _preprocess_frame(frame, 480)
+                    input_tensor = _preprocess_frame(frame, 640)
 
                 userdata = {"frame_idx": frame_idx, "frame": frame.copy(),
                             "img_w": width, "img_h": height}

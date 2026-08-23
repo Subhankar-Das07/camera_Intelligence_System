@@ -287,6 +287,7 @@ class RoomGuardianPipeline(BaseVideoPipeline):
 
         # ── Frame loop ────────────────────────────────────────────────────────
         while cap.isOpened():
+            alert_event = None
             ret, frame = cap.read()
             if not ret:
                 break
