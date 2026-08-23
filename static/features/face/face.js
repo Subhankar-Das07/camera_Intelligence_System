@@ -60,6 +60,23 @@ document.addEventListener("DOMContentLoaded", () => {
     const filterKnownBtn = document.getElementById("filter-known-btn");
     const filterPendingBtn = document.getElementById("filter-pending-btn");
 
+    const frAdminSwitchBtn = document.getElementById("fr-admin-switch-btn");
+    const frReportsSwitchBtn = document.getElementById("fr-reports-switch-btn");
+    const frAdminBackBtn   = document.getElementById("fr-admin-back-btn");
+    const frReportsBackBtn = document.getElementById("fr-reports-back-btn");
+    const frAdminEntryHeader = document.getElementById("fr-admin-entry-header");
+    const frAdminContent   = document.getElementById("fr-admin-content");
+    const frReportsContent = document.getElementById("fr-reports-content");
+    
+    const reportsList      = document.getElementById("reports-list");
+    const refreshReportsBtn= document.getElementById("refresh-reports-btn");
+    
+    const reportModal      = document.getElementById("report-modal");
+    const closeReportModal = document.getElementById("close-report-modal");
+    const reportModalTitle = document.getElementById("report-modal-title");
+    const reportModalMeta  = document.getElementById("report-modal-meta");
+    const reportModalBody  = document.getElementById("report-modal-body");
+
     const renameModal    = document.getElementById("rename-modal");
     const renameInput    = document.getElementById("rename-input");
     const renameConfirm  = document.getElementById("rename-confirm-btn");
@@ -78,13 +95,36 @@ document.addEventListener("DOMContentLoaded", () => {
     const adminContent       = document.getElementById("fr-admin-content");
 
     if (adminSwitchBtn && adminBackBtn && adminEntryHeader && adminContent) {
-        adminSwitchBtn.addEventListener("click", () => {
-            adminEntryHeader.classList.add("hidden");
-            adminContent.classList.remove("hidden");
+        frAdminSwitchBtn.addEventListener("click", () => {
+            frAdminEntryHeader.classList.add("hidden");
+            frAdminContent.classList.remove("hidden");
+            frReportsContent.classList.add("hidden");
+            loadIdentities();
         });
-        adminBackBtn.addEventListener("click", () => {
-            adminContent.classList.add("hidden");
-            adminEntryHeader.classList.remove("hidden");
+        
+        frReportsSwitchBtn.addEventListener("click", () => {
+            frAdminEntryHeader.classList.add("hidden");
+            frAdminContent.classList.add("hidden");
+            frReportsContent.classList.remove("hidden");
+            loadReports();
+        });
+
+        frAdminBackBtn.addEventListener("click", () => {
+            frAdminContent.classList.add("hidden");
+            frAdminEntryHeader.classList.remove("hidden");
+        });
+        
+        frReportsBackBtn.addEventListener("click", () => {
+            frReportsContent.classList.add("hidden");
+            frAdminEntryHeader.classList.remove("hidden");
+        });
+        
+        refreshReportsBtn.addEventListener("click", () => {
+            loadReports();
+        });
+        
+        closeReportModal.addEventListener("click", () => {
+            reportModal.classList.add("hidden");
         });
     }
 
@@ -412,6 +452,113 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // ── Stats ──────────────────────────────────────────────────────────────────
+    function deleteIdentity(pid) {
+        if (!confirm(`Are you sure you want to completely delete person ${pid}?`)) return;
+        const mode = getMode();
+        fetch(`/api/faces/identity/${pid}?mode=${mode}`, { method: "DELETE" })
+            .then(r => r.json())
+            .then(() => {
+                loadStats();
+                loadIdentities();
+            });
+    }
+
+    // ── Reports Manager ────────────────────────────────────────────────────────
+    
+    function loadReports() {
+        const mode = getMode();
+        reportsList.innerHTML = `<div class="fr-identity-loading">Loading reports...</div>`;
+        fetch(`/api/reports?mode=${mode}`)
+            .then(r => r.json())
+            .then(data => {
+                const list = data.reports || [];
+                if (list.length === 0) {
+                    reportsList.innerHTML = `<div class="fr-identity-empty">No reports found.</div>`;
+                    return;
+                }
+                
+                reportsList.innerHTML = "";
+                list.forEach(report => {
+                    const card = document.createElement("div");
+                    card.className = "report-card";
+                    
+                    const startStr = new Date(report.start_time * 1000).toLocaleString();
+                    const durationStr = Math.round(report.duration) + "s";
+                    
+                    let statsHtml = "";
+                    if (mode === "attendance") {
+                        statsHtml = `Present: <b>${report.present_count}</b> | Absent: <b>${report.absent_count}</b>`;
+                    } else {
+                        statsHtml = `Known: <b>${report.known_count}</b> | Unknown: <b>${report.unknown_count}</b>`;
+                    }
+                    
+                    card.innerHTML = `
+                        <div class="report-title">Session: ${report.session_id.substring(0, 12)}...</div>
+                        <div class="report-meta">${startStr} (Duration: ${durationStr})</div>
+                        <div class="report-meta" style="margin-top: 4px; color: #cbd5e1;">${statsHtml}</div>
+                    `;
+                    
+                    card.addEventListener("click", () => showReportDetails(report.session_id, mode));
+                    reportsList.appendChild(card);
+                });
+            })
+            .catch(() => {
+                reportsList.innerHTML = `<div class="fr-identity-empty">Error loading reports.</div>`;
+            });
+    }
+    
+    function showReportDetails(sessionId, mode) {
+        reportModalBody.innerHTML = `<div class="fr-identity-loading">Fetching details...</div>`;
+        reportModalMeta.textContent = `Session: ${sessionId}`;
+        reportModalTitle.textContent = mode === "attendance" ? "Attendance Report" : "Visitor Report";
+        reportModal.classList.remove("hidden");
+        
+        fetch(`/api/reports/${sessionId}?mode=${mode}`)
+            .then(r => r.json())
+            .then(report => {
+                let html = "";
+                
+                if (mode === "attendance") {
+                    html += `
+                        <div class="report-section">
+                            <div class="report-section-title">Present (${report.present.length})</div>
+                            ${report.present.map(p => `<div class="report-item"><span>${escHtml(p.label)}</span><span style="color:#4ade80;">✓ Present</span></div>`).join("")}
+                            ${report.present.length === 0 ? '<div class="report-meta">No one was present.</div>' : ''}
+                        </div>
+                        <div class="report-section">
+                            <div class="report-section-title">Absent (${report.absent.length})</div>
+                            ${report.absent.map(p => `<div class="report-item"><span>${escHtml(p.label)}</span><span style="color:#f87171;">✗ Absent</span></div>`).join("")}
+                            ${report.absent.length === 0 ? '<div class="report-meta">Everyone was present.</div>' : ''}
+                        </div>
+                    `;
+                } else {
+                    html += `
+                        <div class="report-section">
+                            <div class="report-section-title">Known Visitors (${report.known_visitors.length})</div>
+                            ${report.known_visitors.map(p => {
+                                const seen = new Date(p.first_seen * 1000).toLocaleTimeString();
+                                return `<div class="report-item"><span>${escHtml(p.label)}</span><span>Seen at ${seen} (${p.count}x)</span></div>`;
+                            }).join("")}
+                            ${report.known_visitors.length === 0 ? '<div class="report-meta">No known visitors seen.</div>' : ''}
+                        </div>
+                        <div class="report-section">
+                            <div class="report-section-title">Unknown Visitors (${report.unknown_visitors.length})</div>
+                            ${report.unknown_visitors.map(p => {
+                                const seen = new Date(p.first_seen * 1000).toLocaleTimeString();
+                                return `<div class="report-item"><span>Track ID ${p.id}</span><span>Seen at ${seen} (${p.count}x)</span></div>`;
+                            }).join("")}
+                            ${report.unknown_visitors.length === 0 ? '<div class="report-meta">No unknown visitors seen.</div>' : ''}
+                        </div>
+                    `;
+                }
+                
+                reportModalBody.innerHTML = html;
+            })
+            .catch(() => {
+                reportModalBody.innerHTML = `<div class="fr-identity-empty">Failed to load details.</div>`;
+            });
+    }
+
     function loadStats() {
         const mode = getMode();
         fetch(`/api/faces/status?mode=${mode}`)
@@ -582,11 +729,7 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             card.querySelector(".fr-identity-delete-btn").addEventListener("click", () => {
-                if (!confirm(`Delete ${identity.label}? This cannot be undone.`)) return;
-                fetch(`/api/faces/identity/${identity.person_id}?mode=${getMode()}`, { method: "DELETE" })
-                    .then(r => r.json())
-                    .then(() => { loadStats(); loadIdentities(); })
-                    .catch(err => alert("Delete failed: " + err.message));
+                deleteIdentity(identity.person_id);
             });
 
             identityList.appendChild(card);

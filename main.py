@@ -95,6 +95,7 @@ async def _on_startup():
 rtsp_streams: Dict[str, ThreadedCamera] = {}
 rtsp_dims:    Dict[str, Tuple[int, int]] = {}
 active_sessions: Dict[str, Any] = {}
+visitor_sessions_meta: Dict[str, dict] = {}
 stop_events:     Dict[str, threading.Event] = {}
 
 
@@ -382,6 +383,7 @@ async def get_pipelines():
 async def start_analysis(request: ProcessRequest):
     session_id = str(uuid.uuid4())
     active_sessions[session_id] = request
+    visitor_sessions_meta[session_id] = {"start_time": time.time()}
     _clear_session_alerts(session_id)
     stop_events[session_id] = threading.Event()
     return {"session_id": session_id}
@@ -429,6 +431,53 @@ def stop_analysis(session_id: str):
     ev = stop_events.get(session_id)
     if ev:
         ev.set()
+        
+    req = active_sessions.get(session_id)
+    if req and req.pipeline_name == "face_recognition":
+        meta = visitor_sessions_meta.get(session_id, {})
+        start_time = meta.get("start_time", time.time())
+        end_time = time.time()
+        
+        alerts = _get_session_alerts(session_id)
+        
+        known_map = {}
+        unknown_map = {}
+        
+        for alert in alerts:
+            if alert.get("type") == "face_recognised":
+                pid = alert.get("person_id")
+                label = alert.get("label", pid)
+                ts = alert.get("timestamp")
+                ts_val = time.time() 
+                
+                is_unknown = (pid == label)
+                
+                if is_unknown:
+                    if pid not in unknown_map:
+                        unknown_map[pid] = {"id": pid, "label": "Unknown", "first_seen": ts_val, "last_seen": ts_val, "count": 1}
+                    else:
+                        unknown_map[pid]["last_seen"] = ts_val
+                        unknown_map[pid]["count"] += 1
+                else:
+                    if pid not in known_map:
+                        known_map[pid] = {"id": pid, "label": label, "first_seen": ts_val, "last_seen": ts_val, "count": 1}
+                    else:
+                        known_map[pid]["last_seen"] = ts_val
+                        known_map[pid]["count"] += 1
+
+        report = {
+            "session_id": session_id,
+            "mode": "visitor",
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration": end_time - start_time,
+            "known_visitors": list(known_map.values()),
+            "unknown_visitors": list(unknown_map.values())
+        }
+        
+        r = redis_client.get_redis()
+        r.hset("reports:visitor", session_id, json.dumps(report))
+        
     return {"status": "stopped"}
 
 
@@ -672,6 +721,56 @@ async def delete_identity(person_id: str, mode: str = "visitor"):
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
     return {"person_id": person_id, "status": "deleted"}
 
+
+# ── Reports API ──────────────────────────────────────────────────────────────
+
+@app.get("/api/reports")
+async def list_reports(mode: str = "visitor"):
+    """Return all session reports for the given mode."""
+    r = redis_client.get_redis()
+    key = f"reports:{mode}"
+    raw_hash = r.hgetall(key)
+    
+    reports = []
+    for sess_id_bytes, meta_bytes in raw_hash.items():
+        try:
+            report_data = json.loads(redis_client.redis_str(meta_bytes))
+            # Just return summary data for the list
+            summary = {
+                "session_id": report_data.get("session_id"),
+                "start_time": report_data.get("start_time"),
+                "end_time": report_data.get("end_time"),
+                "duration": report_data.get("duration"),
+            }
+            if mode == "attendance":
+                summary["present_count"] = len(report_data.get("present", []))
+                summary["absent_count"] = len(report_data.get("absent", []))
+            else:
+                summary["known_count"] = len(report_data.get("known_visitors", []))
+                summary["unknown_count"] = len(report_data.get("unknown_visitors", []))
+            reports.append(summary)
+        except Exception:
+            continue
+            
+    reports.sort(key=lambda x: x.get("start_time", 0), reverse=True)
+    return {"reports": reports}
+
+
+@app.get("/api/reports/{session_id}")
+async def get_report(session_id: str, mode: str = "visitor"):
+    """Return the full details of a specific report."""
+    r = redis_client.get_redis()
+    key = f"reports:{mode}"
+    raw = r.hget(key, session_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    try:
+        report_data = json.loads(redis_client.redis_str(raw))
+        return report_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Attendance Session Management ────────────────────────────────────────────
 
 @app.post("/api/attendance/start")
@@ -683,8 +782,53 @@ def start_attendance_session():
 
 @app.post("/api/attendance/stop")
 def stop_attendance_session():
+    if not attendance_session["active"]:
+        return {"status": "stopped", "present_ids": []}
+        
     attendance_session["active"] = False
-    return {"status": "stopped", "present_ids": list(attendance_session["present_ids"])}
+    end_time = time.time()
+    start_time = attendance_session.get("start_time", end_time)
+    duration = end_time - start_time
+    
+    session_id = f"att_sess_{uuid.uuid4().hex[:8]}"
+    
+    # 1. Get present students
+    present_ids = list(attendance_session["present_ids"])
+    
+    # 2. Get all registered students
+    im = _get_identity_manager("attendance")
+    all_identities = im.get_all_identities()
+    
+    present = []
+    absent = []
+    
+    for pid, meta in all_identities.items():
+        person = {"person_id": pid, "label": meta.get("label", pid)}
+        if pid in present_ids:
+            present.append(person)
+        else:
+            absent.append(person)
+            
+    # 3. Get pending approvals (requested during this session)
+    pending_all = im.get_pending_identities() if hasattr(im, 'get_pending_identities') else []
+    pending_session = [p for p in pending_all if start_time <= p.get("timestamp", 0) <= end_time]
+    
+    report = {
+        "session_id": session_id,
+        "mode": "attendance",
+        "start_time": start_time,
+        "end_time": end_time,
+        "duration": duration,
+        "present": present,
+        "absent": absent,
+        "pending_approvals": pending_session
+    }
+    
+    # Save to Redis
+    r = redis_client.get_redis()
+    r.hset("reports:attendance", session_id, json.dumps(report))
+    
+    return {"status": "stopped", "session_id": session_id, "present_ids": present_ids}
 
 @app.get("/api/attendance/status")
 def get_attendance_status():
