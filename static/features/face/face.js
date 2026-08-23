@@ -68,6 +68,23 @@ document.addEventListener("DOMContentLoaded", () => {
     const visitorControls    = document.getElementById("fr-visitor-controls");
     const attendanceControls = document.getElementById("fr-attendance-controls");
     const rightPanelTitle    = document.getElementById("right-panel-title");
+    
+    // Admin toggling
+    const adminSwitchBtn     = document.getElementById("fr-admin-switch-btn");
+    const adminBackBtn       = document.getElementById("fr-admin-back-btn");
+    const adminEntryHeader   = document.getElementById("fr-admin-entry-header");
+    const adminContent       = document.getElementById("fr-admin-content");
+
+    if (adminSwitchBtn && adminBackBtn && adminEntryHeader && adminContent) {
+        adminSwitchBtn.addEventListener("click", () => {
+            adminEntryHeader.classList.add("hidden");
+            adminContent.classList.remove("hidden");
+        });
+        adminBackBtn.addEventListener("click", () => {
+            adminContent.classList.add("hidden");
+            adminEntryHeader.classList.remove("hidden");
+        });
+    }
 
     const attRegName        = document.getElementById("att-reg-name");
     const attRegSnapshotBtn = document.getElementById("att-reg-snapshot-btn");
