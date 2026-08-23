@@ -109,7 +109,7 @@ The specific computer vision use-cases. Each pipeline is a distinct module.
 - **`danger_zone_pipeline.py`**: Detects unauthorized human entry into dynamically drawn polygon areas.
 - **`fall_detection_pipeline.py`**: Uses YOLO-Pose to map human skeletons, calculating fall angles based on bounding box aspect ratios and spine orientation vectors.
 - **`room_guardian_pipeline.py`**: Tracks static objects (e.g., backpacks, laptops) using FastSAM and ByteTrack. Emits alerts if an object is moved, removed, or occluded.
-- **`face_recognition_pipeline.py`**: Interacts with the `face_recognition/` package to translate raw frames into Known/Unknown identities, driving the Attendance and Visitor tracking systems.
+- **`face_recognition/pipeline.py`**: Interacts with the `face_recognition/` package to translate raw frames into Known/Unknown identities, driving the Attendance and Visitor tracking systems.
 - **`vehicle_recognition/`**: A specialized sub-package dedicated to ALPR (reading license plates), tracking unique vehicle visits, and identifying vehicle color and type.
 
 ### 👤 Face Recognition Engine (`face_recognition/`)

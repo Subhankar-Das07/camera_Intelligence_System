@@ -35,6 +35,7 @@ services:
       - ./core:/app/core
       - ./static:/app/static
       - ./main.py:/app/main.py
+      - ./face_recognition:/app/face_recognition
     depends_on:
       redis:
         condition: service_healthy

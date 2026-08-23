@@ -2,7 +2,7 @@ from typing import Dict, Type
 from core.base_pipeline import BaseVideoPipeline
 from pipelines.intrusion_pipeline import IntrusionDetectionPipeline
 from pipelines.danger_zone_pipeline import DangerZonePipeline
-from pipelines.face_recognition_pipeline import FaceRecognitionPipeline
+from face_recognition.pipeline import FaceRecognitionPipeline
 from pipelines.fall_detection_pipeline import FallDetectionPipeline
 # Add Room Guardian pipeline to track static objects
 from pipelines.room_guardian_pipeline import RoomGuardianPipeline
