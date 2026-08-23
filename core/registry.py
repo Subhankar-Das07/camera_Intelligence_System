@@ -46,3 +46,7 @@ registry.register("fall_detection", FallDetectionPipeline)
 
 # ── Room Guardian pipeline ───────────────────────────────────────────────────
 registry.register("room_guardian", RoomGuardianPipeline)
+
+# ── New Intrusion pipeline (OpenVINO hardware-accelerated) ────────────────────
+from pipelines.new_intrusion_pipeline import NewIntrusionPipeline
+registry.register("new_intrusion", NewIntrusionPipeline)

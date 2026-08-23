@@ -230,6 +230,7 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                         st["track_band"].pop(tid, None)
 
                 for box, tid, cls_id in zip(boxes, track_ids, cls_ids):
+                    x1, y1, x2, y2 = box
                     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
                     tid = int(tid)
                     kind = _classify(int(cls_id))

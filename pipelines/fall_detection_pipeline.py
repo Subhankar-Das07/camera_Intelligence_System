@@ -64,7 +64,7 @@ class FallDetectionPipeline(BaseVideoPipeline):
     # ------------------------------------------------------------------
     DEFAULT_CONFIG = {
         # Model
-        "person_conf_threshold":  0.70,   # lowered from 0.75 to catch partially-visible falls
+        "person_conf_threshold":  0.45,   # lowered from 0.75 to catch partially-visible falls
         "keypoint_conf_threshold": 0.4,   # lowered so ankle/shoulder are usable on floor poses
 
         # Phase 1 – detecting the fall impulse
@@ -161,7 +161,7 @@ class FallDetectionPipeline(BaseVideoPipeline):
                 cooldown -= 1
 
             results = self.model.track(
-                frame, classes=[0], conf=conf_thresh, imgsz=480,
+                frame, classes=[0], conf=conf_thresh, imgsz=640,
                 persist=True, verbose=False,
             )[0]
             frame = results.plot()

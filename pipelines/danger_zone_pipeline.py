@@ -57,7 +57,7 @@ class DangerZonePipeline(BaseVideoPipeline):
             if cooldown_frames > 0:
                 cooldown_frames -= 1
 
-            results = self.model(frame, classes=[0], conf=0.70, imgsz=480, verbose=False)[0]
+            results = self.model(frame, classes=[0], conf=0.45, imgsz=640, verbose=False)[0]
             
             # Natively draw skeleton over all people
             frame = results.plot()
