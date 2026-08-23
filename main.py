@@ -68,6 +68,7 @@ ALERTS_DIR  = os.path.join(STORAGE_DIR, "alerts")
 
 for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
     os.makedirs(d, exist_ok=True)
+os.makedirs("storage/vehicle_images", exist_ok=True)
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
