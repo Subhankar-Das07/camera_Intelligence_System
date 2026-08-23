@@ -3,11 +3,10 @@ setlocal
 cd /d "%~dp0"
 
 echo ========================================
-echo  Docker Refresh - FULL / SLOW rebuild
+echo  Docker Rebuild - build with layer cache
 echo ========================================
 echo.
-echo Use only when stuck or you need a fresh base image.
-echo For everyday code changes use docker-quick.bat instead.
+echo Use when requirements.txt or Dockerfile changed.
 echo See docs\DOCKER_DEV.md for which bat to use.
 echo.
 
@@ -19,33 +18,27 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [1/4] Stopping existing containers...
-docker compose down
-if errorlevel 1 (
-  echo WARNING: docker compose down reported an error. Continuing...
-)
-
-echo [2/4] Building images from current project files...
-docker compose build --pull
+echo [1/2] Building images ^(no --pull, uses cache^)...
+docker compose build
 if errorlevel 1 (
   echo ERROR: docker compose build failed.
   pause
   exit /b 1
 )
 
-echo [3/4] Starting containers...
-docker compose up -d --force-recreate --remove-orphans
+echo [2/2] Starting containers...
+docker compose up -d
 if errorlevel 1 (
   echo ERROR: docker compose up failed.
   pause
   exit /b 1
 )
 
-echo [4/4] Status:
+echo.
+echo Status:
 docker compose ps
 echo.
 echo Open http://localhost:8000
-echo Redis DB volume: redis_data
 echo.
 pause
 endlocal

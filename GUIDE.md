@@ -1,8 +1,16 @@
 # 📖 Camera Intelligence System — Comprehensive Setup & Architecture Guide
 
+<<<<<<< HEAD
 A robust, real-time edge computer vision platform designed to run state-of-the-art AI pipelines on **RTSP IP Cameras (NVRs)**, local **USB Webcams**, and **Android smartphones**. 
 
 This system leverages a highly concurrent FastAPI Python backend to perform YOLO-based object detection, semantic segmentation, ALPR (License Plate Recognition), and biometric vector-search tracking. It serves a responsive Web Dashboard for management and interfaces with a Flutter Mobile App for remote edge-camera streaming.
+=======
+**New teammates:** start here → [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) (Docker install, Hub pull, Git feature branches, merge & conflicts).
+
+**Site operations (clients):** [`docs/CLIENT_ONBOARDING.md`](docs/CLIENT_ONBOARDING.md) — use the **Site Admin** tab only. Existing Zone Safety / Vehicle / Face pages are unchanged demo workspaces.
+
+A robust, real-time computer vision platform designed to run AI pipelines on both **RTSP IP Cameras (NVRs)** and **Android smartphones**. The system uses a FastAPI Python backend to perform YOLO object detection and tracking, serving a responsive Web Dashboard for management and a Flutter Mobile App for edge camera streaming.
+>>>>>>> origin/develop
 
 ---
 
@@ -181,6 +189,10 @@ There are **two distinct ways** to run the system depending on your hardware req
 ---
 
 ## 📡 5. Mobile App Connectivity
+
+**Local Docker (developers):** see [`docs/DOCKER_DEV.md`](docs/DOCKER_DEV.md) for the bat-file cheat sheet.  
+Everyday code changes → `docker-quick.bat`. Deps/`Dockerfile` → `docker-rebuild.bat`. Rare full rebuild → `docker-refresh.bat`.  
+Publish new Hub tags (maintainers): run `docker-publish.bat`
 
 To use an Android phone as a wireless edge camera:
 1. Ensure your PC and the Android phone are on the **same Wi-Fi network**.
