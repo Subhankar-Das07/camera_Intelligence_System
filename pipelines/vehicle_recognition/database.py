@@ -152,6 +152,11 @@ class VehicleDatabase:
         self.r.hset(f"vr:vehicle:{plate}", "status", "Known")
         logger.info(f"Vehicle %s registered as Known.", plate)
 
+    def unregister_vehicle(self, plate_number: str) -> None:
+        plate = plate_number.strip().upper()
+        self.r.hset(f"vr:vehicle:{plate}", "status", "Unknown")
+        logger.info(f"Vehicle {plate} unregistered (reverted to Unknown).")
+
     def get_image_bytes(self, kind: str, plate_number: str, visit_number: int) -> Optional[bytes]:
         plate = plate_number.strip().upper()
         prefix = "vr:snap" if kind == "snap" else "vr:crop"
