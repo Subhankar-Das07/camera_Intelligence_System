@@ -13,7 +13,12 @@
     roi: [],
     previewUrl: "",
     monitorSessionId: null,
+    monitorCameraPick: "",
     monitorPoll: null,
+    monitorFramePoll: null,
+    monitorEventCount: 0,
+    monitorSeenEventIds: null,
+    monitorEvents: [],
     seekDragging: false,
     wasPlayingBeforeDrag: false,
     seekDebounceTimer: null,
@@ -32,6 +37,13 @@
     roiSuggestions: [],
     roiPickMode: false,
     roiSuggestBusy: false,
+    scanPreviewWizard: false,
+    scanPreviewSidebar: false,
+    scanPreviewTimer: null,
+    scanPreviewGen: 0,
+    scanPreviewApplyRules: false,
+    scanPreviewFocusCamId: "",
+    scanPreviewLastHeroAt: 0,
   };
 
   function emptyGateConfig() {
@@ -325,12 +337,9 @@
   function strokePoly(ctx, pts, w, h, color, fill) {
     if (!pts || pts.length < 2) return;
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    if (fill && color.startsWith("#") && pts.length >= 3) {
-      const r = parseInt(color.slice(1, 3), 16);
-      const g = parseInt(color.slice(3, 5), 16);
-      const b = parseInt(color.slice(5, 7), 16);
-      ctx.fillStyle = `rgba(${r},${g},${b},0.22)`;
+    ctx.lineWidth = fill ? 3 : 2;
+    if (fill && pts.length >= 3) {
+      ctx.fillStyle = colorWithAlpha(color, 0.22);
     }
     ctx.beginPath();
     pts.forEach((p, i) => {
@@ -346,8 +355,24 @@
     ctx.stroke();
   }
 
+  function colorWithAlpha(color, alpha) {
+    if (!color) return `rgba(34,211,238,${alpha})`;
+    if (color.startsWith("rgb(")) {
+      const m = color.match(/rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/);
+      if (m) return `rgba(${m[1]},${m[2]},${m[3]},${alpha})`;
+    }
+    if (color.startsWith("#") && color.length >= 7) {
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+    return color;
+  }
+
   function paintRuleOverlays(ctx, w, h, rule) {
     if (!rule) return;
+    const accent = rule.css_color || "#22d3ee";
     if (rule.scan_type === "gate_analytics") {
       const gc = rule.gate_config || {};
       strokePoly(ctx, gc.count_line, w, h, "#ffff00", false);
@@ -358,7 +383,7 @@
       strokePoly(ctx, zones.far, w, h, "#44cc66", true);
       return;
     }
-    strokePoly(ctx, rule.roi_normalized || [], w, h, "#22d3ee", true);
+    strokePoly(ctx, rule.roi_normalized || [], w, h, accent, true);
   }
 
   function drawRuleOntoCanvas(canvas, img, rule) {
@@ -456,7 +481,7 @@
         </div>`;
     }
     return `<div class="sa-monitor-controls sa-monitor-controls--disabled">
-        <p class="sa-muted">Live RTSP — upload a test video to scrub</p>
+        <p class="sa-muted">Live stream — upload a test video under Cameras to scrub</p>
       </div>`;
   }
 
@@ -633,11 +658,371 @@
     return `<span class="sa-badge ${cls}">${escapeHtml(h || "unknown")}</span>`;
   }
 
+  function scanningCameras() {
+    return state.cameras.filter(
+      (c) =>
+        c.enabled !== false &&
+        state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
+    );
+  }
+
+  function previewCameras() {
+    return state.cameras.filter((c) => c.enabled !== false);
+  }
+
+  function cameraHasEnabledRules(camId) {
+    return state.rules.some((r) => r.camera_id === camId && r.enabled !== false);
+  }
+
+  function previewCamerasWithRules() {
+    return previewCameras().filter((c) => cameraHasEnabledRules(c.id));
+  }
+
+  function previewCamerasWithoutRules() {
+    return previewCameras().filter((c) => !cameraHasEnabledRules(c.id));
+  }
+
+  function previewHeroApplyRules(camId) {
+    return !!(state.scanPreviewApplyRules && camId && cameraHasEnabledRules(camId));
+  }
+
+  function activeScanCameraIds() {
+    const rt = state.status?.runtime || {};
+    if (Array.isArray(rt.active_camera_ids) && rt.active_camera_ids.length) {
+      return rt.active_camera_ids;
+    }
+    const single = rt.active_camera_id || "";
+    return single ? [single] : [];
+  }
+
+  function resolvePreviewFocusCamId() {
+    const cams = previewCameras();
+    if (!cams.length) return "";
+    const activeIds = activeScanCameraIds();
+    if (state.scanPreviewFocusCamId && cams.some((c) => c.id === state.scanPreviewFocusCamId)) {
+      return state.scanPreviewFocusCamId;
+    }
+    const activeId = activeIds[0] || "";
+    if (activeId && cams.some((c) => c.id === activeId)) return activeId;
+    return cams[0].id;
+  }
+
+  function previewSnapshotUrl(camId) {
+    return `${API}/cameras/${encodeURIComponent(camId)}/snapshot?t=${Date.now()}`;
+  }
+
+  function previewHeroUrl(camId) {
+    const apply = previewHeroApplyRules(camId) ? "1" : "0";
+    return `${API}/cameras/${encodeURIComponent(camId)}/preview-frame?apply_rules=${apply}&t=${Date.now()}`;
+  }
+
+  function scanPreviewWanted() {
+    return !!(state.status?.go_live && (state.scanPreviewWizard || state.scanPreviewSidebar));
+  }
+
+  function clearScanPreviewTimer() {
+    if (state.scanPreviewTimer) {
+      clearInterval(state.scanPreviewTimer);
+      state.scanPreviewTimer = null;
+    }
+  }
+
+  function stopScanPreview() {
+    state.scanPreviewWizard = false;
+    state.scanPreviewSidebar = false;
+    state.scanPreviewApplyRules = false;
+    state.scanPreviewFocusCamId = "";
+    state.scanPreviewLastHeroAt = 0;
+    state.scanPreviewGen += 1;
+    clearScanPreviewTimer();
+    syncScanPreviewUI();
+  }
+
+  function updatePreviewHighlights() {
+    const activeIds = new Set(activeScanCameraIds());
+    const focusId = resolvePreviewFocusCamId();
+    document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact)").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id") || "";
+      card.classList.toggle("is-active", activeIds.has(camId));
+      card.classList.toggle("is-selected", camId === focusId);
+    });
+    document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact) .sa-preview-badge").forEach((badge) => {
+      const card = badge.closest(".sa-preview-card");
+      if (card) badge.hidden = !activeIds.has(card.getAttribute("data-cam-id") || "");
+    });
+    document.querySelectorAll(".sa-preview-card-compact").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id") || "";
+      const isActive = activeIds.has(camId);
+      card.classList.toggle("is-active", isActive);
+      const badge = card.querySelector(".sa-preview-badge");
+      if (badge) badge.hidden = !isActive;
+    });
+    const heroLabel = document.getElementById("w-preview-hero-label");
+    if (heroLabel) {
+      const cam = previewCameras().find((c) => c.id === focusId);
+      heroLabel.textContent = cam ? cam.name : "";
+    }
+    syncPreviewRulesCheckbox();
+  }
+
+  function syncPreviewRulesCheckbox() {
+    const focusId = resolvePreviewFocusCamId();
+    const hasRules = !!(focusId && cameraHasEnabledRules(focusId));
+    if (!hasRules && state.scanPreviewApplyRules) {
+      state.scanPreviewApplyRules = false;
+    }
+    const rulesInner = document.getElementById("w-preview-rules-inner");
+    const rulesLabel = document.querySelector("#w-preview-grid .sa-preview-rules-check");
+    const hint = document.getElementById("w-preview-rules-hint");
+    if (rulesInner) {
+      rulesInner.disabled = !hasRules;
+      rulesInner.checked = hasRules && state.scanPreviewApplyRules;
+    }
+    if (rulesLabel) {
+      rulesLabel.classList.toggle("is-disabled", !hasRules);
+    }
+    if (hint) {
+      hint.hidden = hasRules;
+    }
+  }
+
+  function buildPreviewCardHtml(cam, compact, noRules) {
+    const activeIds = new Set(activeScanCameraIds());
+    const focusId = resolvePreviewFocusCamId();
+    const isActive = activeIds.has(cam.id);
+    const isSelected = !compact && cam.id === focusId;
+    const badge = '<span class="sa-preview-badge"' + (isActive ? "" : " hidden") + ">Scanning</span>";
+    if (compact) {
+      return `<div class="sa-preview-card sa-preview-card-compact${isActive ? " is-active" : ""}" data-cam-id="${escapeHtml(cam.id)}" title="${escapeHtml(cam.name)}">
+        <img alt="" loading="lazy" />
+        ${badge}
+      </div>`;
+    }
+    const noRulesCls = noRules ? " sa-preview-card-no-rules" : "";
+    return `<div class="sa-preview-card${noRulesCls}${isActive ? " is-active" : ""}${isSelected ? " is-selected" : ""}" data-cam-id="${escapeHtml(cam.id)}" role="button" tabindex="0" title="Show in large preview">
+      <div class="sa-preview-thumb"><img alt="" loading="lazy" /></div>
+      <div class="sa-preview-label">${escapeHtml(cam.name)}${badge}</div>
+    </div>`;
+  }
+
+  function buildPreviewGridSectionsHtml() {
+    const withRules = previewCamerasWithRules();
+    const withoutRules = previewCamerasWithoutRules();
+    const withSection = `<section class="sa-preview-group">
+      <h4 class="sa-preview-group-title">With rules</h4>
+      ${
+        withRules.length
+          ? `<div class="sa-preview-grid" data-group="with-rules">${withRules.map((c) => buildPreviewCardHtml(c, false, false)).join("")}</div>`
+          : `<p class="sa-preview-group-empty">No cameras have rules yet.</p>`
+      }
+    </section>`;
+    const noSection = `<section class="sa-preview-group">
+      <h4 class="sa-preview-group-title">No rules yet</h4>
+      ${
+        withoutRules.length
+          ? `<div class="sa-preview-grid" data-group="no-rules">${withoutRules.map((c) => buildPreviewCardHtml(c, false, true)).join("")}</div>`
+          : `<p class="sa-preview-group-empty">All cameras have rules.</p>`
+      }
+    </section>`;
+    return withSection + noSection;
+  }
+
+  function bindPreviewGridClicks() {
+    document.querySelectorAll("#w-preview-grid .sa-preview-card[data-cam-id]").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id");
+      if (!camId) return;
+      card.onclick = () => {
+        state.scanPreviewFocusCamId = camId;
+        updatePreviewHighlights();
+        state.scanPreviewGen += 1;
+        refreshHeroPreview(state.scanPreviewGen);
+      };
+    });
+  }
+
+  function refreshHeroPreview(gen) {
+    if (gen !== state.scanPreviewGen || !scanPreviewWanted() || !state.scanPreviewWizard) return Promise.resolve();
+    const camId = resolvePreviewFocusCamId();
+    const img = document.getElementById("w-preview-hero-img");
+    if (!img || !camId) return Promise.resolve();
+    const url = previewHeroUrl(camId);
+    return new Promise((resolve) => {
+      img.onerror = () => {
+        img.classList.add("sa-preview-error");
+        resolve();
+      };
+      img.onload = () => {
+        img.classList.remove("sa-preview-error");
+        resolve();
+      };
+      img.src = url;
+      state.scanPreviewLastHeroAt = Date.now();
+      updatePreviewHighlights();
+    });
+  }
+
+  async function refreshPreviewFrames(gen) {
+    const cams = previewCameras();
+    for (let i = 0; i < cams.length; i += 1) {
+      if (gen !== state.scanPreviewGen || !scanPreviewWanted()) return;
+      const cam = cams[i];
+      const url = previewSnapshotUrl(cam.id);
+      document.querySelectorAll(`.sa-preview-card[data-cam-id="${CSS.escape(cam.id)}"] img`).forEach((img) => {
+        img.onerror = () => img.classList.add("sa-preview-error");
+        img.onload = () => img.classList.remove("sa-preview-error");
+        img.src = url;
+      });
+      if (i < cams.length - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      }
+    }
+    const heroInterval = previewHeroApplyRules(resolvePreviewFocusCamId()) ? 6000 : 4000;
+    const due = Date.now() - (state.scanPreviewLastHeroAt || 0) >= heroInterval;
+    if (state.scanPreviewWizard && due) {
+      await refreshHeroPreview(gen);
+    }
+    updatePreviewHighlights();
+  }
+
+  function ensureScanPreviewLoop() {
+    if (!scanPreviewWanted() || document.hidden) {
+      clearScanPreviewTimer();
+      return;
+    }
+    if (state.scanPreviewTimer) return;
+    const tick = async () => {
+      if (!scanPreviewWanted() || document.hidden) return;
+      try {
+        state.status = await api("/status");
+        if (!state.status?.go_live) {
+          stopScanPreview();
+          return;
+        }
+        const live = !!state.status.go_live;
+        document.getElementById("live-dot").className = "sa-dot " + (live ? "on" : "off");
+        document.getElementById("live-label").textContent = live ? "Scanning" : "Idle";
+      } catch (_) {
+        /* ignore */
+      }
+      await refreshPreviewFrames(state.scanPreviewGen);
+      updatePreviewHighlights();
+    };
+    tick();
+    state.scanPreviewTimer = setInterval(tick, 4000);
+  }
+
+  function syncScanPreviewUI() {
+    const live = !!state.status?.go_live;
+    const toggleBtn = document.getElementById("live-preview-toggle");
+    const strip = document.getElementById("live-preview-strip");
+
+    if (toggleBtn) {
+      toggleBtn.hidden = !live;
+      toggleBtn.textContent = state.scanPreviewSidebar ? "Hide preview" : "Show preview";
+    }
+    if (strip) {
+      strip.hidden = !live || !state.scanPreviewSidebar;
+      if (!strip.hidden) {
+        const cams = previewCameras();
+        const stripKey = cams.map((c) => c.id).join("|");
+        if (strip.dataset.stripKey !== stripKey) {
+          strip.dataset.stripKey = stripKey;
+          strip.innerHTML = cams.length
+            ? cams.map((c) => buildPreviewCardHtml(c, true)).join("")
+            : '<p class="sa-preview-placeholder">No enabled cameras</p>';
+        }
+      }
+    }
+
+    const wToggle = document.getElementById("w-preview-toggle");
+    const wGrid = document.getElementById("w-preview-grid");
+    if (wToggle) {
+      wToggle.textContent = state.scanPreviewWizard ? "Hide preview" : "Show preview";
+    }
+    if (wGrid) {
+      wGrid.hidden = !live || !state.scanPreviewWizard;
+      if (!wGrid.hidden) {
+        const withRules = previewCamerasWithRules();
+        const withoutRules = previewCamerasWithoutRules();
+        const gridKey = `${withRules.map((c) => c.id).join("|")}||${withoutRules.map((c) => c.id).join("|")}`;
+        if (wGrid.dataset.gridKey !== gridKey || !wGrid.querySelector(".sa-preview-group")) {
+          wGrid.dataset.gridKey = gridKey;
+          const total = withRules.length + withoutRules.length;
+          wGrid.innerHTML = total
+            ? `<label class="sa-preview-rules-check"><input type="checkbox" id="w-preview-rules-inner"${state.scanPreviewApplyRules ? " checked" : ""}> Apply rules on preview</label>
+               <p class="sa-preview-rules-hint" id="w-preview-rules-hint" hidden>Select a camera with rules to preview overlays.</p>
+               <div class="sa-preview-hero">
+                 <img id="w-preview-hero-img" alt="" />
+                 <span class="sa-preview-hero-label" id="w-preview-hero-label"></span>
+               </div>
+               ${buildPreviewGridSectionsHtml()}`
+            : '<p class="sa-preview-placeholder">Add enabled cameras to preview.</p>';
+          const rulesInner = document.getElementById("w-preview-rules-inner");
+          if (rulesInner) {
+            rulesInner.onchange = () => {
+              if (rulesInner.disabled) return;
+              state.scanPreviewApplyRules = rulesInner.checked;
+              state.scanPreviewLastHeroAt = 0;
+              state.scanPreviewGen += 1;
+              refreshHeroPreview(state.scanPreviewGen);
+            };
+          }
+          bindPreviewGridClicks();
+          syncPreviewRulesCheckbox();
+        } else {
+          syncPreviewRulesCheckbox();
+        }
+        updatePreviewHighlights();
+      }
+    }
+
+    if (scanPreviewWanted()) {
+      ensureScanPreviewLoop();
+    } else {
+      clearScanPreviewTimer();
+    }
+  }
+
+  function toggleScanPreviewSidebar() {
+    state.scanPreviewSidebar = !state.scanPreviewSidebar;
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  }
+
+  function toggleScanPreviewWizard() {
+    state.scanPreviewWizard = !state.scanPreviewWizard;
+    if (state.scanPreviewWizard && !state.scanPreviewFocusCamId) {
+      state.scanPreviewFocusCamId = resolvePreviewFocusCamId();
+    }
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      state.scanPreviewLastHeroAt = 0;
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  }
+
   async function refresh() {
     state.status = await api("/status");
     const live = !!state.status.go_live;
+    if (!live && (state.scanPreviewWizard || state.scanPreviewSidebar)) {
+      state.scanPreviewWizard = false;
+      state.scanPreviewSidebar = false;
+      state.scanPreviewApplyRules = false;
+      state.scanPreviewFocusCamId = "";
+      state.scanPreviewLastHeroAt = 0;
+      state.scanPreviewGen += 1;
+      clearScanPreviewTimer();
+    }
     document.getElementById("live-dot").className = "sa-dot " + (live ? "on" : "off");
     document.getElementById("live-label").textContent = live ? "Scanning" : "Idle";
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      updatePreviewHighlights();
+    }
   }
 
   async function loadLists() {
@@ -665,12 +1050,20 @@
     if (state.view === "monitor" && view !== "monitor") {
       stopMonitorIfAny();
     }
+    if (state.view === "wizard" && view !== "wizard") {
+      state.scanPreviewWizard = false;
+      if (!state.scanPreviewSidebar) {
+        state.scanPreviewGen += 1;
+        clearScanPreviewTimer();
+      }
+    }
     if (!isAdmin() && ADMIN_VIEWS.includes(view)) {
       view = "alerts";
     }
     state.view = view;
     syncNavActive(view);
     render();
+    syncScanPreviewUI();
   }
 
   function render() {
@@ -744,6 +1137,8 @@
   }
 
   async function stopMonitorIfAny() {
+    clearMonitorFramePoll();
+    resetMonitorEventTracking();
     if (!state.monitorSessionId) return;
     const sid = state.monitorSessionId;
     state.monitorSessionId = null;
@@ -807,6 +1202,15 @@
             <button class="btn primary" type="button" id="w-live"${isAdmin() ? "" : " disabled"}>${s.go_live ? "Stop scanning" : "Start scanning"}</button>
             <span class="sa-muted" id="w-msg"></span>
           </div>
+          ${
+            s.go_live
+              ? `<div class="sa-golive-preview">
+            <p class="sa-muted">On-demand preview — verify all cameras while scanning. Stops when hidden or you leave this page.</p>
+            <button class="btn secondary" type="button" id="w-preview-toggle">${state.scanPreviewWizard ? "Hide preview" : "Show preview"}</button>
+            <div id="w-preview-grid" class="sa-golive-preview-grid"${state.scanPreviewWizard ? "" : " hidden"}></div>
+          </div>`
+              : ""
+          }
         </section>
       </div>`;
     document.getElementById("w-to-cam").onclick = () => go("cameras");
@@ -829,15 +1233,27 @@
     };
     document.getElementById("w-live").onclick = async () => {
       try {
+        const turningOff = !!s.go_live;
         await api("/site", {
           json: { go_live: !s.go_live, setup_complete: true },
         });
+        if (turningOff) {
+          stopScanPreview();
+        }
         await refresh();
+        await loadLists();
         wizard();
       } catch (e) {
         alert(e.message);
       }
     };
+    document.getElementById("w-preview-toggle") &&
+      (document.getElementById("w-preview-toggle").onclick = toggleScanPreviewWizard);
+    syncScanPreviewUI();
+    if (state.scanPreviewWizard && scanPreviewWanted()) {
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
   }
 
   function cameras() {
@@ -861,18 +1277,40 @@
       )
       .join("");
     main.innerHTML = `
-      <div class="sa-h"><div><h2>Cameras</h2><p>Live RTSP for production. Upload a video to test without CCTV.</p></div></div>
+      <div class="sa-h"><div><h2>Cameras</h2><p>Add DVR (HTTP snapshot) or NVR (RTSP). Upload a video to test without CCTV.</p></div></div>
       ${
         isAdmin()
           ? `<div class="sa-card" style="margin-bottom:1rem;">
-        <h3>Add live CCTV (RTSP)</h3>
+        <h3>Add live CCTV</h3>
         <div class="sa-form" style="margin-top:0.7rem;">
-          <div class="sa-field"><label>Name</label><input class="text-input" id="c-name" placeholder="Entrance"></div>
-          <div class="sa-field"><label>RTSP URL</label><input class="text-input" id="c-url" placeholder="rtsp://user:pass@nvr:554/..."></div>
+          <div class="sa-field"><label>Name</label><input class="text-input" id="c-name" placeholder="Kitchen"></div>
+          <div class="sa-field">
+            <label>Device type</label>
+            <select class="text-input" id="c-device-type">
+              <option value="dvr">DVR (HTTP snapshot)</option>
+              <option value="rtsp">NVR (RTSP)</option>
+            </select>
+          </div>
+          <div id="c-dvr-fields">
+            <div class="sa-field">
+              <label>HTTP snapshot URL</label>
+              <input class="text-input" id="c-snapshot-url" placeholder="http://192.168.1.100/ISAPI/Streaming/channels/101/picture">
+              <p class="sa-muted sa-field-hint">Hikvision channels: 101, 201, 301 … 801 (cam 1–8 main stream)</p>
+            </div>
+            <div class="sa-field"><label>Username</label><input class="text-input" id="c-http-user" placeholder="admin" autocomplete="username"></div>
+            <div class="sa-field"><label>Password</label><input class="text-input" id="c-http-pass" type="password" placeholder="••••••" autocomplete="current-password"></div>
+          </div>
+          <div id="c-rtsp-fields" hidden>
+            <div class="sa-field"><label>RTSP URL</label><input class="text-input" id="c-rtsp-url" placeholder="rtsp://user:pass@nvr:554/Streaming/Channels/101"></div>
+          </div>
           <div class="sa-row">
             <button class="btn secondary" type="button" id="c-test">Test connection</button>
             <button class="btn primary" type="button" id="c-save" style="width:auto;">Save camera</button>
             <span id="c-msg" class="sa-muted"></span>
+          </div>
+          <div id="c-preview-wrap" class="sa-camera-preview" hidden>
+            <img id="c-preview-img" alt="Camera test preview">
+            <span id="c-preview-meta" class="sa-muted"></span>
           </div>
         </div>
         <div class="divider-or">— OR —</div>
@@ -890,18 +1328,79 @@
       </table>`;
 
     const msg = document.getElementById("c-msg");
+    const deviceType = document.getElementById("c-device-type");
+    const dvrFields = document.getElementById("c-dvr-fields");
+    const rtspFields = document.getElementById("c-rtsp-fields");
+    const previewWrap = document.getElementById("c-preview-wrap");
+    const previewImg = document.getElementById("c-preview-img");
+    const previewMeta = document.getElementById("c-preview-meta");
+
+    function syncCameraDeviceFields() {
+      const isDvr = deviceType?.value === "dvr";
+      if (dvrFields) dvrFields.hidden = !isDvr;
+      if (rtspFields) rtspFields.hidden = isDvr;
+      state.previewUrl = "";
+      if (previewWrap) previewWrap.hidden = true;
+      if (previewImg) previewImg.removeAttribute("src");
+      if (previewMeta) previewMeta.textContent = "";
+      if (msg) {
+        msg.textContent = "";
+        msg.className = "sa-muted";
+      }
+    }
+
+    function cameraTestPayload() {
+      const isDvr = deviceType?.value === "dvr";
+      const base = { name: document.getElementById("c-name")?.value || "Camera" };
+      if (isDvr) {
+        return {
+          ...base,
+          type: "dvr",
+          snapshot_url: document.getElementById("c-snapshot-url")?.value || "",
+          http_user: document.getElementById("c-http-user")?.value || "",
+          http_password: document.getElementById("c-http-pass")?.value || "",
+        };
+      }
+      return {
+        ...base,
+        type: "rtsp",
+        rtsp_url: document.getElementById("c-rtsp-url")?.value || "",
+      };
+    }
+
+    function showCameraPreview(r) {
+      state.previewUrl = r.preview_url || "";
+      if (!previewWrap || !previewImg) return;
+      if (state.previewUrl) {
+        previewWrap.hidden = false;
+        previewImg.src = state.previewUrl + "?t=" + Date.now();
+        if (previewMeta) {
+          previewMeta.textContent = r.width && r.height ? `${r.width}×${r.height}` : "";
+        }
+      } else {
+        previewWrap.hidden = true;
+      }
+    }
+
+    if (deviceType) {
+      deviceType.onchange = syncCameraDeviceFields;
+      syncCameraDeviceFields();
+    }
+
     const testBtn = document.getElementById("c-test");
     if (testBtn) {
       testBtn.onclick = async () => {
         msg.textContent = "Testing…";
+        msg.className = "sa-muted";
         try {
-          const r = await api("/cameras/test-rtsp", {
-            json: { name: document.getElementById("c-name").value, rtsp_url: document.getElementById("c-url").value, type: "rtsp" },
-          });
-          state.previewUrl = r.preview_url;
-          msg.textContent = "Online — frames received";
+          const r = await api("/cameras/test-connection", { json: cameraTestPayload() });
+          showCameraPreview(r);
+          msg.textContent = deviceType?.value === "dvr" ? "Online — snapshot received" : "Online — frames received";
           msg.className = "sa-ok";
         } catch (e) {
+          state.previewUrl = "";
+          if (previewWrap) previewWrap.hidden = true;
+          if (previewImg) previewImg.removeAttribute("src");
           msg.textContent = e.message;
           msg.className = "sa-error";
         }
@@ -911,16 +1410,13 @@
     if (saveBtn) {
       saveBtn.onclick = async () => {
         try {
-          await api("/cameras", {
-            json: {
-              name: document.getElementById("c-name").value || "Camera",
-              type: "rtsp",
-              rtsp_url: document.getElementById("c-url").value,
-              preview_url: state.previewUrl || "",
-              enabled: true,
-              health: state.previewUrl ? "online" : "unknown",
-            },
-          });
+          const payload = {
+            ...cameraTestPayload(),
+            preview_url: state.previewUrl || "",
+            enabled: true,
+            health: state.previewUrl ? "online" : "unknown",
+          };
+          await api("/cameras", { json: payload });
           await loadLists();
           cameras();
         } catch (e) {
@@ -1019,6 +1515,7 @@
         <div class="sa-form">
           <div class="sa-field"><label>Rule name</label><input class="text-input" id="r-name" placeholder="Main gate"></div>
           <div class="sa-field"><label>Camera</label><select class="text-input" id="r-cam">${camOpts}</select></div>
+          <p class="sa-muted" id="r-cam-limit-hint"></p>
           <div class="sa-field">
             <label class="sa-label-row">Scan type
               <button type="button" class="sa-info-btn" id="r-type-info" title="What each scan type means">i</button>
@@ -1155,6 +1652,27 @@
     });
 
     const camSel = document.getElementById("r-cam");
+    const MAX_RULES_PER_CAMERA = 3;
+
+    function enabledRulesOnCamera(camId) {
+      return state.rules.filter((r) => r.camera_id === camId && r.enabled !== false);
+    }
+
+    function syncCameraRuleLimitHint() {
+      const hint = document.getElementById("r-cam-limit-hint");
+      if (!hint || !camSel) return;
+      const camId = camSel.value;
+      const n = enabledRulesOnCamera(camId).length;
+      if (!camId) {
+        hint.textContent = "";
+        return;
+      }
+      hint.textContent =
+        n >= MAX_RULES_PER_CAMERA
+          ? `This camera already has ${MAX_RULES_PER_CAMERA} enabled rules (max). Disable or remove one to add another.`
+          : `${n} of ${MAX_RULES_PER_CAMERA} enabled rules on this camera. Monitor runs all rules in parallel.`;
+    }
+
     function showPreview() {
       const cam = state.cameras.find((c) => c.id === camSel?.value);
       const wrap = document.getElementById("roi-wrap");
@@ -1170,6 +1688,7 @@
       img.onload = () => bindCanvas(img, document.getElementById("roi-cv"), isGateType());
       img.src = cam.preview_url;
       syncRoiPickUi();
+      syncCameraRuleLimitHint();
     }
     if (camSel) {
       camSel.onchange = showPreview;
@@ -1183,7 +1702,7 @@
       const img = document.getElementById("roi-img");
       const cv = document.getElementById("roi-cv");
       if (!img || !cv || !document.getElementById("roi-wrap")?.style.display || document.getElementById("roi-wrap").style.display === "none") {
-        return alert("Camera needs a preview still. Re-test RTSP or re-upload the file.");
+        return alert("Camera needs a preview still. Re-test the connection or re-upload the file.");
       }
       state.roiSuggestBusy = true;
       syncRoiPickUi();
@@ -1241,9 +1760,13 @@
       const channels = [];
       if (document.getElementById("ch-web").checked) channels.push("web");
       if (document.getElementById("ch-wa").checked) channels.push("whatsapp");
+      const camId = document.getElementById("r-cam").value;
+      if (enabledRulesOnCamera(camId).length >= MAX_RULES_PER_CAMERA) {
+        return alert(`Max ${MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.`);
+      }
       const payload = {
         name: document.getElementById("r-name").value || "Rule",
-        camera_id: document.getElementById("r-cam").value,
+        camera_id: camId,
         scan_type: scanType,
         roi_normalized: state.roi,
         channels: channels.length ? channels : ["web"],
@@ -1416,6 +1939,7 @@
               ${st !== "ignored" ? `<button class="btn secondary" type="button" data-veh-ignore="${escapeHtml(v.id)}">Ignore</button>` : ""}
               ${st !== "risk" && st !== "danger" ? `<button class="btn danger" type="button" data-veh-risk="${escapeHtml(v.id)}">Mark risk</button>` : ""}
               ${st === "risk" || st === "danger" ? `<button class="btn secondary" type="button" data-veh-approve="${escapeHtml(v.id)}">Clear risk → ours</button>` : ""}
+              <button class="btn danger" type="button" data-veh-del="${escapeHtml(v.id)}" data-veh-plate="${escapeHtml(v.plate || v.label || "")}">Remove</button>
             </div>
           </div>
         </article>`;
@@ -1481,6 +2005,18 @@
         }
       };
     });
+    main.querySelectorAll("[data-veh-del]").forEach((b) => {
+      b.onclick = async () => {
+        const plate = b.getAttribute("data-veh-plate") || "this vehicle";
+        if (!confirm("Remove plate " + plate + " from Vehicles?")) return;
+        try {
+          await api("/known-vehicles/" + b.getAttribute("data-veh-del"), { method: "DELETE" });
+          vehicles();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+    });
   }
 
   function bindRoi(img, canvas) {
@@ -1516,6 +2052,101 @@
     ctx.stroke();
   }
 
+  let monitorAudioCtx = null;
+
+  function playMonitorBipTone(ctx) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.22, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.16);
+  }
+
+  function playMonitorBeepsForNewEvents(events) {
+    if (!state.monitorSeenEventIds) state.monitorSeenEventIds = new Set();
+    const seen = state.monitorSeenEventIds;
+    const fresh = (events || []).filter((ev) => {
+      const eid = ev.event_id || ev.id;
+      return eid && !seen.has(eid);
+    });
+    fresh.forEach((ev, idx) => {
+      const eid = ev.event_id || ev.id;
+      seen.add(eid);
+      setTimeout(() => playMonitorBip(), idx * 120);
+    });
+  }
+
+  function seedMonitorSeenEvents(events) {
+    state.monitorSeenEventIds = new Set();
+    (events || []).forEach((ev) => {
+      const eid = ev.event_id || ev.id;
+      if (eid) state.monitorSeenEventIds.add(eid);
+    });
+  }
+
+  function resetMonitorEventTracking() {
+    state.monitorEventCount = 0;
+    state.monitorSeenEventIds = new Set();
+  }
+
+  function playMonitorBip() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!monitorAudioCtx) monitorAudioCtx = new AC();
+      const ctx = monitorAudioCtx;
+      if (ctx.state === "suspended") {
+        ctx.resume().then(() => playMonitorBipTone(ctx)).catch(() => {});
+        return;
+      }
+      playMonitorBipTone(ctx);
+    } catch (_) {
+      /* ignore autoplay / AudioContext errors */
+    }
+  }
+
+  function eventAsRule(ev) {
+    return {
+      scan_type: ev.scan_type,
+      roi_normalized: ev.roi_normalized || [],
+      gate_config: ev.gate_config || {},
+      css_color: ev.css_color,
+    };
+  }
+
+  function openEventLightbox(ev) {
+    const title = `${ev.rule_name || "Event"} · ${(ev.scan_type || "").replace(/_/g, " ")}`;
+    if (ev.clip_url && !ev.thumb_url) {
+      openLightbox({ title, videoUrl: ev.clip_url });
+      return;
+    }
+    const thumb = ev.thumb_url;
+    if (!thumb) {
+      openLightbox({ title, body: '<p class="sa-muted">No snapshot for this event.</p>' });
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.className = "sa-lightbox-media";
+      const maxW = Math.min(720, img.naturalWidth);
+      const scale = maxW / img.naturalWidth;
+      canvas.width = maxW;
+      canvas.height = Math.round(img.naturalHeight * scale);
+      drawRuleOntoCanvas(canvas, img, eventAsRule(ev));
+      openLightbox({ title, canvas });
+    };
+    img.onerror = () => openLightbox({ title, imageUrl: thumb });
+    img.src = thumb;
+  }
+
   function eventTrackerHtml(events) {
     const list = events || [];
     if (!list.length) {
@@ -1529,15 +2160,20 @@
       .reverse()
       .map((ev) => {
         const t = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : "";
+        const eid = ev.event_id || ev.id || "";
+        const swatch = ev.css_color
+          ? `<span class="sa-event-chip-swatch" style="background:${escapeHtml(ev.css_color)}"></span>`
+          : "";
+        const borderStyle = ev.css_color ? ` style="border-color:${escapeHtml(ev.css_color)}"` : "";
         const media = ev.thumb_url
           ? `<img src="${escapeHtml(ev.thumb_url)}" alt="">`
           : ev.clip_url
             ? `<video src="${escapeHtml(ev.clip_url)}" muted playsinline preload="metadata"></video>`
             : `<span class="sa-event-chip-empty">No snap</span>`;
-        return `<button type="button" class="sa-event-chip" data-ev-thumb="${escapeHtml(ev.thumb_url || "")}" data-ev-clip="${escapeHtml(ev.clip_url || "")}" data-ev-title="${escapeHtml(ev.rule_name || ev.scan_type || "Event")}">
+        return `<button type="button" class="sa-event-chip" data-event-id="${escapeHtml(eid)}"${borderStyle} data-ev-thumb="${escapeHtml(ev.thumb_url || "")}" data-ev-clip="${escapeHtml(ev.clip_url || "")}" data-ev-title="${escapeHtml(ev.rule_name || ev.scan_type || "Event")}">
           <div class="sa-event-chip-media">${media}</div>
           <div class="sa-event-chip-meta">
-            <strong>${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</strong>
+            ${swatch}<strong>${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</strong>
             <span>${escapeHtml(ev.rule_name || "")}</span>
             <span class="sa-muted">${escapeHtml(t)}</span>
           </div>
@@ -1553,6 +2189,12 @@
   function bindEventTrackerClicks(root) {
     (root || document).querySelectorAll(".sa-event-chip").forEach((b) => {
       b.onclick = () => {
+        const eid = b.getAttribute("data-event-id");
+        const ev = (state.monitorEvents || []).find((e) => (e.event_id || e.id) === eid);
+        if (ev) {
+          openEventLightbox(ev);
+          return;
+        }
         const title = b.getAttribute("data-ev-title") || "Event";
         const clip = b.getAttribute("data-ev-clip") || "";
         const thumb = b.getAttribute("data-ev-thumb") || "";
@@ -1575,26 +2217,91 @@
     }
   }
 
+  function clearMonitorFramePoll() {
+    if (state.monitorFramePoll) {
+      clearInterval(state.monitorFramePoll);
+      state.monitorFramePoll = null;
+    }
+  }
+
+  function hideMonitorOverlays() {
+    const loading = document.getElementById("sa-monitor-loading");
+    const errEl = document.getElementById("sa-monitor-error");
+    if (loading) loading.hidden = true;
+    if (errEl) errEl.hidden = true;
+  }
+
+  function monitorCameraType(monStatus) {
+    if (monStatus?.camera_type) return monStatus.camera_type;
+    const cam = state.cameras.find((c) => c.id === monStatus?.camera_id);
+    return cam?.type || "rtsp";
+  }
+
+  function bindMonitorStreamImg(useDvrPoll, sessionId) {
+    const img = document.getElementById("sa-monitor-video");
+    const loading = document.getElementById("sa-monitor-loading");
+    const errEl = document.getElementById("sa-monitor-error");
+    if (!img) return;
+
+    clearMonitorFramePoll();
+    if (errEl) errEl.hidden = true;
+
+    img.onload = () => hideMonitorOverlays();
+    img.onerror = () => {
+      /* Keep overlay hidden when polling — a failed refresh must not block the last good frame */
+      if (useDvrPoll) return;
+    };
+
+    if (img.complete && img.naturalWidth > 0) {
+      hideMonitorOverlays();
+    }
+
+    if (useDvrPoll && sessionId) {
+      const refresh = () => {
+        if (state.view !== "monitor" || !state.monitorSessionId) return;
+        img.src = `/api/site-admin/monitor/frame/${encodeURIComponent(sessionId)}?t=${Date.now()}`;
+      };
+      refresh();
+      state.monitorFramePoll = setInterval(refresh, 1000);
+      window.setTimeout(hideMonitorOverlays, 4000);
+      return;
+    }
+
+    window.setTimeout(hideMonitorOverlays, 2500);
+  }
+
   async function monitor() {
     if (state.monitorPoll) {
       clearInterval(state.monitorPoll);
       state.monitorPoll = null;
     }
+    if (!state.monitorSessionId) {
+      clearMonitorFramePoll();
+    }
     await loadLists();
     const monStatus = await api("/monitor/status");
     if (monStatus.active && monStatus.session_id) {
       state.monitorSessionId = monStatus.session_id;
+      if (monStatus.camera_id) {
+        state.monitorCameraPick = monStatus.camera_id;
+      }
+    } else if (state.monitorSessionId && !monStatus.active) {
+      state.monitorSessionId = null;
     }
 
     const camerasWithRules = state.cameras.filter((c) =>
       state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
     );
-    const camOpts = camerasWithRules
-      .map((c) => {
-        const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
-        return `<option value="${c.id}">${escapeHtml(c.name)} (${n} rules)</option>`;
-      })
-      .join("");
+    const activeCamId = monStatus.active ? monStatus.camera_id || state.monitorCameraPick : state.monitorCameraPick;
+    const camOpts =
+      `<option value=""${!activeCamId ? " selected" : ""}>Select camera…</option>` +
+      camerasWithRules
+        .map((c) => {
+          const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
+          const sel = c.id === activeCamId ? " selected" : "";
+          return `<option value="${c.id}"${sel}>${escapeHtml(c.name)} (${n} rules)</option>`;
+        })
+        .join("");
 
     const activeRules = monStatus.active ? monStatus.rules || [] : [];
     const legend = activeRules
@@ -1628,10 +2335,21 @@
           </div>`
         : "";
 
-    const streaming = state.monitorSessionId
+    const streamLive = !!(monStatus.active && state.monitorSessionId);
+    const useDvrPoll = streamLive && monitorCameraType(monStatus) === "dvr";
+    const videoSrc = streamLive
+      ? useDvrPoll
+        ? `/api/site-admin/monitor/frame/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+        : `/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+      : "";
+    const streaming = streamLive
       ? `<div class="sa-monitor-wrap">
+          <div id="sa-monitor-loading" class="sa-monitor-loading">Connecting…</div>
+          <div id="sa-monitor-error" class="sa-monitor-error" hidden>
+            Stream unavailable — check camera or Docker network to DVR
+          </div>
           <img id="sa-monitor-video" class="sa-monitor-video" alt="Live monitor"
-            src="/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}">
+            src="${videoSrc}">
         </div>
         ${monitorControlsHtml(monStatus.active ? monStatus : null)}`
       : `<div class="sa-monitor-wrap"><p class="placeholder-msg" style="padding:2rem;">Select a camera and click Watch live</p></div>`;
@@ -1645,16 +2363,17 @@
       </div>
       ${heavyNote}
       <div class="sa-row" style="margin-bottom:1rem;">
-        <select class="text-input" id="mon-cam" style="max-width:320px;" ${state.monitorSessionId ? "disabled" : ""}>
+        <select class="text-input" id="mon-cam" style="max-width:320px;" ${streamLive ? "disabled" : ""}>
           ${camOpts || '<option value="">No cameras with rules</option>'}
         </select>
         ${
           isAdmin()
-            ? state.monitorSessionId
+            ? streamLive
               ? `<button class="btn danger" type="button" id="mon-stop">Stop</button>`
               : `<button class="btn primary" type="button" id="mon-start" style="width:auto;">Watch live</button>`
             : `<span class="sa-muted">Viewer — watch only when Admin starts a session</span>`
         }
+        <button class="btn" type="button" id="mon-test-beep">Test beep</button>
       </div>
       ${streaming}
       ${gatePanel}
@@ -1664,32 +2383,61 @@
         <div class="sa-legend">${legend || '<span class="sa-muted">Start monitoring to see rule legend</span>'}</div>
       </div>`;
 
+    document.getElementById("mon-cam")?.addEventListener("change", (e) => {
+      state.monitorCameraPick = e.target.value || "";
+    });
+
+    document.getElementById("mon-test-beep")?.addEventListener("click", () => {
+      playMonitorBip();
+    });
+
     document.getElementById("mon-start")?.addEventListener("click", async () => {
-      const camId = document.getElementById("mon-cam")?.value;
-      if (!camId) return alert("Choose a camera with rules");
+      const camSel = document.getElementById("mon-cam");
+      const camId = camSel?.value;
+      if (!camId) return alert("Select a camera with rules");
+      const startBtn = document.getElementById("mon-start");
+      if (startBtn) {
+        startBtn.disabled = true;
+        startBtn.textContent = "Starting…";
+      }
       try {
         const r = await api("/monitor/start", { method: "POST", json: { camera_id: camId } });
         state.monitorSessionId = r.session_id;
+        state.monitorCameraPick = camId;
+        state.monitorEventCount = 0;
+        resetMonitorEventTracking();
         monitor();
       } catch (e) {
         alert(e.message);
+        if (startBtn) {
+          startBtn.disabled = false;
+          startBtn.textContent = "Watch live";
+        }
       }
     });
 
     document.getElementById("mon-stop")?.addEventListener("click", async () => {
       await stopMonitorIfAny();
+      state.monitorCameraPick = "";
       monitor();
     });
 
+    bindMonitorStreamImg(useDvrPoll, state.monitorSessionId);
+    if (streamLive) hideMonitorOverlays();
+
     bindEventTrackerClicks(main);
 
+    state.monitorEvents = monStatus.events || [];
+
     if (state.monitorSessionId && monStatus.active) {
+      seedMonitorSeenEvents(monStatus.events || []);
+      state.monitorEventCount = (monStatus.events || []).length;
       state.monitorPaused = !!monStatus.paused;
       syncMonitorPlayback(monStatus);
       bindMonitorControls(monStatus);
     }
 
-    if (state.monitorSessionId) {
+    if (state.monitorSessionId && monStatus.active) {
       state.monitorPoll = setInterval(async () => {
         if (state.view !== "monitor") {
           clearInterval(state.monitorPoll);
@@ -1697,8 +2445,23 @@
         }
         try {
           const st = await api("/monitor/status");
+          if (!st.active && state.monitorSessionId) {
+            state.monitorSessionId = null;
+            resetMonitorEventTracking();
+            clearInterval(state.monitorPoll);
+            state.monitorPoll = null;
+            monitor();
+            return;
+          }
+          if (st.active) {
+            hideMonitorOverlays();
+          }
           syncMonitorPlayback(st);
-          renderEventTrackerStrip(st.events || []);
+          const events = st.events || [];
+          state.monitorEvents = events;
+          playMonitorBeepsForNewEvents(events);
+          state.monitorEventCount = events.length;
+          renderEventTrackerStrip(events);
           const gateEl = document.querySelector(".sa-gate-live");
           if (st.gate_live && gateEl) {
             const gl2 = st.gate_live;
@@ -1965,6 +2728,24 @@
 
   document.querySelectorAll(".sa-tabs [data-view]").forEach((b) => {
     b.onclick = () => go(b.getAttribute("data-view"));
+  });
+
+  document.getElementById("live-preview-toggle")?.addEventListener("click", toggleScanPreviewSidebar);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearScanPreviewTimer();
+      return;
+    }
+    if (scanPreviewWanted()) {
+      ensureScanPreviewLoop();
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  });
+
+  window.addEventListener("beforeunload", () => {
+    clearScanPreviewTimer();
   });
 
   roleSwitch?.querySelectorAll(".sa-role-btn").forEach((btn) => {

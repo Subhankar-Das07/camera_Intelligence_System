@@ -19,7 +19,7 @@ Use these Windows `.bat` files from the **project root**. Keep Docker Desktop ru
 |--------------|-----|
 | Python / JS / CSS / Site Admin / pipelines / `main.py` | **`docker-quick.bat`** |
 | Nothing — just start the stack | **`docker-up.bat`** |
-| `requirements.txt` or `Dockerfile` (packages / models) | **`docker-rebuild.bat`** |
+| `requirements.txt` or `Dockerfile` (packages / models) | **`docker-rebuild.bat`** — not `docker-refresh` unless rebuild fails |
 | Still broken / want latest base image | **`docker-refresh.bat`** |
 | Stop Docker for this project | **`docker-down.bat`** |
 | See live app logs | **`docker-logs.bat`** |
@@ -42,3 +42,46 @@ Restarting `app` reloads that mounted code without reinstalling Python packages 
 - **Hub pull (no local build)** — for teammates who only run the published image; see [`GUIDE.md`](../GUIDE.md) and [`TEAM_ONBOARDING.md`](../TEAM_ONBOARDING.md).
 
 Open the app at http://localhost:8000 after start/restart.
+
+**DVR on home LAN (e.g. `192.168.x.x`):** If **Cameras → Test connection** works on your PC but fails in Docker, the container cannot reach the DVR. Fix host/network access first; Live Monitor uses the same HTTP snapshot path as the camera test.
+
+## Go-live parallel runtime (env)
+
+When **Go live / scanning** is on, Site Admin runs up to **8 camera worker processes** in parallel. Frame capture is per camera; YOLO/pipeline runs share a capacity pool.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SITE_ADMIN_MAX_CAMERAS` | `8` | Max parallel camera worker processes |
+| `SITE_ADMIN_INFERENCE_SLOTS` | `2` | Max concurrent pipeline/YOLO runs across all workers |
+| `SITE_ADMIN_WORKER_STAGGER_MS` | `250` | Delay between spawning each worker (protects DVR) |
+| `SITE_ADMIN_TICK_MIN_SEC` | `1.0` | Fastest poll interval (high-priority rules) |
+| `SITE_ADMIN_TICK_MAX_SEC` | `3.0` | Slowest poll interval (backoff / low priority) |
+
+Example for a busy 8-channel DVR on a modest PC — add to `docker-compose.yml` under `app.environment`:
+
+```yaml
+SITE_ADMIN_MAX_CAMERAS: "8"
+SITE_ADMIN_INFERENCE_SLOTS: "2"
+SITE_ADMIN_TICK_MIN_SEC: "1.5"
+```
+
+After changing env vars, run `docker-quick.bat` (or `docker compose up -d --force-recreate` if compose env changed).
+
+Check logs: `docker-logs.bat` — look for `spawned scan worker for camera` and `camera worker started`.
+
+## Fall detection rule types
+
+| Rule | Use on |
+|------|--------|
+| **Fall detection** | Live video / RTSP / NVR / Live Monitor (velocity-based pipeline) |
+| **Fall detection — standing & lying** | HTTP snapshot DVR channels / go-live polling (upright → lying transition) |
+
+Manual test (standing & lying on DVR): create the rule with an ROI over the floor area, enable go-live, stand in view, then lie down and stay ~5 s. Expect an alert after two consecutive lying snapshots (~2–6 s). Hard-refresh Site Admin after `docker-quick.bat`.
+
+## Live Monitor parallel rules
+
+- **Max 3 enabled rules per camera** (enforced when saving rules).
+- Monitor evaluates all rules **in parallel** (up to 3 threads) on each frame.
+- **Event tracker + beep**: uses a **3s debounce per rule** (`SITE_ADMIN_MONITOR_DEBOUNCE_SEC`); Alerts tab still uses each rule's **60s cooldown**.
+- **Parallel workers**: `SITE_ADMIN_MONITOR_RULE_WORKERS=3` (default 3).
+- Click **Test beep** on Monitor before expecting automatic event sounds (unlocks browser audio).

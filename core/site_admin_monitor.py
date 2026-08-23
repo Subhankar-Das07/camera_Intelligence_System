@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import cv2
@@ -14,6 +15,7 @@ import numpy as np
 from shapely.geometry import Point, Polygon
 
 from core import site_admin_common as common
+from core import site_admin_scan as scan
 from core import site_admin_store as store
 from core.registry import registry
 from core.video_source import ThreadedCamera, get_video_source
@@ -26,6 +28,7 @@ os.makedirs(MONITOR_TEMP_DIR, exist_ok=True)
 os.makedirs(MONITOR_TEMP_PREVIEW_DIR, exist_ok=True)
 
 MAX_SESSION_EVENTS = 50
+MONITOR_RULE_WORKERS = max(1, min(3, int(os.environ.get("SITE_ADMIN_MONITOR_RULE_WORKERS", "3"))))
 
 RULE_COLORS = [
     (34, 211, 238),
@@ -39,6 +42,9 @@ RULE_COLORS = [
 _sessions: Dict[str, Dict[str, Any]] = {}
 _stop_events: Dict[str, threading.Event] = {}
 _lock = threading.Lock()
+_preview_cache: Dict[str, Dict[str, Any]] = {}
+_preview_lock = threading.Lock()
+PREVIEW_CACHE_TTL = 90.0
 _pose_model = None
 
 
@@ -86,16 +92,71 @@ def _denorm_roi(roi_normalized: List, width: int, height: int) -> np.ndarray:
 def _draw_all_rois(frame: np.ndarray, rules: List[Dict[str, Any]]) -> None:
     h, w = frame.shape[:2]
     for rule in rules:
-        roi = rule.get("roi_normalized") or []
-        if len(roi) < 3:
-            continue
-        color = _rule_color(rule.get("id") or "")
-        pts = _denorm_roi(roi, w, h)
-        cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
-        label = f"{rule.get('name', 'Rule')} ({rule.get('scan_type', '')})"
-        cx = int(np.mean(pts[:, 0]))
-        cy = int(np.mean(pts[:, 1]))
-        cv2.putText(frame, label, (cx, max(20, cy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        _draw_rule_geometry(frame, rule, highlight=False)
+
+
+def _draw_rule_geometry(frame: np.ndarray, rule: Dict[str, Any], highlight: bool = False) -> None:
+    """Draw one rule's ROI or gate geometry; optional highlight for breach."""
+    h, w = frame.shape[:2]
+    rule_id = rule.get("id") or ""
+    color = _rule_color(rule_id)
+    thickness = 4 if highlight else 2
+
+    scan_type = rule.get("scan_type") or ""
+    if scan_type == "gate_analytics":
+        gc = rule.get("gate_config") or {}
+        count_line = gc.get("count_line") or []
+        if len(count_line) == 2:
+            pts = _denorm_roi(count_line, w, h)
+            cv2.polylines(frame, [pts], False, (0, 255, 255), thickness)
+        gate_roi = gc.get("gate_roi") or []
+        if len(gate_roi) >= 3:
+            pts = _denorm_roi(gate_roi, w, h)
+            if highlight:
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [pts], (200, 120, 255))
+                cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
+            cv2.polylines(frame, [pts], True, (200, 120, 255), thickness)
+        zones = gc.get("distance_zones") or {}
+        zone_colors = {"near": (68, 68, 255), "medium": (0, 170, 255), "far": (102, 204, 68)}
+        for band, zc in zone_colors.items():
+            z = zones.get(band) or []
+            if len(z) >= 3:
+                pts = _denorm_roi(z, w, h)
+                cv2.polylines(frame, [pts], True, zc, max(1, thickness - 1))
+        return
+
+    roi = rule.get("roi_normalized") or []
+    if len(roi) < 3:
+        if highlight:
+            label = f"BREACH: {rule.get('name') or scan_type}"
+            cv2.rectangle(frame, (8, 8), (min(w - 8, 8 + len(label) * 11), 36), color, -1)
+            cv2.putText(
+                frame, label, (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+        return
+
+    pts = _denorm_roi(roi, w, h)
+    if highlight:
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.32, frame, 0.68, 0, frame)
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+    label = f"{rule.get('name', 'Rule')} ({scan_type})"
+    cx = int(np.mean(pts[:, 0]))
+    cy = int(np.mean(pts[:, 1]))
+    cv2.putText(
+        frame, label, (cx, max(20, cy - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5 if highlight else 0.45, color, 2 if highlight else 1, cv2.LINE_AA,
+    )
+
+
+def _frame_with_rule_emphasis(frame: np.ndarray, rule: Dict[str, Any]) -> np.ndarray:
+    """Copy frame with this rule's zone highlighted for event thumbs."""
+    out = frame.copy()
+    _draw_rule_geometry(out, rule, highlight=True)
+    return out
 
 
 def _get_pose_model():
@@ -214,30 +275,188 @@ def _emit_if_allowed(
     event: Dict[str, Any],
     frame: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
-    if session.get("scrub_mode"):
+    if session.get("preview_only") or session.get("scrub_mode"):
         return None
     snap = frame if frame is not None else session.get("last_raw_frame")
     if (rule.get("scan_type") or "") == "vehicle":
-        stored = common.handle_vehicle_sighting(cam, rule, event, frame=snap)
+        return common.handle_vehicle_sighting(cam, rule, event, frame=snap)
+    return common.emit_site_alert(cam, rule, event, frame=snap)
+
+
+def _record_monitor_detection(
+    session: Dict[str, Any],
+    rule: Dict[str, Any],
+    event: Dict[str, Any],
+    frame: Optional[np.ndarray] = None,
+) -> Optional[Dict[str, Any]]:
+    """Append monitor event (short debounce); independent of alert cooldown."""
+    if session.get("preview_only") or session.get("scrub_mode"):
+        return None
+    rule_id = rule.get("id") or ""
+    now = time.time()
+    debounce = session.setdefault("monitor_debounce", {})
+    last_ts = float(debounce.get(rule_id) or 0)
+    if now - last_ts < common.MONITOR_DEBOUNCE_SEC:
+        return None
+    debounce[rule_id] = now
+
+    event_id = str(uuid.uuid4())
+    scan_type = rule.get("scan_type") or event.get("type") or ""
+    msg = event.get("message") or (
+        f"{rule.get('name') or scan_type.replace('_', ' ')} — {scan_type.replace('_', ' ')}"
+    )
+    thumb_url = event.get("thumb_url") or ""
+    snap = frame if frame is not None else session.get("last_raw_frame")
+    if snap is not None:
+        thumb_src = _frame_with_rule_emphasis(snap, rule)
+        thumb_url = common._save_frame_thumb(thumb_src, event_id, common.ALERTS_DIR) or thumb_url
+
+    entry = {
+        "event_id": event_id,
+        "id": event.get("id") or event_id,
+        "ts": now,
+        "rule_id": rule_id,
+        "rule_name": rule.get("name"),
+        "scan_type": scan_type,
+        "message": msg,
+        "thumb_url": thumb_url,
+        "clip_url": event.get("clip_url") or "",
+        "severity": event.get("severity") or rule.get("severity") or "high",
+        "css_color": _rule_css_color(rule_id),
+        "roi_normalized": rule.get("roi_normalized") or [],
+        "gate_config": rule.get("gate_config") or {},
+    }
+
+    lock = session.get("event_lock")
+    if lock:
+        with lock:
+            events = session.setdefault("events", [])
+            events.append(entry)
+            if len(events) > MAX_SESSION_EVENTS:
+                session["events"] = events[-MAX_SESSION_EVENTS:]
+            session["last_event"] = msg
+            session["last_event_at"] = now
     else:
-        stored = common.emit_site_alert(cam, rule, event, frame=snap)
-    if stored:
-        session["last_event"] = stored.get("message") or rule.get("name") or ""
-        session["last_event_at"] = time.time()
         events = session.setdefault("events", [])
-        events.append({
-            "id": stored.get("id"),
-            "ts": time.time(),
-            "rule_id": rule.get("id"),
-            "rule_name": rule.get("name"),
-            "scan_type": rule.get("scan_type") or stored.get("scan_type"),
-            "message": stored.get("message") or "",
-            "thumb_url": stored.get("thumb_url") or "",
-            "clip_url": stored.get("clip_url") or "",
-        })
+        events.append(entry)
         if len(events) > MAX_SESSION_EVENTS:
             session["events"] = events[-MAX_SESSION_EVENTS:]
-    return stored
+        session["last_event"] = msg
+        session["last_event_at"] = now
+    return entry
+
+
+def _handle_rule_hit(
+    session: Dict[str, Any],
+    cam: Dict[str, Any],
+    rule: Dict[str, Any],
+    event: Dict[str, Any],
+    frame: Optional[np.ndarray] = None,
+) -> None:
+    stored_monitor = _record_monitor_detection(session, rule, event, frame)
+    stored_alert = _emit_if_allowed(session, cam, rule, event, frame)
+    if stored_monitor and stored_alert and stored_alert.get("thumb_url") and not stored_monitor.get("thumb_url"):
+        stored_monitor["thumb_url"] = stored_alert.get("thumb_url") or ""
+
+
+def _blend_overlay(base: np.ndarray, overlay: np.ndarray) -> None:
+    if base.shape != overlay.shape:
+        return
+    cv2.addWeighted(overlay, 0.55, base, 0.45, 0, base)
+
+
+def _draw_pose_cache_markers(
+    out: np.ndarray,
+    rules: List[Dict[str, Any]],
+    pose_cache: Optional[Dict[str, Any]],
+    hit_rule_ids: Optional[set] = None,
+) -> None:
+    if not pose_cache or pose_cache.get("keypoints_xy") is None:
+        return
+    h, w = out.shape[:2]
+    keypoints_xy = pose_cache["keypoints_xy"]
+    keypoints_conf = pose_cache["keypoints_conf"]
+    hit_rule_ids = hit_rule_ids or set()
+    for rule in rules:
+        scan_type = rule.get("scan_type") or ""
+        if scan_type not in ("intrusion", "danger_zone"):
+            continue
+        rule_id = rule.get("id") or ""
+        color = _rule_color(rule_id)
+        marker_color = (0, 0, 255) if rule_id in hit_rule_ids else color
+        roi = rule.get("roi_normalized") or []
+        if len(roi) < 3:
+            continue
+        roi_poly = Polygon(_denorm_roi(roi, w, h))
+        buffered = roi_poly.buffer(20) if scan_type == "danger_zone" else roi_poly
+        for person_kpts, conf in zip(keypoints_xy, keypoints_conf):
+            indices = [15, 16] if scan_type == "intrusion" else range(len(person_kpts))
+            for kpt_idx in indices:
+                if conf[kpt_idx] <= 0.5:
+                    continue
+                x, y = person_kpts[kpt_idx]
+                pt = Point(x, y)
+                inside = buffered.contains(pt) if scan_type == "danger_zone" else roi_poly.contains(pt)
+                if inside:
+                    cv2.circle(out, (int(x), int(y)), 10 if rule_id in hit_rule_ids else 8, marker_color, -1)
+                    lbl = (rule.get("name") or scan_type).upper().replace("_", " ")[:18]
+                    cv2.putText(
+                        out,
+                        lbl,
+                        (int(x) - 20, int(y) - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        marker_color,
+                        2,
+                    )
+
+
+def _monitor_eval_state(session: Dict[str, Any], frame_idx: int, pose_cache: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "frame_idx": frame_idx,
+        "pose_cache": pose_cache,
+        "pipelines": session.get("pipelines") or {},
+        "generators": session.get("generators") or {},
+        "frame_feeds": session.get("frame_feeds") or {},
+        "fall_sl": session.setdefault("fall_sl", {}),
+        "pipe_lock": session.get("pipe_lock"),
+        "monitor_session": session,
+        "session_lock": session.get("session_lock"),
+        "skip_gate_store": bool(session.get("preview_only")),
+    }
+
+
+def _evaluate_rules_parallel(
+    session: Dict[str, Any],
+    cam: Dict[str, Any],
+    frame: np.ndarray,
+    rules: List[Dict[str, Any]],
+    eval_state: Dict[str, Any],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]]:
+    hits: List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]] = []
+    workers = min(MONITOR_RULE_WORKERS, max(1, len(rules)))
+
+    def _eval_one(rule: Dict[str, Any]):
+        fr = frame.copy()
+        return scan.evaluate_rule_on_frame(cam, rule, fr, eval_state)
+
+    if workers <= 1 or len(rules) <= 1:
+        for rule in rules:
+            hit = _eval_one(rule)
+            if hit:
+                hits.append(hit)
+        return hits
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_eval_one, rule): rule for rule in rules}
+        for fut in as_completed(futures):
+            try:
+                hit = fut.result()
+                if hit:
+                    hits.append(hit)
+            except Exception as e:
+                log.warning("parallel monitor rule: %s", e)
+    return hits
 
 
 def temp_video_path(temp_id: str) -> Optional[str]:
@@ -400,6 +619,11 @@ def start_monitor(
             "pipelines": {},
             "generators": {},
             "frame_feeds": {},
+            "fall_sl": {},
+            "monitor_debounce": {},
+            "pipe_lock": threading.Lock(),
+            "event_lock": threading.Lock(),
+            "session_lock": threading.Lock(),
         }
 
         _sessions[session_id] = session
@@ -418,7 +642,33 @@ def start_monitor(
             "events": [],
         }
         result.update(_playback_status(session))
-        return result
+
+    # Warmup outside lock — prove the source yields at least one frame
+    try:
+        ret, frame = _read_frame(session)
+        if not ret or frame is None:
+            stop_monitor(session_id)
+            raise ValueError(
+                "Could not read from camera — check URL, credentials, and Docker network to DVR"
+            )
+        h, w = frame.shape[:2]
+        session["width"] = w
+        session["height"] = h
+        session["last_raw_frame"] = frame
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            session["last_jpeg"] = (
+                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            )
+    except ValueError:
+        raise
+    except Exception as e:
+        stop_monitor(session_id)
+        raise ValueError(
+            "Could not read from camera — check URL, credentials, and Docker network to DVR"
+        ) from e
+
+    return result
 
 
 def stop_monitor(session_id: str) -> None:
@@ -457,6 +707,7 @@ def get_monitor_status() -> Dict[str, Any]:
             "camera_id": session.get("camera_id") or "",
             "temp_id": session.get("temp_id"),
             "camera_name": (session.get("camera") or {}).get("name"),
+            "camera_type": (session.get("camera") or {}).get("type") or "rtsp",
             "rule_count": len(session.get("rules") or []),
             "scan_types": session.get("scan_types") or [],
             "last_event": session.get("last_event") or "",
@@ -539,8 +790,15 @@ def _ensure_capture(session: Dict[str, Any]):
     source = session["source"]
     cap = get_video_source(source)
     session["capture"] = cap
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+    if w <= 1 or h <= 1:
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            h, w = frame.shape[:2]
+            session["last_raw_frame"] = frame
+    w = w or 640
+    h = h or 480
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     session["width"] = w
     session["height"] = h
@@ -559,7 +817,7 @@ def _ensure_capture(session: Dict[str, Any]):
         pipeline_name = common.SCAN_TO_PIPELINE.get(scan_type)
         if not pipeline_name:
             continue
-        if scan_type in ("face_attendance", "vehicle", "gate_analytics"):
+        if scan_type in ("face_attendance", "vehicle", "gate_analytics", "fall_standing_lying"):
             session["pipelines"][scan_type] = registry.get_pipeline(pipeline_name)
         elif scan_type == "fall":
             first = next((r for r in session["rules"] if r.get("scan_type") == "fall"), None)
@@ -623,109 +881,53 @@ def _process_frame(session: Dict[str, Any], frame: np.ndarray) -> np.ndarray:
     cam: Dict[str, Any] = session["camera"]
     frame_idx = session["frame_idx"]
     out = frame.copy()
-    _draw_all_rois(out, rules)
 
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    needs_pose = any((r.get("scan_type") or "") in ("intrusion", "danger_zone") for r in rules)
+    pose_cache = scan.build_pose_cache(frame) if needs_pose else None
+    eval_state = _monitor_eval_state(session, frame_idx, pose_cache)
+
+    hits = _evaluate_rules_parallel(session, cam, frame, rules, eval_state)
+    hit_rule_ids = {rule.get("id") or "" for rule, _, _ in hits}
+
+    for rule, event, annotated in hits:
+        snap = annotated if annotated is not None else out
+        _handle_rule_hit(session, cam, rule, event, snap)
+        _draw_rule_geometry(out, rule, highlight=True)
+        if annotated is not None and annotated is not out:
+            _blend_overlay(out, annotated)
+
+    if pose_cache and pose_cache.get("results") is not None:
+        try:
+            plotted = pose_cache["results"].plot()
+            if plotted is not None and plotted.shape == out.shape:
+                cv2.addWeighted(plotted, 0.3, out, 0.7, 0, out)
+        except Exception:
+            pass
+        _draw_pose_cache_markers(out, rules, pose_cache, hit_rule_ids)
+
     for rule in rules:
-        st = rule.get("scan_type") or ""
-        by_type.setdefault(st, []).append(rule)
-
-    if "intrusion" in by_type:
-        out, hits = _apply_pose_rules(out, by_type["intrusion"], "intrusion")
-        for rule, event in hits:
-            _emit_if_allowed(session, cam, rule, event, out)
-
-    if "danger_zone" in by_type:
-        out, hits = _apply_pose_rules(out, by_type["danger_zone"], "danger_zone")
-        for rule, event in hits:
-            _emit_if_allowed(session, cam, rule, event, out)
-
-    if "face_attendance" in by_type:
-        pipe = session["pipelines"].get("face_attendance")
-        if pipe:
-            try:
-                annotated, meta = pipe.process_frame(out, frame_idx, np.array([]), common.pipeline_config("face_attendance"))
-                if annotated is not None:
-                    out = annotated
-                if isinstance(meta, dict) and (meta.get("person_id") or meta.get("type") == "face_recognised"):
-                    for rule in by_type["face_attendance"]:
-                        _emit_if_allowed(session, cam, rule, meta, out)
-            except Exception as e:
-                log.warning("face monitor frame: %s", e)
-
-    if "vehicle" in by_type:
-        pipe = session["pipelines"].get("vehicle")
-        if pipe:
-            try:
-                annotated, meta = pipe.process_frame(out, frame_idx, np.array([]), {})
-                if annotated is not None:
-                    out = annotated
-                event = _vehicle_event(meta or {})
-                if event:
-                    for rule in by_type["vehicle"]:
-                        _emit_if_allowed(session, cam, rule, event, out)
-            except Exception as e:
-                log.warning("vehicle monitor frame: %s", e)
-
-    if "gate_analytics" in by_type:
-        pipe = session["pipelines"].get("gate_analytics")
-        if pipe:
-            for rule in by_type["gate_analytics"]:
-                try:
-                    gate_config = rule.get("gate_config") or {}
-                    if not common.gate_config_valid(gate_config):
-                        continue
-                    rule_id = rule.get("id") or ""
-                    baseline = store.get_gate_baseline(rule_id)
-                    config: Dict[str, Any] = {
-                        "gate_config": gate_config,
-                        "rule_id": rule_id,
-                    }
-                    if baseline is not None:
-                        config["force_baseline"] = baseline
-                    annotated, meta = pipe.process_frame(out, frame_idx, None, config)
-                    if annotated is not None:
-                        out = annotated
-                    if isinstance(meta, dict) and meta.get("type") == "gate_tick":
-                        counters = meta.get("counters") or {}
-                        if any(counters.values()):
-                            store.increment_gate_counters(rule_id, counters)
-                        session["gate_live"] = meta.get("live") or {}
-                        if meta.get("band") == "near" and meta.get("alert_near"):
-                            _emit_if_allowed(
-                                session,
-                                cam,
-                                rule,
-                                {"type": "gate_near", "severity": rule.get("severity") or "medium"},
-                                out,
-                            )
-                except Exception as e:
-                    log.warning("gate monitor frame: %s", e)
-
-    if "fall" in by_type:
-        feed: FrameFeed = session["frame_feeds"].get("fall")
-        gen = session["generators"].get("fall")
-        if feed and gen:
-            try:
-                feed.frame = out
-                annotated, event = next(gen)
-                if annotated is not None:
-                    out = annotated
-                if common.is_event_dict(event):
-                    for rule in by_type["fall"]:
-                        _emit_if_allowed(session, cam, rule, event, out)
-            except StopIteration:
-                pass
-            except Exception as e:
-                log.warning("fall monitor frame: %s", e)
-
-    _draw_all_rois(out, rules)
+        rid = rule.get("id") or ""
+        if rid not in hit_rule_ids:
+            _draw_rule_geometry(out, rule, highlight=False)
     session["frame_idx"] = frame_idx + 1
     return out
 
 
 def session_exists(session_id: str) -> bool:
     return session_id in _sessions
+
+
+def capture_frame_jpeg(session_id: str) -> Optional[bytes]:
+    """Single processed JPEG for DVR poll preview (and MJPEG fallback)."""
+    session = _sessions.get(session_id)
+    if not session:
+        return None
+    ret, frame = _read_frame(session)
+    if not ret or frame is None:
+        return None
+    out = _process_frame(session, frame)
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    return buf.tobytes() if ok else None
 
 
 def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
@@ -736,6 +938,8 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
     os.makedirs(common.ALERTS_DIR, exist_ok=True)
 
     try:
+        if session.get("last_jpeg"):
+            yield session["last_jpeg"]
         while stop_ev and not stop_ev.is_set():
             pending_seek = session.get("seek_to_frame") is not None
             if session.get("paused") and not pending_seek and session.get("last_jpeg"):
@@ -761,5 +965,173 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
                 time.sleep(0.15)
             else:
                 time.sleep(0.066)
-    finally:
-        stop_monitor(session_id)
+    except GeneratorExit:
+        pass
+    except Exception as e:
+        log.warning("monitor stream %s ended: %s", session_id, e)
+
+
+def _grab_preview_frame(cam: Dict[str, Any]) -> Optional[np.ndarray]:
+    """One-shot frame for go-live preview (no persistent capture)."""
+    kind = cam.get("type") or "rtsp"
+    if kind == "dvr":
+        from core.snapshot_camera import fetch_snapshot_jpeg
+
+        snapshot_url = (cam.get("snapshot_url") or "").strip()
+        if not snapshot_url:
+            return None
+        return fetch_snapshot_jpeg(
+            snapshot_url,
+            user=(cam.get("http_user") or "").strip(),
+            password=(cam.get("http_password") or ""),
+        )
+
+    source = common.input_for_camera(cam)
+    if not source:
+        return None
+    if kind == "file":
+        cap = get_video_source(source)
+        if not cap.isOpened():
+            return None
+        ret, frame = cap.read()
+        cap.release()
+        return frame if ret else None
+
+    if hasattr(source, "read") and hasattr(source, "isOpened"):
+        if not source.isOpened():
+            return None
+        ret, frame = source.read()
+        if hasattr(source, "release"):
+            source.release()
+        return frame if ret else None
+
+    cam_src = ThreadedCamera(source)
+    if not cam_src.isOpened():
+        return None
+    cam_src.start()
+    frame = None
+    for _ in range(40):
+        ret, fr = cam_src.read()
+        if ret and fr is not None:
+            frame = fr
+            break
+        time.sleep(0.1)
+    cam_src.release()
+    return frame
+
+
+def _dispose_preview_session(cam_id: str) -> None:
+    session = _preview_cache.pop(cam_id, None)
+    if not session:
+        return
+    for gen in (session.get("generators") or {}).values():
+        try:
+            gen.close()
+        except Exception:
+            pass
+
+
+def clear_preview_cache() -> None:
+    with _preview_lock:
+        for cam_id in list(_preview_cache.keys()):
+            _dispose_preview_session(cam_id)
+
+
+def _init_preview_pipelines(session: Dict[str, Any], frame: np.ndarray) -> None:
+    h, w = frame.shape[:2]
+    session["width"] = w
+    session["height"] = h
+    fps = float(session.get("fps") or 30.0)
+    if session.get("pipelines_initialized"):
+        return
+    for scan_type in session.get("scan_types") or []:
+        pipeline_name = common.SCAN_TO_PIPELINE.get(scan_type)
+        if not pipeline_name:
+            continue
+        if scan_type in ("face_attendance", "vehicle", "gate_analytics", "fall_standing_lying"):
+            session["pipelines"][scan_type] = registry.get_pipeline(pipeline_name)
+        elif scan_type == "fall":
+            first = next((r for r in session["rules"] if r.get("scan_type") == "fall"), None)
+            roi = (first or {}).get("roi_normalized") or []
+            feed = FrameFeed(w, h, fps)
+            pipe = registry.get_pipeline(pipeline_name)
+            gen = pipe.run_on_video(
+                feed,
+                common.ALERTS_DIR,
+                roi,
+                common.pipeline_config("fall"),
+            )
+            session["frame_feeds"]["fall"] = feed
+            session["generators"]["fall"] = gen
+    session["pipelines_initialized"] = True
+
+
+def _ensure_preview_session(cam_id: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _preview_lock:
+        stale = [cid for cid, s in _preview_cache.items() if now - float(s.get("last_access") or 0) > PREVIEW_CACHE_TTL]
+        for cid in stale:
+            _dispose_preview_session(cid)
+
+        session = _preview_cache.get(cam_id)
+        if session:
+            session["last_access"] = now
+            return session
+
+        cam = store.get_camera(cam_id)
+        if not cam:
+            return None
+        rules = [
+            r
+            for r in store.list_rules()
+            if r.get("camera_id") == cam_id and r.get("enabled", True)
+        ]
+        scan_types = sorted({r.get("scan_type") for r in rules if r.get("scan_type")})
+        session = {
+            "camera_id": cam_id,
+            "camera": cam,
+            "rules": rules,
+            "scan_types": scan_types,
+            "frame_idx": 0,
+            "pipelines": {},
+            "generators": {},
+            "frame_feeds": {},
+            "preview_only": True,
+            "last_access": now,
+            "width": 640,
+            "height": 480,
+            "fps": 30.0,
+            "pipelines_initialized": False,
+        }
+        _preview_cache[cam_id] = session
+        return session
+
+
+def render_preview_frame(cam_id: str, apply_rules: bool) -> Optional[bytes]:
+    """JPEG for go-live hero preview; optional rule overlays without alerts."""
+    cam = store.get_camera(cam_id)
+    if not cam:
+        return None
+    frame = _grab_preview_frame(cam)
+    if frame is None:
+        return None
+    if not apply_rules:
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        return buf.tobytes() if ok else None
+
+    session = _ensure_preview_session(cam_id)
+    if not session:
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        return buf.tobytes() if ok else None
+
+    session["last_access"] = time.time()
+    _init_preview_pipelines(session, frame)
+    session["last_raw_frame"] = frame
+    if not session.get("rules"):
+        out = frame.copy()
+        ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        return buf.tobytes() if ok else None
+
+    out = _process_frame(session, frame)
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    return buf.tobytes() if ok else None

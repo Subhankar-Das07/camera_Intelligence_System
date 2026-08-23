@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core import site_admin_common as common
@@ -20,6 +20,7 @@ from core import site_admin_runtime
 from core import site_admin_store as store
 from core import whatsapp_adapter
 from core.registry import registry
+from core.snapshot_camera import fetch_snapshot_jpeg
 from core.video_source import ThreadedCamera, get_video_source
 
 router = APIRouter(prefix="/api/site-admin", tags=["site-admin"])
@@ -48,6 +49,9 @@ class CameraIn(BaseModel):
     name: str = "Camera"
     type: str = "rtsp"
     rtsp_url: str = ""
+    snapshot_url: str = ""
+    http_user: str = ""
+    http_password: str = ""
     filename: str = ""
     video_id: str = ""
     preview_url: str = ""
@@ -149,12 +153,37 @@ class KnownVehiclePatch(BaseModel):
 VEHICLE_STATUS_OK = ("candidate", "approved", "ignored", "risk", "danger")
 
 
+def _save_preview_frame(frame) -> Dict[str, Any]:
+    h, w = frame.shape[:2]
+    vid = str(uuid.uuid4())
+    preview_fn = f"{vid}.jpg"
+    cv2.imwrite(os.path.join(PREVIEW_DIR, preview_fn), frame)
+    return {
+        "ok": True,
+        "width": w,
+        "height": h,
+        "preview_url": f"/storage/previews/{preview_fn}",
+        "health": "online",
+    }
+
+
 def _grab_camera_frame(cam: Dict[str, Any]):
-    """Read one frame from a saved camera (file or RTSP)."""
+    """Read one frame from a saved camera (file, RTSP, or DVR snapshot)."""
+    kind = cam.get("type") or "rtsp"
+    if kind == "dvr":
+        snapshot_url = (cam.get("snapshot_url") or "").strip()
+        if not snapshot_url:
+            return None
+        frame = fetch_snapshot_jpeg(
+            snapshot_url,
+            user=(cam.get("http_user") or "").strip(),
+            password=(cam.get("http_password") or ""),
+        )
+        return frame
+
     source = common.input_for_camera(cam)
     if not source:
         return None
-    kind = cam.get("type") or "rtsp"
     if kind == "file":
         cap = get_video_source(source)
         if not cap.isOpened():
@@ -162,6 +191,15 @@ def _grab_camera_frame(cam: Dict[str, Any]):
         ret, frame = cap.read()
         cap.release()
         return frame if ret else None
+
+    if hasattr(source, "read") and hasattr(source, "isOpened"):
+        if not source.isOpened():
+            return None
+        ret, frame = source.read()
+        if hasattr(source, "release"):
+            source.release()
+        return frame if ret else None
+
     cam_src = ThreadedCamera(source)
     if not cam_src.isOpened():
         return None
@@ -202,6 +240,7 @@ def status():
         "scan_types": common.available_scan_types(),
         "scan_catalog": common.SCAN_CATALOG,
         "monitor": site_admin_monitor.get_monitor_status(),
+        "runtime": site_admin_runtime.get_runtime_status(),
     }
 
 
@@ -220,6 +259,8 @@ def put_site(body: SitePatch, x_cis_role: Optional[str] = Header(default="admin"
     saved = store.save_site(current)
     if saved.get("go_live"):
         site_admin_runtime.start_runtime()
+    else:
+        site_admin_monitor.clear_preview_cache()
     return saved
 
 
@@ -266,6 +307,44 @@ def remove_camera(cam_id: str, x_cis_role: Optional[str] = Header(default="admin
     return {"ok": True}
 
 
+@router.get("/cameras/{cam_id}/snapshot")
+def camera_snapshot(cam_id: str):
+    """Lightweight JPEG for go-live preview — no rule pipelines."""
+    if not store.get_site().get("go_live"):
+        raise HTTPException(status_code=409, detail="Scanning is not active")
+    cam = store.get_camera(cam_id)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    frame = _grab_camera_frame(cam)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Could not read a frame from this camera")
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode frame")
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+
+@router.get("/cameras/{cam_id}/preview-frame")
+def camera_preview_frame(cam_id: str, apply_rules: bool = False):
+    """Go-live hero preview — raw or with rule overlays (no alerts)."""
+    if not store.get_site().get("go_live"):
+        raise HTTPException(status_code=409, detail="Scanning is not active")
+    cam = store.get_camera(cam_id)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if apply_rules:
+        data = site_admin_monitor.render_preview_frame(cam_id, True)
+    else:
+        frame = _grab_camera_frame(cam)
+        if frame is None:
+            raise HTTPException(status_code=400, detail="Could not read a frame from this camera")
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        data = buf.tobytes() if ok else None
+    if not data:
+        raise HTTPException(status_code=400, detail="Could not render preview frame")
+    return Response(content=data, media_type="image/jpeg")
+
+
 @router.post("/cameras/{cam_id}/suggest-roi")
 def suggest_roi(
     cam_id: str,
@@ -308,9 +387,23 @@ def suggest_roi(
     }
 
 
-@router.post("/cameras/test-rtsp")
-def test_rtsp(body: CameraIn, x_cis_role: Optional[str] = Header(default="admin")):
+@router.post("/cameras/test-connection")
+def test_connection(body: CameraIn, x_cis_role: Optional[str] = Header(default="admin")):
     _require_admin(x_cis_role)
+    kind = (body.type or "rtsp").strip().lower()
+    if kind == "dvr":
+        snapshot_url = (body.snapshot_url or "").strip()
+        if not snapshot_url:
+            raise HTTPException(status_code=400, detail="HTTP snapshot URL required")
+        frame = fetch_snapshot_jpeg(
+            snapshot_url,
+            user=(body.http_user or "").strip(),
+            password=body.http_password or "",
+        )
+        if frame is None:
+            raise HTTPException(status_code=400, detail="Could not fetch snapshot — check URL and credentials")
+        return _save_preview_frame(frame)
+
     url = (body.rtsp_url or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="RTSP URL required")
@@ -328,17 +421,15 @@ def test_rtsp(body: CameraIn, x_cis_role: Optional[str] = Header(default="admin"
     cam.release()
     if frame is None:
         raise HTTPException(status_code=400, detail="Opened but no frames received")
-    h, w = frame.shape[:2]
-    vid = str(uuid.uuid4())
-    preview_fn = f"{vid}.jpg"
-    cv2.imwrite(os.path.join(PREVIEW_DIR, preview_fn), frame)
-    return {
-        "ok": True,
-        "width": w,
-        "height": h,
-        "preview_url": f"/storage/previews/{preview_fn}",
-        "health": "online",
-    }
+    return _save_preview_frame(frame)
+
+
+@router.post("/cameras/test-rtsp")
+def test_rtsp(body: CameraIn, x_cis_role: Optional[str] = Header(default="admin")):
+    """Backward-compatible alias for camera connection test."""
+    if not (body.type or "").strip():
+        body = body.model_copy(update={"type": "rtsp"})
+    return test_connection(body, x_cis_role)
 
 
 @router.post("/cameras/upload")
@@ -398,6 +489,11 @@ def create_rule(body: RuleIn, x_cis_role: Optional[str] = Header(default="admin"
         raise HTTPException(status_code=400, detail="Unknown camera")
     if body.scan_type == "gate_analytics" and not common.gate_config_valid(body.gate_config):
         raise HTTPException(status_code=400, detail="Gate rule needs count line, gate ROI, and near/medium/far zones")
+    if body.enabled and common.camera_rule_limit_reached(body.camera_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {common.MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.",
+        )
     return store.save_rule(body.model_dump())
 
 
@@ -414,6 +510,11 @@ def update_rule(rule_id: str, body: RuleIn, x_cis_role: Optional[str] = Header(d
         )
     if body.scan_type == "gate_analytics" and not common.gate_config_valid(body.gate_config):
         raise HTTPException(status_code=400, detail="Gate rule needs count line, gate ROI, and near/medium/far zones")
+    if body.enabled and common.camera_rule_limit_reached(body.camera_id, exclude_rule_id=rule_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max {common.MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.",
+        )
     data = body.model_dump()
     data["id"] = rule_id
     data["created_at"] = existing.get("created_at")
@@ -668,6 +769,14 @@ def patch_known_vehicle(
     return item
 
 
+@router.delete("/known-vehicles/{vehicle_id}")
+def remove_known_vehicle(vehicle_id: str, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    if not store.delete_known_vehicle(vehicle_id):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return {"ok": True}
+
+
 @router.post("/whatsapp/test")
 def whatsapp_test(body: WhatsAppTestIn, x_cis_role: Optional[str] = Header(default="admin")):
     _require_admin(x_cis_role)
@@ -717,6 +826,17 @@ def monitor_stream(session_id: str):
         site_admin_monitor.mjpeg_generator(session_id),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@router.get("/monitor/frame/{session_id}")
+def monitor_frame(session_id: str):
+    """Single JPEG frame — used for DVR HTTP snapshot poll preview."""
+    if not site_admin_monitor.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Monitor session not found")
+    data = site_admin_monitor.capture_frame_jpeg(session_id)
+    if not data:
+        raise HTTPException(status_code=400, detail="No frame available")
+    return Response(content=data, media_type="image/jpeg")
 
 
 @router.post("/monitor/stop/{session_id}")

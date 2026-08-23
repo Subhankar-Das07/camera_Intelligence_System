@@ -15,10 +15,14 @@ VEHICLES_DIR = os.path.join("storage", "vehicles")
 
 VEHICLE_STATUSES = ("candidate", "approved", "ignored", "risk", "danger")
 
+MAX_RULES_PER_CAMERA = 3
+MONITOR_DEBOUNCE_SEC = float(os.environ.get("SITE_ADMIN_MONITOR_DEBOUNCE_SEC", "3"))
+
 SCAN_TO_PIPELINE = {
     "intrusion": "intrusion_detection",
     "danger_zone": "danger_zone",
     "fall": "fall_detection",
+    "fall_standing_lying": "fall_standing_lying",
     "face_attendance": "face_recognition",
     "vehicle": "vehicle_recognition",
     "gate_analytics": "gate_analytics",
@@ -47,8 +51,17 @@ SCAN_CATALOG: List[Dict[str, Any]] = [
     {
         "id": "fall",
         "label": "Fall detection",
-        "typical_need": "Detect a person falling",
-        "fit": "High — elders, staff safety",
+        "typical_need": "Detect a person falling (live video / RTSP)",
+        "fit": "High — RTSP, NVR, Live Monitor",
+        "category": "People & safety",
+        "status": "available",
+        "kind": "area",
+    },
+    {
+        "id": "fall_standing_lying",
+        "label": "Fall detection — standing & lying",
+        "typical_need": "Person was standing, then found lying (snapshot cameras)",
+        "fit": "High — DVR / HTTP picture polling",
         "category": "People & safety",
         "status": "available",
         "kind": "area",
@@ -192,6 +205,20 @@ def available_scan_types() -> List[str]:
     return [e["id"] for e in SCAN_CATALOG if e.get("status") == "available" and e["id"] in SCAN_TO_PIPELINE]
 
 
+def enabled_rules_for_camera(camera_id: str, exclude_rule_id: str = "") -> List[Dict[str, Any]]:
+    return [
+        r
+        for r in store.list_rules()
+        if r.get("camera_id") == camera_id
+        and r.get("enabled", True)
+        and (r.get("id") or "") != exclude_rule_id
+    ]
+
+
+def camera_rule_limit_reached(camera_id: str, exclude_rule_id: str = "") -> bool:
+    return len(enabled_rules_for_camera(camera_id, exclude_rule_id)) >= MAX_RULES_PER_CAMERA
+
+
 def input_for_camera(cam: Dict[str, Any]) -> Optional[Any]:
     kind = cam.get("type") or "rtsp"
     if kind == "file":
@@ -200,6 +227,17 @@ def input_for_camera(cam: Dict[str, Any]) -> Optional[Any]:
         if os.path.isfile(path):
             return path
         return None
+    if kind == "dvr":
+        from core.snapshot_camera import SnapshotCamera
+
+        snapshot_url = (cam.get("snapshot_url") or "").strip()
+        if not snapshot_url:
+            return None
+        return SnapshotCamera(
+            snapshot_url,
+            user=(cam.get("http_user") or "").strip(),
+            password=(cam.get("http_password") or ""),
+        )
     url = (cam.get("rtsp_url") or "").strip()
     return url or None
 
@@ -237,6 +275,17 @@ def pipeline_config(scan_type: str) -> Dict[str, Any]:
         return {"mode": "attendance"}
     if scan_type == "danger_zone":
         return {"machine_active": True}
+    if scan_type == "fall_standing_lying":
+        return {
+            "person_conf_threshold": 0.70,
+            "keypoint_conf_threshold": 0.4,
+            "sit_angle_deg": 30.0,
+            "down_torso_angle_deg": 40.0,
+            "down_hip_ankle_ratio": 0.45,
+            "upright_memory_sec": 45.0,
+            "match_dist_ratio": 0.25,
+            "confirm_snapshots": 2,
+        }
     return {}
 
 
@@ -441,14 +490,16 @@ def handle_vehicle_sighting(
 
 def mark_camera_monitored(camera_id: str) -> None:
     _monitored_camera_ids.add(camera_id)
+    store.mark_camera_monitored_redis(camera_id)
 
 
 def unmark_camera_monitored(camera_id: str) -> None:
     _monitored_camera_ids.discard(camera_id)
+    store.unmark_camera_monitored_redis(camera_id)
 
 
 def is_camera_monitored(camera_id: str) -> bool:
-    return camera_id in _monitored_camera_ids
+    return camera_id in _monitored_camera_ids or store.is_camera_monitored_redis(camera_id)
 
 
 def monitored_camera_ids() -> set[str]:

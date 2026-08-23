@@ -16,6 +16,8 @@ ALERT_LIST = "alert:inbox"
 MUTE_PREFIX = "alert:mute:"
 COOLDOWN_PREFIX = "alert:cd:"
 LIVE_KEY = "site:live"
+MONITOR_CAM_SET = "runtime:monitored_cams"
+RUNTIME_WORKER_PREFIX = "runtime:worker:"
 KNOWN_FACES_LIST = "site:known_faces"
 KNOWN_VEHICLES_LIST = "site:known_vehicles"
 
@@ -528,3 +530,65 @@ def patch_known_vehicle(item_id: str, patch: Dict[str, Any]) -> Optional[Dict[st
     if "plate" in patch and patch["plate"] is not None:
         patch = {**patch, "plate": normalize_plate(patch["plate"]) or patch["plate"]}
     return _patch_identity(KNOWN_VEHICLES_LIST, item_id, patch)
+
+
+def delete_known_vehicle(item_id: str) -> bool:
+    r = get_redis()
+    items = r.lrange(KNOWN_VEHICLES_LIST, 0, 499)
+    for raw in items:
+        item = _loads(raw)
+        if item and item.get("id") == item_id:
+            r.lrem(KNOWN_VEHICLES_LIST, 1, raw)
+            return True
+    return False
+
+
+def mark_camera_monitored_redis(camera_id: str) -> None:
+    if camera_id:
+        get_redis().sadd(MONITOR_CAM_SET, camera_id)
+
+
+def unmark_camera_monitored_redis(camera_id: str) -> None:
+    if camera_id:
+        get_redis().srem(MONITOR_CAM_SET, camera_id)
+
+
+def is_camera_monitored_redis(camera_id: str) -> bool:
+    if not camera_id:
+        return False
+    return bool(get_redis().sismember(MONITOR_CAM_SET, camera_id))
+
+
+def clear_monitored_cameras_redis() -> None:
+    get_redis().delete(MONITOR_CAM_SET)
+
+
+def set_runtime_worker_heartbeat(camera_id: str, payload: Dict[str, Any], ttl_sec: int = 10) -> None:
+    if not camera_id:
+        return
+    data = dict(payload)
+    data["camera_id"] = camera_id
+    data["updated_at"] = time.time()
+    get_redis().setex(f"{RUNTIME_WORKER_PREFIX}{camera_id}", ttl_sec, _dumps(data))
+
+
+def list_runtime_worker_heartbeats(max_age_sec: float = 5.0) -> List[Dict[str, Any]]:
+    r = get_redis()
+    now = time.time()
+    out: List[Dict[str, Any]] = []
+    for key in r.scan_iter(match=f"{RUNTIME_WORKER_PREFIX}*"):
+        raw = r.get(key)
+        item = _loads(raw)
+        if not item:
+            continue
+        updated = float(item.get("updated_at") or item.get("last_tick_at") or 0)
+        if now - updated <= max_age_sec:
+            out.append(item)
+    out.sort(key=lambda x: x.get("camera_id") or "")
+    return out
+
+
+def clear_runtime_worker_heartbeats() -> None:
+    r = get_redis()
+    for key in r.scan_iter(match=f"{RUNTIME_WORKER_PREFIX}*"):
+        r.delete(key)

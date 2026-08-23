@@ -47,8 +47,12 @@
                 <button type="button" data-view="settings">Settings</button>
             </nav>
             <div class="sa-live" id="live-panel">
-                <span class="sa-dot" id="live-dot"></span>
-                <span id="live-label">Idle</span>
+                <div class="sa-live-head">
+                    <span class="sa-dot" id="live-dot"></span>
+                    <span id="live-label">Idle</span>
+                </div>
+                <button type="button" class="btn secondary sa-live-preview-btn" id="live-preview-toggle" hidden>Show preview</button>
+                <div id="live-preview-strip" class="sa-live-preview-strip" hidden></div>
             </div>
         </aside>
 
