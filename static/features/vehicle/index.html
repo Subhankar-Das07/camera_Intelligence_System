@@ -36,12 +36,19 @@
                 <div class="divider-or">— OR —</div>
                 <input type="text" id="vr-rtsp-url" class="text-input" placeholder="rtsp://... or 0 for webcam">
                 <button class="btn secondary" id="vr-connect-rtsp-btn" type="button" style="margin-top:8px;width:100%;">Connect Stream</button>
-                <button class="btn danger hidden" id="vr-disconnect-btn" type="button" style="margin-top:4px;width:100%;">Disconnect</button>
+                <button class="btn danger hidden" id="vr-disconnect-rtsp-btn" type="button" style="margin-top:4px;width:100%;">Disconnect</button>
+            </section>
+
+            <section class="control-group" id="vr-roi-controls">
+                <h3>2. ROI</h3>
+                <p>Click on the preview to draw a virtual gate (3+ points).</p>
+                <button class="btn secondary" id="vr-clear-roi-btn" type="button">Clear ROI</button>
             </section>
 
             <section class="control-actions">
                 <button class="btn primary" id="vr-run-btn" type="button" disabled>Start Recognition</button>
                 <button class="btn secondary hidden" id="vr-stop-btn" type="button">Stop</button>
+                <button class="btn secondary" id="vr-admin-btn" type="button" style="margin-top:8px;width:100%;">Admin Portal</button>
                 <p id="vr-status-msg" class="status-msg" style="margin-top:0.75rem;max-width:100%;">No source selected</p>
             </section>
         </aside>
@@ -52,7 +59,7 @@
                 <ul>
                     <li>Connect a file or RTSP/webcam source, then start recognition.</li>
                     <li>Confirmed plates appear in the log; visit counts persist in Redis (<code>vr:*</code> keys).</li>
-                    <li>No ROI polygon is required for this pipeline.</li>
+                    <li>Draw an ROI polygon to strictly check if vehicles have entered the zone.</li>
                     <li>Developer folder: <code>static/features/vehicle/</code></li>
                 </ul>
             </div>
@@ -63,7 +70,10 @@
 
             <div class="content-wrapper" id="vr-content-wrapper">
                 <div id="vr-placeholder" class="placeholder-msg">Upload a video or connect a stream to begin</div>
-                <img id="vr-stream-img" class="hidden" style="max-width:100%;max-height:100%;object-fit:contain;" alt="Vehicle stream">
+                <div id="vr-video-container" class="hidden" style="position:relative;display:flex;max-width:100%;max-height:100%;">
+                    <img id="vr-stream-img" style="max-width:100%;max-height:100%;object-fit:contain;display:block;" alt="Vehicle stream">
+                    <canvas id="vr-roi-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair;"></canvas>
+                </div>
             </div>
 
             <div class="reports-section">
@@ -75,8 +85,35 @@
         </main>
     </div>
 
+    <div id="admin-modal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close-btn" id="admin-close-btn">&times;</span>
+            <h2>Admin Portal - Society Vehicles</h2>
+            <div class="admin-tabs">
+                <button class="admin-tab active" id="tab-pending">Pending Approvals</button>
+                <button class="admin-tab" id="tab-known">My Vehicles</button>
+            </div>
+            <div class="admin-table-container">
+                <table id="admin-vehicles-table">
+                    <thead>
+                        <tr>
+                            <th>Image</th>
+                            <th>Plate</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Visits</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="admin-table-body">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <script src="/shell/shell.js"></script>
     <script src="/shared/source-controls.js"></script>
-    <script src="vehicle.js"></script>
+    <script src="vehicle.js?v=3"></script>
 </body>
 </html>

@@ -107,6 +107,10 @@ smart_vision_assistant/reports/
 storage/alerts/
 storage/uploads/
 storage/outputs/
+storage/plate_crops/
+storage/previews/
+storage/snapshots/
+storage/vehicle_images/
 *.pt
 
 # ── Face Recognition (Ayush) ─────────────────────────

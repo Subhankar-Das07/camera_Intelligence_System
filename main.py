@@ -70,6 +70,7 @@ for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
+app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
 app.include_router(mobile_router)
 app.include_router(site_admin_router)
 
@@ -108,6 +109,10 @@ def _vr_plates_key(session_id: str) -> str:
     return f"vr:detplates:{session_id}"
 
 
+def _vr_alerts_key(session_id: str) -> str:
+    return f"vr:alerts:{session_id}"
+
+
 def _append_session_alert(session_id: str, alert_event: Dict[str, Any]) -> None:
     get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event).encode())
 
@@ -129,10 +134,11 @@ def _clear_session_alerts(session_id: str) -> None:
 
 def _reset_vr_detections(session_id: str) -> None:
     r = get_redis()
-    r.delete(_vr_det_key(session_id), _vr_plates_key(session_id))
+    r.delete(_vr_det_key(session_id), _vr_plates_key(session_id), _vr_alerts_key(session_id))
+    r.delete(f"vr:alerted_plates:{session_id}")
 
 
-def _vr_add_detection(session_id: str, plate: str, total_visits: int) -> bool:
+def _vr_add_detection(session_id: str, plate: str, total_visits: int, status: str = "Unknown", vehicle_type: str = "Car", image_path: str = None) -> bool:
     """Return True if this plate is newly recorded for the session."""
     r = get_redis()
     added = r.sadd(_vr_plates_key(session_id), plate)
@@ -140,7 +146,13 @@ def _vr_add_detection(session_id: str, plate: str, total_visits: int) -> bool:
         return False
     r.rpush(
         _vr_det_key(session_id),
-        json.dumps({"plate": plate, "total_visits": total_visits}).encode(),
+        json.dumps({
+            "plate": plate,
+            "total_visits": total_visits,
+            "status": status,
+            "vehicle_type": vehicle_type,
+            "image_path": image_path
+        }).encode(),
     )
     return True
 
@@ -261,11 +273,12 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
 
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.mp4', '.avi', '.mov')):
+    if not file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         raise HTTPException(status_code=400, detail="Unsupported file format.")
     video_id  = str(uuid.uuid4())
-    ext       = os.path.splitext(file.filename)[1]
+    ext       = os.path.splitext(file.filename)[1].lower()
     filename  = f"{video_id}{ext}"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     with open(file_path, "wb") as f:
@@ -274,8 +287,10 @@ async def upload_video(file: UploadFile = File(...)):
     cap = cv2.VideoCapture(file_path)
     ret, frame = cap.read()
     if not ret:
-        cap.release(); os.remove(file_path)
-        raise HTTPException(status_code=400, detail="Could not read video file.")
+        cap.release()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail="Could not read video file due to codec failure or corrupted stream.")
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
@@ -677,7 +692,28 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
             for det in metadata["detections"]:
                 plate = det.get("plate")
                 if plate:
-                    _vr_add_detection(session_id, plate, det.get("total_visits", 1))
+
+                    # Fetch latest status and vehicle_type from DB for this plate
+                    db_status       = "Unknown"
+                    db_vehicle_type = det.get("vehicle_type", "Car")
+                    image_path      = det.get("image_path")
+                    try:
+                        vehicle_row = pipeline.db.get_vehicle_stats(plate)
+                        if vehicle_row:
+                            db_status       = vehicle_row.get("status", "Unknown")
+                            db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
+                    except Exception:
+                        pass
+                    _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
+
+        if metadata and metadata.get("alerts"):
+            r = get_redis()
+            for alert in metadata["alerts"]:
+                # Use Redis Sets to avoid duplicate alerts for the same plate
+                added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
+                if added:
+                    r.rpush(_vr_alerts_key(session_id), json.dumps(alert).encode())
+
         if frame is not None:
             ok, buf = cv2.imencode('.jpg', frame)
             if ok:
@@ -687,9 +723,50 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
 
 @app.get("/api/vr_detections/{session_id}")
 def get_vr_detections(session_id: str):
-    """Return the list of confirmed unique plates detected in a VR session."""
-    return {"detections": _get_vr_detections(session_id)}
+    """Return the list of confirmed unique plates and active loitering alerts."""
+    r = get_redis()
 
+    # Get detections
+    det_items = r.lrange(_vr_det_key(session_id), 0, -1)
+    detections = [json.loads(redis_str(x)) for x in det_items if x]
+
+    # Get VR loitering alerts
+    alert_items = r.lrange(_vr_alerts_key(session_id), 0, -1)
+    alerts = [json.loads(redis_str(x)) for x in alert_items if x]
+
+    return {"detections": detections, "alerts": alerts}
+
+@app.get("/api/vehicles")
+def get_all_vehicles():
+    """Return all vehicles from the database for the Admin Portal."""
+    try:
+        pipeline = registry.get_pipeline("vehicle_recognition")
+        vehicles = pipeline.db.get_all_vehicles()
+        return {"vehicles": vehicles}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/register_vehicle/{plate}")
+def register_vehicle(plate: str):
+    """Mark a vehicle plate as Known in the database."""
+    try:
+        pipeline = registry.get_pipeline("vehicle_recognition")
+        pipeline.db.register_vehicle(plate)
+        return {"status": "ok", "plate": plate}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/unregister_vehicle/{plate}")
+def unregister_vehicle(plate: str):
+    """Revert a vehicle plate back to Unknown in the database."""
+    try:
+        pipeline = registry.get_pipeline("vehicle_recognition")
+        pipeline.db.unregister_vehicle(plate)
+        return {"status": "ok", "plate": plate}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ── Guardian endpoints ────────────────────────────────────────────────────────
 # These are fully decoupled from the existing pipeline endpoints.
