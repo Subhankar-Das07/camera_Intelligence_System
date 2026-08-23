@@ -1,6 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
   const ZONE_PIPELINES = new Set([
     "intrusion_detection",
+    "new_intrusion",
     "danger_zone",
     "fall_detection",
     "room_guardian",
@@ -44,6 +45,7 @@ document.addEventListener("DOMContentLoaded", () => {
           opt.value = p;
           let displayName = p;
           if (p === "intrusion_detection") displayName = "Intrusion Detection";
+          if (p === "new_intrusion") displayName = "Intrusion Detection (OpenVINO)";
           if (p === "danger_zone") displayName = "Danger Zone";
           if (p === "fall_detection") displayName = "Fall Detection";
           if (p === "room_guardian") displayName = "Object Tracking";
@@ -220,7 +222,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function checkRunReady() {
     const pipeline = pipelineSelect.value;
-    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection";
+    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection" || pipeline === "new_intrusion";
     const hasRoi = roiPoints.length > 2;
     runBtn.disabled = !((needsRoi ? hasRoi : true) && pipeline && currentVideoData);
   }
@@ -228,7 +230,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function updatePipelineUi() {
     const pipeline = pipelineSelect.value;
     const isDangerZone = pipeline === "danger_zone";
-    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection";
+    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection" || pipeline === "new_intrusion";
     const isGuardian = pipeline === "room_guardian";
     
     const machineSettings = document.getElementById("machine-settings");
