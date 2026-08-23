@@ -58,6 +58,16 @@
         <div class="fr-layout">
             <aside class="fr-sidebar">
                 <section class="fr-panel">
+                    <h2 class="fr-panel-title">Operation Mode</h2>
+                    <div class="fr-mode-selector">
+                        <select id="mode-selector" class="fr-input" style="width: 100%; margin-top: 8px;">
+                            <option value="visitor">Visitor Identification</option>
+                            <option value="attendance">Attendance Tracker</option>
+                        </select>
+                    </div>
+                </section>
+
+                <section class="fr-panel">
                     <h2 class="fr-panel-title">Live Source</h2>
                     <div class="fr-source-tabs">
                         <button class="fr-tab active" id="tab-webcam" data-tab="webcam" type="button">Webcam</button>
@@ -87,20 +97,31 @@
 
                 <section class="fr-panel">
                     <h2 class="fr-panel-title">Register Person</h2>
-                    <p class="fr-hint">Upload a clear front-facing photo, or snapshot from the live feed after start.</p>
-                    <input type="text" id="reg-name" class="fr-input" placeholder="Name (optional)">
-                    <div class="fr-reg-methods">
-                        <label class="fr-upload-drop" id="reg-drop-zone">
-                            <input type="file" id="reg-photo" accept="image/*" hidden>
-                            <span>Drop photo or click</span>
-                        </label>
-                        <div class="fr-reg-preview hidden" id="reg-preview">
-                            <img id="reg-preview-img" alt="Preview">
+                    
+                    <div id="fr-visitor-controls">
+                        <p class="fr-hint">Upload a clear front-facing photo, or snapshot from the live feed after start.</p>
+                        <input type="text" id="reg-name" class="fr-input" placeholder="Name (optional)">
+                        <div class="fr-reg-methods">
+                            <label class="fr-upload-drop" id="reg-drop-zone">
+                                <input type="file" id="reg-photo" accept="image/*" hidden>
+                                <span>Drop photo or click</span>
+                            </label>
+                            <div class="fr-reg-preview hidden" id="reg-preview">
+                                <img id="reg-preview-img" alt="Preview">
+                            </div>
+                            <div class="fr-divider-or">— OR —</div>
+                            <button class="fr-btn fr-btn-secondary" id="reg-snapshot-btn" type="button" disabled>Snapshot from Live Feed</button>
                         </div>
-                        <div class="fr-divider-or">— OR —</div>
-                        <button class="fr-btn fr-btn-secondary" id="reg-snapshot-btn" type="button" disabled>Snapshot from Live Feed</button>
+                        <button class="fr-btn fr-btn-register" id="reg-submit-btn" type="button" disabled>Register Identity</button>
                     </div>
-                    <button class="fr-btn fr-btn-register" id="reg-submit-btn" type="button" disabled>Register Identity</button>
+
+                    <div id="fr-attendance-controls" class="hidden">
+                        <p class="fr-hint">Register a student for attendance tracking using a snapshot from the live feed.</p>
+                        <input type="text" id="att-reg-name" class="fr-input" placeholder="Student Name / Roll No.">
+                        <button class="fr-btn fr-btn-secondary" id="att-reg-snapshot-btn" type="button" disabled style="margin-top:10px;">Snapshot from Live Feed</button>
+                        <button class="fr-btn fr-btn-register" id="att-reg-submit-btn" type="button" disabled>Register Student</button>
+                    </div>
+                    
                     <div class="fr-reg-feedback hidden" id="reg-feedback"></div>
                 </section>
             </aside>
@@ -130,11 +151,11 @@
 
             <aside class="fr-identity-panel">
                 <div class="fr-panel-header">
-                    <h2 class="fr-panel-title">Identity Manager</h2>
+                    <h2 class="fr-panel-title" id="right-panel-title">Identity Manager</h2>
                     <button class="fr-btn fr-btn-icon" id="refresh-identities-btn" type="button" title="Refresh">↻</button>
                 </div>
                 <div class="fr-identity-filter">
-                    <button class="fr-filter-tab active" data-filter="known" type="button">Known</button>
+                    <button class="fr-filter-tab active" id="filter-known-btn" data-filter="known" type="button">Known</button>
                     <button class="fr-filter-tab" data-filter="blank" type="button">&nbsp;</button>
                 </div>
                 <div class="fr-identity-list" id="identity-list">

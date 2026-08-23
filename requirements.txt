@@ -2,6 +2,7 @@ fastapi
 uvicorn
 opencv-python
 ultralytics
+lap>=0.5.12
 shapely
 python-multipart
 numpy

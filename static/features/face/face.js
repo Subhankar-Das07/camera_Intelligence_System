@@ -56,12 +56,23 @@ document.addEventListener("DOMContentLoaded", () => {
     const identityList   = document.getElementById("identity-list");
     const refreshBtn     = document.getElementById("refresh-identities-btn");
     const filterTabs     = document.querySelectorAll(".fr-filter-tab");
+    const filterKnownBtn = document.getElementById("filter-known-btn");
 
     const renameModal    = document.getElementById("rename-modal");
     const renameInput    = document.getElementById("rename-input");
     const renameConfirm  = document.getElementById("rename-confirm-btn");
     const renameCancel   = document.getElementById("rename-cancel-btn");
     const renameModalPid = document.getElementById("rename-modal-pid");
+
+    const modeSelector       = document.getElementById("mode-selector");
+    const visitorControls    = document.getElementById("fr-visitor-controls");
+    const attendanceControls = document.getElementById("fr-attendance-controls");
+    const rightPanelTitle    = document.getElementById("right-panel-title");
+
+    const attRegName        = document.getElementById("att-reg-name");
+    const attRegSnapshotBtn = document.getElementById("att-reg-snapshot-btn");
+    const attRegSubmitBtn   = document.getElementById("att-reg-submit-btn");
+    const attRegFeedback    = document.getElementById("att-reg-feedback");
 
     // ── State ──────────────────────────────────────────────────────────────────
     let activeTab        = "webcam";
@@ -75,6 +86,33 @@ document.addEventListener("DOMContentLoaded", () => {
     let regPhotoFile     = null;
     let identitiesCache  = [];
     let isWebcamStream   = false;  // track if webcam opened (needs explicit release on stop)
+    let attendanceStatus = { active: false, present_ids: [] };
+
+    function getMode() {
+        return modeSelector ? modeSelector.value : "visitor";
+    }
+
+    modeSelector.addEventListener("change", () => {
+        const mode = getMode();
+        if (mode === "attendance") {
+            visitorControls.classList.add("hidden");
+            attendanceControls.classList.remove("hidden");
+            rightPanelTitle.textContent = "🗂️ Attendance List";
+            frStartBtn.textContent = "▶ Start Attendance Tracker";
+            if (filterKnownBtn) filterKnownBtn.textContent = "Registered";
+        } else {
+            visitorControls.classList.remove("hidden");
+            attendanceControls.classList.add("hidden");
+            rightPanelTitle.textContent = "🗂️ Identity Manager";
+            frStartBtn.textContent = "▶ Start Recognition";
+            if (filterKnownBtn) filterKnownBtn.textContent = "Known";
+        }
+        loadStats();
+        loadIdentities();
+        if (currentSessionId) {
+            _stopStream(); // Restart stream if mode is changed while active
+        }
+    });
 
     // ── Init ───────────────────────────────────────────────────────────────────
     setStatus("loading", "Connecting...");
@@ -167,6 +205,7 @@ document.addEventListener("DOMContentLoaded", () => {
             frConnectBtn.textContent = "✓ Connected";
             frDisconnBtn.classList.remove("hidden");
             regSnapshotBtn.disabled = false;
+            attRegSnapshotBtn.disabled = false;
             updateStartBtn();
         })
         .catch(err => {
@@ -182,6 +221,7 @@ document.addEventListener("DOMContentLoaded", () => {
         frConnectBtn.disabled = false;
         frDisconnBtn.classList.add("hidden");
         regSnapshotBtn.disabled = true;
+        attRegSnapshotBtn.disabled = true;
         updateStartBtn();
     });
 
@@ -209,9 +249,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 };
                 isWebcamStream = true;
                 regSnapshotBtn.disabled = false;
+                attRegSnapshotBtn.disabled = false;
             } catch (e) {
                 alert("Webcam error: " + e.message);
-                frStartBtn.textContent = "▶ Start Recognition";
+                frStartBtn.textContent = getMode() === "attendance" ? "▶ Start Attendance Tracker" : "▶ Start Recognition";
                 frStartBtn.disabled = false;
                 return;
             }
@@ -225,7 +266,7 @@ document.addEventListener("DOMContentLoaded", () => {
             filename:       currentVideoData.filename,
             pipeline_name:  "face_recognition",
             roi_normalized: [[0, 0], [1, 0], [1, 1], [0, 1]],
-            config:         {},
+            config:         { mode: getMode() },
             stream_id:      currentStreamId || null,
         };
 
@@ -247,7 +288,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 currentStreamId = null;
                 isWebcamStream  = false;
             }
-            frStartBtn.textContent = "▶ Start Recognition";
+            frStartBtn.textContent = getMode() === "attendance" ? "▶ Start Attendance Tracker" : "▶ Start Recognition";
             frStartBtn.disabled = false;
         }
     });
@@ -261,8 +302,12 @@ document.addEventListener("DOMContentLoaded", () => {
         streamImg.classList.remove("hidden");
         videoWrapper.classList.add("active");
 
+        if (getMode() === "attendance") {
+            fetch("/api/attendance/start", { method: "POST" });
+        }
+
         frStartBtn.classList.add("hidden");
-        frStartBtn.textContent = "▶ Start Recognition";
+        frStartBtn.textContent = getMode() === "attendance" ? "▶ Start Attendance Tracker" : "▶ Start Recognition";
         frStopBtn.classList.remove("hidden");
         setStatus("active", "Recognition Active");
 
@@ -275,6 +320,11 @@ document.addEventListener("DOMContentLoaded", () => {
         if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
 
         if (currentSessionId) {
+            if (getMode() === "attendance") {
+                fetch("/api/attendance/stop", { method: "POST" }).then(() => {
+                    loadIdentities(); // Refresh identities to show absent status correctly
+                });
+            }
             fetch(`/api/stop_analysis/${currentSessionId}`, { method: "POST" }).catch(() => {});
             currentSessionId = null;
         }
@@ -285,6 +335,7 @@ document.addEventListener("DOMContentLoaded", () => {
             currentStreamId = null;
             isWebcamStream  = false;
             regSnapshotBtn.disabled = true;
+            attRegSnapshotBtn.disabled = true;
         }
 
         streamImg.src = "";
@@ -343,7 +394,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // ── Stats ──────────────────────────────────────────────────────────────────
     function loadStats() {
-        fetch("/api/faces/status")
+        const mode = getMode();
+        fetch(`/api/faces/status?mode=${mode}`)
             .then(r => r.json())
             .then(data => {
                 statTotal.textContent   = data.total_identities ?? "\u2014";
@@ -357,10 +409,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // ── Identity Manager ───────────────────────────────────────────────────────
     function loadIdentities() {
-        fetch("/api/faces/identities")
-            .then(r => r.json())
-            .then(data => {
-                identitiesCache = data.identities || [];
+        const mode = getMode();
+        let identitiesPromise = fetch(`/api/faces/identities?mode=${mode}`).then(r => r.json());
+        let attendancePromise = mode === "attendance" 
+            ? fetch("/api/attendance/status").then(r => r.json())
+            : Promise.resolve(null);
+            
+        Promise.all([identitiesPromise, attendancePromise])
+            .then(([idData, attData]) => {
+                identitiesCache = idData.identities || [];
+                if (attData) attendanceStatus = attData;
                 renderIdentities();
             })
             .catch(() => {
@@ -386,12 +444,30 @@ document.addEventListener("DOMContentLoaded", () => {
         [...list].reverse().forEach(identity => {
             const card = document.createElement("div");
             const isNamed = identity.named === true;
-            card.className = "fr-identity-card";
+            let statusText = identity.person_id;
+            let statusClass = isNamed ? "known" : "unknown";
+            let typeBadgeHtml = `<div class="fr-identity-type ${statusClass}">${statusText}</div>`;
+
+            if (getMode() === "attendance") {
+                const isPresent = attendanceStatus && attendanceStatus.present_ids.includes(identity.person_id);
+                
+                if (isPresent) {
+                    statusClass = "present";
+                    statusText = "Present";
+                } else {
+                    statusClass = "absent";
+                    statusText = "Absent";
+                }
+                card.className = `fr-identity-card ${statusClass}`;
+                typeBadgeHtml = `<div class="fr-identity-type ${statusClass}">${statusText}</div>`;
+            } else {
+                card.className = `fr-identity-card ${statusClass}`;
+            }
 
             const icon = isNamed ? "✅" : "👤";
             const thumbHtml = identity.thumbnail_url
                 ? `<img src="${identity.thumbnail_url}" alt="face"
-                        class="fr-identity-thumb ${isNamed ? 'known' : ''}"
+                        class="fr-identity-thumb ${statusClass}"
                         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                    <div class="fr-identity-thumb-placeholder" style="display:none">${icon}</div>`
                 : `<div class="fr-identity-thumb-placeholder">${icon}</div>`;
@@ -404,14 +480,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 ${thumbHtml}
                 <div class="fr-identity-info">
                     <div class="fr-identity-name" title="${escHtml(identity.label)}">${escHtml(identity.label)}</div>
-                    <div class="fr-identity-meta">${identity.person_id} · ${identity.face_count ?? 1} frames · ${created}</div>
-                </div>
+                    <div class="fr-identity-meta">${typeBadgeHtml} · ${identity.face_count ?? 1} frames · ${created}</div>
                 </div>
                 <button class="fr-identity-rename-btn" title="Rename"
                     data-pid="${identity.person_id}"
-                    data-label="${escHtml(identity.label)}">✎</button>
+                    data-label="${escHtml(identity.label)}">Edit</button>
                 <button class="fr-identity-delete-btn" title="Delete"
-                    data-pid="${identity.person_id}">🗑</button>
+                    data-pid="${identity.person_id}">Del</button>
             `;
 
             card.querySelector(".fr-identity-rename-btn").addEventListener("click", () => {
@@ -420,7 +495,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             card.querySelector(".fr-identity-delete-btn").addEventListener("click", () => {
                 if (!confirm(`Delete ${identity.label}? This cannot be undone.`)) return;
-                fetch(`/api/faces/identity/${identity.person_id}`, { method: "DELETE" })
+                fetch(`/api/faces/identity/${identity.person_id}?mode=${getMode()}`, { method: "DELETE" })
                     .then(r => r.json())
                     .then(() => { loadStats(); loadIdentities(); })
                     .catch(err => alert("Delete failed: " + err.message));
@@ -458,7 +533,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const newLabel = renameInput.value.trim();
         if (!newLabel || !renamingPersonId) return;
 
-        fetch(`/api/faces/identity/${renamingPersonId}`, {
+        fetch(`/api/faces/identity/${renamingPersonId}?mode=${getMode()}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ new_label: newLabel })
@@ -516,8 +591,8 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!regPhotoFile) { alert("Select a photo first."); return; }
         const label = regName.value.trim() || null;
         const url   = label
-            ? `/api/faces/register?label=${encodeURIComponent(label)}`
-            : "/api/faces/register";
+            ? `/api/faces/register?label=${encodeURIComponent(label)}&mode=${getMode()}`
+            : `/api/faces/register?mode=${getMode()}`;
 
         regSubmitBtn.disabled = true;
         regSubmitBtn.textContent = "Registering...";
@@ -556,8 +631,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         const label = regName.value.trim() || null;
         const url   = label
-            ? `/api/faces/snapshot/${currentStreamId}?label=${encodeURIComponent(label)}`
-            : `/api/faces/snapshot/${currentStreamId}`;
+            ? `/api/faces/snapshot/${currentStreamId}?label=${encodeURIComponent(label)}&mode=${getMode()}`
+            : `/api/faces/snapshot/${currentStreamId}?mode=${getMode()}`;
 
         regSnapshotBtn.disabled = true;
         regSnapshotBtn.textContent = "Capturing...";
@@ -578,6 +653,49 @@ document.addEventListener("DOMContentLoaded", () => {
         } finally {
             regSnapshotBtn.disabled = false;
             regSnapshotBtn.textContent = "📸 Snapshot from Live Feed";
+        }
+    });
+
+    // ── Attendance Registration — Live Snapshot ────────────────────────────────
+    attRegSnapshotBtn.addEventListener("click", async () => {
+        if (!currentStreamId) {
+            alert("Start a live source first (webcam or RTSP), then click snapshot.");
+            return;
+        }
+        const label = attRegName.value.trim() || null;
+        if (!label) {
+            alert("Please enter a full name for attendance tracking.");
+            return;
+        }
+        const url = `/api/faces/snapshot/${currentStreamId}?label=${encodeURIComponent(label)}&mode=attendance`;
+
+        attRegSnapshotBtn.disabled = true;
+        attRegSnapshotBtn.textContent = "Capturing...";
+
+        try {
+            const resp = await fetch(url, { method: "POST" });
+            if (!resp.ok) {
+                const err = await resp.json();
+                throw new Error(err.detail || "Snapshot failed");
+            }
+            const data = await resp.json();
+            
+            attRegFeedback.textContent = "✓ Registered: " + data.label;
+            attRegFeedback.className = "fr-reg-feedback success";
+            attRegFeedback.classList.remove("hidden");
+            setTimeout(() => attRegFeedback.classList.add("hidden"), 5000);
+            
+            attRegName.value = "";
+            loadIdentities();
+            loadStats();
+        } catch (e) {
+            attRegFeedback.textContent = "✗ " + e.message;
+            attRegFeedback.className = "fr-reg-feedback error";
+            attRegFeedback.classList.remove("hidden");
+            setTimeout(() => attRegFeedback.classList.add("hidden"), 5000);
+        } finally {
+            attRegSnapshotBtn.disabled = false;
+            attRegSnapshotBtn.textContent = "📸 Snapshot from Live Feed";
         }
     });
 

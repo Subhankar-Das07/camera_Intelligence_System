@@ -20,6 +20,7 @@ services:
       - "8000:8000"
     environment:
       REDIS_URL: redis://redis:6379/0
+      YOLO_CONFIG_DIR: /app/.ultralytics
     volumes:
       # ── Persistent Runtime Storage ────────────────────────────────
       - app_storage:/app/storage              # All alert clips, uploads, previews
