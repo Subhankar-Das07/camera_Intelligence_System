@@ -1,16 +1,8 @@
-# 📖 Camera Intelligence System — Comprehensive Setup & Architecture Guide
+# 📖 Camera Intelligence System — Setup & Developer Guide
 
-<<<<<<< HEAD
 A robust, real-time edge computer vision platform designed to run state-of-the-art AI pipelines on **RTSP IP Cameras (NVRs)**, local **USB Webcams**, and **Android smartphones**. 
 
 This system leverages a highly concurrent FastAPI Python backend to perform YOLO-based object detection, semantic segmentation, ALPR (License Plate Recognition), and biometric vector-search tracking. It serves a responsive Web Dashboard for management and interfaces with a Flutter Mobile App for remote edge-camera streaming.
-=======
-**New teammates:** start here → [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) (Docker install, Hub pull, Git feature branches, merge & conflicts).
-
-**Site operations (clients):** [`docs/CLIENT_ONBOARDING.md`](docs/CLIENT_ONBOARDING.md) — use the **Site Admin** tab only. Existing Zone Safety / Vehicle / Face pages are unchanged demo workspaces.
-
-A robust, real-time computer vision platform designed to run AI pipelines on both **RTSP IP Cameras (NVRs)** and **Android smartphones**. The system uses a FastAPI Python backend to perform YOLO object detection and tracking, serving a responsive Web Dashboard for management and a Flutter Mobile App for edge camera streaming.
->>>>>>> origin/develop
 
 ---
 
@@ -147,22 +139,46 @@ The Flutter application codebase.
 - **Python 3.10+**
 - **Docker Desktop** (For Redis and Linux containerization).
 
-### Installation
-1. Clone the repository and checkout the main branch:
-   ```bash
-   git clone https://github.com/endevs/camera_Intelligence.git
-   cd camera_Intelligence
-   git checkout main
-   ```
-2. Create and activate a Python virtual environment:
-   ```bash
-   python -m venv venv
-   .\venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### Team main repository (endevs)
+**Source of truth:** https://github.com/endevs/camera_Intelligence  
+**Base branch for all feature work:** `main`  
+https://github.com/endevs/camera_Intelligence/tree/main
+
+Clone and start a feature branch:
+
+```bash
+git clone https://github.com/endevs/camera_Intelligence.git
+cd camera_Intelligence
+git checkout main
+git pull
+git checkout -b feature/<name>
+```
+
+| Area | Branch |
+|------|--------|
+| Zone Safety | `feature/zone-safety` |
+| Vehicle | `feature/vehicle` |
+| Face | `feature/face` |
+
+Primary folders: `static/features/zone-safety/`, `static/features/vehicle/`, `static/features/face/`
+
+### Docker Hub image (no local build)
+Image: **`drpinfotech/camera-intelligence:develop`** (also tagged `0.1.0`)  
+https://hub.docker.com/r/drpinfotech/camera-intelligence
+
+```bat
+docker pull drpinfotech/camera-intelligence:develop
+docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
+```
+Open http://localhost:8000
+
+Local rebuild from source: run `docker-refresh.bat`  
+Publish new Hub tags (maintainers): run `docker-publish.bat`
+
+### 1. Install Dependencies (local Python)
+```bash
+pip install -r requirements.txt
+```
 
 ### 🚀 Running the Application
 
@@ -189,10 +205,6 @@ There are **two distinct ways** to run the system depending on your hardware req
 ---
 
 ## 📡 5. Mobile App Connectivity
-
-**Local Docker (developers):** see [`docs/DOCKER_DEV.md`](docs/DOCKER_DEV.md) for the bat-file cheat sheet.  
-Everyday code changes → `docker-quick.bat`. Deps/`Dockerfile` → `docker-rebuild.bat`. Rare full rebuild → `docker-refresh.bat`.  
-Publish new Hub tags (maintainers): run `docker-publish.bat`
 
 To use an Android phone as a wireless edge camera:
 1. Ensure your PC and the Android phone are on the **same Wi-Fi network**.
