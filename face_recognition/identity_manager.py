@@ -280,6 +280,102 @@ class IdentityManager:
             return None
         return f"/api/faces/image/{person_id}/1?mode={mode}"
 
+    # ── Pending Queue (Attendance Workflow) ────────────────────────────────────
+
+    def add_pending_identity(self, embeddings: np.ndarray, face_crops: List[np.ndarray]) -> str:
+        """Stores a pending registration request with embeddings and crops."""
+        import uuid
+        req_id = f"req_{uuid.uuid4().hex[:8]}"
+        with self._lock:
+            meta = {
+                "req_id": req_id,
+                "timestamp": time.time(),
+                "crop_count": len(face_crops)
+            }
+            # Save metadata to hash
+            self.r.hset(f"{self._redis_prefix}:pending", req_id, json.dumps(meta))
+            
+            # Save embeddings
+            emb_meta = {"shape": embeddings.shape, "dtype": str(embeddings.dtype)}
+            self.r.set(f"{self._redis_prefix}:pending:embmeta:{req_id}", json.dumps(emb_meta))
+            self.r.set(f"{self._redis_prefix}:pending:emb:{req_id}", embeddings.tobytes())
+            
+            # Save crops
+            for i, crop in enumerate(face_crops, start=1):
+                _, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                self.r.set(f"{self._redis_prefix}:pending:face:{req_id}:{i}", buf.tobytes())
+            
+        log.info("[IdentityManager] Added pending identity %s", req_id)
+        return req_id
+
+    def get_pending_identities(self) -> List[dict]:
+        """Returns all pending registration requests."""
+        with self._lock:
+            raw_hash = self.r.hgetall(f"{self._redis_prefix}:pending")
+            results = []
+            for req_id_bytes, meta_bytes in raw_hash.items():
+                req_id = redis_str(req_id_bytes)
+                meta = json.loads(redis_str(meta_bytes))
+                results.append(meta)
+            
+            # Sort by timestamp, newest first
+            results.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+            return results
+
+    def approve_pending_identity(self, req_id: str, label: str) -> Optional[str]:
+        """Moves a pending identity into the active database, returning the new person_id."""
+        with self._lock:
+            meta_bytes = self.r.hget(f"{self._redis_prefix}:pending", req_id)
+            if not meta_bytes:
+                return None
+            
+            # Load embeddings
+            emb_meta_raw = self.r.get(f"{self._redis_prefix}:pending:embmeta:{req_id}")
+            emb_data = self.r.get(f"{self._redis_prefix}:pending:emb:{req_id}")
+            if not emb_meta_raw or not emb_data:
+                return None
+                
+            emb_meta = json.loads(redis_str(emb_meta_raw))
+            shape = tuple(emb_meta["shape"])
+            dtype = np.dtype(emb_meta.get("dtype", "float32"))
+            embeddings = np.frombuffer(emb_data, dtype=dtype).reshape(shape).copy().astype(np.float32)
+            
+            # Load crops
+            meta = json.loads(redis_str(meta_bytes))
+            crops = []
+            for i in range(1, meta.get("crop_count", 0) + 1):
+                buf = self.r.get(f"{self._redis_prefix}:pending:face:{req_id}:{i}")
+                if buf:
+                    img_array = np.frombuffer(buf, dtype=np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        crops.append(img)
+            
+            # Add to permanent identities
+            new_pid = self.add_identity(embeddings, crops)
+            self.rename_identity(new_pid, label)
+            
+            # Delete pending
+            self.reject_pending_identity(req_id)
+            return new_pid
+
+    def reject_pending_identity(self, req_id: str) -> bool:
+        """Deletes a pending request and its data."""
+        with self._lock:
+            meta_bytes = self.r.hget(f"{self._redis_prefix}:pending", req_id)
+            if not meta_bytes:
+                return False
+                
+            meta = json.loads(redis_str(meta_bytes))
+            self.r.hdel(f"{self._redis_prefix}:pending", req_id)
+            self.r.delete(f"{self._redis_prefix}:pending:embmeta:{req_id}")
+            self.r.delete(f"{self._redis_prefix}:pending:emb:{req_id}")
+            for i in range(1, meta.get("crop_count", 0) + 1):
+                self.r.delete(f"{self._redis_prefix}:pending:face:{req_id}:{i}")
+            
+            log.info("[IdentityManager] Rejected pending identity %s", req_id)
+            return True
+
     def get_stats(self) -> dict:
         with self._lock:
             named = sum(1 for v in self._identities.values() if v.get("named"))

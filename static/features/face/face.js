@@ -54,9 +54,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const regFeedback    = document.getElementById("reg-feedback");
 
     const identityList   = document.getElementById("identity-list");
+    const pendingList    = document.getElementById("pending-list");
     const refreshBtn     = document.getElementById("refresh-identities-btn");
     const filterTabs     = document.querySelectorAll(".fr-filter-tab");
     const filterKnownBtn = document.getElementById("filter-known-btn");
+    const filterPendingBtn = document.getElementById("filter-pending-btn");
 
     const renameModal    = document.getElementById("rename-modal");
     const renameInput    = document.getElementById("rename-input");
@@ -436,10 +438,79 @@ document.addEventListener("DOMContentLoaded", () => {
             .then(([idData, attData]) => {
                 identitiesCache = idData.identities || [];
                 if (attData) attendanceStatus = attData;
-                renderIdentities();
+                if (identityFilter !== "pending") renderIdentities();
             })
             .catch(() => {
                 identityList.innerHTML = `<div class="fr-identity-empty">Error loading identities.</div>`;
+            });
+    }
+
+    function loadPending() {
+        const mode = getMode();
+        pendingList.innerHTML = `<div class="fr-identity-loading">Loading pending requests...</div>`;
+        fetch(`/api/faces/pending?mode=${mode}`)
+            .then(r => r.json())
+            .then(data => {
+                const list = data.pending || [];
+                if (list.length === 0) {
+                    pendingList.innerHTML = `<div class="fr-identity-empty">No pending approval requests.</div>`;
+                    return;
+                }
+                
+                pendingList.innerHTML = "";
+                list.forEach(pending => {
+                    const card = document.createElement("div");
+                    card.className = "fr-identity-card pending-card";
+                    
+                    const thumbHtml = pending.thumbnail_url
+                        ? `<img src="${pending.thumbnail_url}" alt="face" class="fr-identity-thumb unknown">`
+                        : `<div class="fr-identity-thumb-placeholder">?</div>`;
+                        
+                    const created = new Date(pending.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+                    
+                    card.innerHTML = `
+                        ${thumbHtml}
+                        <div class="fr-identity-info" style="gap: 4px;">
+                            <div class="fr-identity-meta" style="margin-bottom: 4px;">Req: ${pending.req_id} • ${created}</div>
+                            <input type="text" class="fr-input fr-pending-name" placeholder="Enter Name/Roll No..." style="padding: 4px; font-size: 0.85rem;">
+                        </div>
+                        <button class="fr-btn fr-btn-icon approve-btn" title="Approve" style="color: #4ade80;" data-req="${pending.req_id}">✓</button>
+                        <button class="fr-btn fr-btn-icon reject-btn" title="Reject" style="color: #f87171;" data-req="${pending.req_id}">✗</button>
+                    `;
+                    
+                    const inputField = card.querySelector(".fr-pending-name");
+                    const approveBtn = card.querySelector(".approve-btn");
+                    const rejectBtn = card.querySelector(".reject-btn");
+                    
+                    approveBtn.addEventListener("click", () => {
+                        const label = inputField.value.trim() || `Unknown_${pending.req_id.slice(-4)}`;
+                        approveBtn.disabled = true;
+                        rejectBtn.disabled = true;
+                        fetch(`/api/faces/pending/${pending.req_id}/approve?mode=${mode}`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ label })
+                        }).then(r => r.json()).then(() => {
+                            loadPending();
+                            loadIdentities();
+                        });
+                    });
+                    
+                    rejectBtn.addEventListener("click", () => {
+                        approveBtn.disabled = true;
+                        rejectBtn.disabled = true;
+                        fetch(`/api/faces/pending/${pending.req_id}/reject?mode=${mode}`, {
+                            method: "POST"
+                        }).then(r => r.json()).then(() => {
+                            loadPending();
+                        });
+                    });
+                    
+                    pendingList.appendChild(card);
+                });
+            })
+            .catch(() => {
+                pendingList.innerHTML = `<div class="fr-identity-empty">Error loading pending requests.</div>`;
             });
     }
 
@@ -532,8 +603,25 @@ document.addEventListener("DOMContentLoaded", () => {
             filterTabs.forEach(t => t.classList.remove("active"));
             tab.classList.add("active");
             identityFilter = tab.dataset.filter;
-            renderIdentities();
+            if (identityFilter === "pending") {
+                identityList.classList.add("hidden");
+                pendingList.classList.remove("hidden");
+                loadPending();
+            } else {
+                identityList.classList.remove("hidden");
+                pendingList.classList.add("hidden");
+                renderIdentities();
+            }
         });
+    });
+
+    refreshBtn.addEventListener("click", () => {
+        if (identityFilter === "pending") {
+            loadPending();
+        } else {
+            loadStats();
+            loadIdentities();
+        }
     });
 
     // ── Rename Modal ───────────────────────────────────────────────────────────

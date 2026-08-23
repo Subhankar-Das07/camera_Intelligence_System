@@ -532,6 +532,59 @@ async def list_identities(mode: str = "visitor"):
     result.sort(key=lambda x: x.get("created_at", 0))
     return {"identities": result}
 
+@app.get("/api/faces/pending")
+async def list_pending(mode: str = "visitor"):
+    """Return all pending registration requests (useful for Attendance mode)."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'get_pending_identities'):
+        return {"pending": []}
+        
+    pending = im.get_pending_identities()
+    for entry in pending:
+        # Provide thumbnail URL for the first face crop of the pending request
+        entry["thumbnail_url"] = f"/api/faces/pending/image/{entry['req_id']}?mode={mode}"
+    return {"pending": pending}
+
+
+@app.get("/api/faces/pending/image/{req_id}")
+async def pending_face_image(req_id: str, mode: str = "visitor"):
+    """Serve the first face crop JPEG of a pending request."""
+    im = _get_identity_manager(mode)
+    buf = im.r.get(f"{im._redis_prefix}:pending:face:{req_id}:1")
+    if not buf:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return Response(content=buf, media_type="image/jpeg")
+
+
+class PendingApproveRequest(BaseModel):
+    label: str
+
+
+@app.post("/api/faces/pending/{req_id}/approve")
+async def approve_pending(req_id: str, body: PendingApproveRequest, mode: str = "visitor"):
+    """Approve a pending request and register it permanently."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'approve_pending_identity'):
+        raise HTTPException(status_code=400, detail="Approval not supported in this mode")
+        
+    new_pid = im.approve_pending_identity(req_id, body.label)
+    if not new_pid:
+        raise HTTPException(status_code=404, detail="Pending request not found")
+    return {"status": "success", "person_id": new_pid, "label": body.label}
+
+
+@app.post("/api/faces/pending/{req_id}/reject")
+async def reject_pending(req_id: str, mode: str = "visitor"):
+    """Reject a pending request."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'reject_pending_identity'):
+        raise HTTPException(status_code=400, detail="Rejection not supported in this mode")
+        
+    success = im.reject_pending_identity(req_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Pending request not found")
+    return {"status": "success"}
+
 
 @app.post("/api/faces/register")
 async def register_face(

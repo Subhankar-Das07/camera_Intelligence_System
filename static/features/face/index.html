@@ -162,10 +162,13 @@
                     </div>
                     <div class="fr-identity-filter">
                         <button class="fr-filter-tab active" id="filter-known-btn" data-filter="known" type="button">Known</button>
-                        <button class="fr-filter-tab" data-filter="blank" type="button">&nbsp;</button>
+                        <button class="fr-filter-tab" id="filter-pending-btn" data-filter="pending" type="button">Pending</button>
                     </div>
                     <div class="fr-identity-list" id="identity-list" style="flex: 1; overflow-y: auto;">
                         <div class="fr-identity-loading">Loading identities...</div>
+                    </div>
+                    <div class="fr-identity-list hidden" id="pending-list" style="flex: 1; overflow-y: auto;">
+                        <div class="fr-identity-loading">Loading pending requests...</div>
                     </div>
                 </div>
             </aside>
