@@ -37,6 +37,10 @@
     roiSuggestions: [],
     roiPickMode: false,
     roiSuggestBusy: false,
+    monitorSuggestions: [],
+    monitorSuggestPickMode: false,
+    monitorSuggestBusy: false,
+    monitorUseDvrPoll: false,
     scanPreviewWizard: false,
     scanPreviewSidebar: false,
     scanPreviewTimer: null,
@@ -1160,7 +1164,8 @@
   }
 
   function syncNavActive(view) {
-    const rulesFamily = view === "rules" || view === "staff" || view === "vehicles";
+    const rulesFamily =
+      view === "rules" || view === "staff" || view === "vehicles" || view === "journeys";
     document.querySelectorAll(".sa-tabs [data-view]").forEach((b) => {
       const v = b.getAttribute("data-view");
       if (b.classList.contains("sa-nav-parent") && v === "rules") {
@@ -1195,7 +1200,7 @@
   }
 
   function render() {
-    const views = { wizard, cameras, rules, staff, vehicles, monitor, alerts, reports, settings };
+    const views = { wizard, cameras, rules, staff, vehicles, monitor, journeys, alerts, reports, settings };
     (views[state.view] || wizard)();
   }
 
@@ -1291,12 +1296,19 @@
         <div class="sa-card"><h3>Rules</h3><div class="sa-stat">${state.status?.rules ?? 0}</div></div>
         <div class="sa-card"><h3>Recent alerts</h3><div class="sa-stat">${state.status?.alerts ?? 0}</div></div>
         <div class="sa-card"><h3>WhatsApp</h3><p>${state.status?.whatsapp_configured ? "API configured" : "Not configured (web alerts still work)"}</p></div>
+        <div class="sa-card"><h3>Email</h3><p>${state.status?.email_configured ? "SMTP configured" : "Not configured — set SMTP_* in .env"}</p></div>
       </div>
       <div class="sa-steps">
         <section class="sa-step">
           <h3>Site profile</h3>
           <div class="sa-form">
             <div class="sa-field"><label>Site name</label><input class="text-input" id="w-name" value="${escapeHtml(s.name)}"></div>
+            <div class="sa-field"><label>Contact name</label><input class="text-input" id="w-contact-name" placeholder="Primary contact" value="${escapeHtml(s.contact_name || "")}"></div>
+            <div class="sa-field">
+              <label>Contact email</label>
+              <input class="text-input" id="w-contact-email" type="email" placeholder="you@example.com" value="${escapeHtml(s.contact_email || "")}">
+              <p class="sa-muted sa-field-hint">Saved for alerts and further communication.</p>
+            </div>
             <div class="sa-field"><label>Type</label>
               <select id="w-type" class="text-input">
                 <option value="shop"${s.type === "shop" ? " selected" : ""}>Shop</option>
@@ -1306,6 +1318,7 @@
             </div>
             <div class="sa-field"><label>Timezone</label><input class="text-input" id="w-tz" value="${escapeHtml(s.timezone || "Asia/Kolkata")}"></div>
             <button class="btn primary" id="w-save-site" type="button"${isAdmin() ? "" : " disabled"}>Save site</button>
+            <span class="sa-muted" id="w-site-msg"></span>
           </div>
         </section>
         <section class="sa-step">
@@ -1345,18 +1358,31 @@
     document.getElementById("w-to-rules").onclick = () => go("rules");
     document.getElementById("w-to-mon").onclick = () => go("monitor");
     document.getElementById("w-save-site").onclick = async () => {
+      const contactEmail = (document.getElementById("w-contact-email")?.value || "").trim();
+      const siteMsg = document.getElementById("w-site-msg");
+      if (!contactEmail || !contactEmail.includes("@")) {
+        if (siteMsg) siteMsg.textContent = "Enter a valid contact email to save.";
+        return;
+      }
       try {
         await api("/site", {
           json: {
             name: document.getElementById("w-name").value,
+            contact_name: (document.getElementById("w-contact-name")?.value || "").trim(),
+            contact_email: contactEmail,
             type: document.getElementById("w-type").value,
             timezone: document.getElementById("w-tz").value,
           },
         });
         await refresh();
+        const msg =
+          state.status?.email_configured
+            ? "Saved — confirmation email sent if SMTP is working."
+            : "Saved (SMTP not configured — alerts email needs .env SMTP_*).";
+        if (siteMsg) siteMsg.textContent = msg;
         document.getElementById("w-msg") && (document.getElementById("w-msg").textContent = "Saved");
       } catch (e) {
-        alert(e.message);
+        if (siteMsg) siteMsg.textContent = e.message || "Save failed";
       }
     };
     document.getElementById("w-live").onclick = async () => {
@@ -1635,6 +1661,7 @@
         <div class="sa-row">
           <button class="btn secondary" type="button" id="r-goto-staff">Staff</button>
           <button class="btn secondary" type="button" id="r-goto-vehicles">Vehicles</button>
+          <button class="btn secondary" type="button" id="r-goto-journeys">Journeys</button>
         </div>
       </div>
       ${
@@ -1653,7 +1680,12 @@
           </div>
           <div class="sa-field"><label>Channels</label>
             <label style="display:inline;margin-right:1rem;"><input type="checkbox" id="ch-web" checked> Web</label>
-            <label style="display:inline;"><input type="checkbox" id="ch-wa"> WhatsApp</label>
+            <label style="display:inline;margin-right:1rem;"><input type="checkbox" id="ch-wa"> WhatsApp</label>
+            <label style="display:inline;"><input type="checkbox" id="ch-email"${
+              (state.status?.site?.contact_email || (state.status?.site?.alert_emails || []).length)
+                ? " checked"
+                : ""
+            }> Email</label>
           </div>
           <div id="gate-setup" class="sa-gate-setup" style="display:none;">
             <p class="sa-muted">Draw each shape on the preview. Click a step, then click the image.</p>
@@ -1670,6 +1702,19 @@
               <label style="display:inline;"><input type="radio" name="g-dir" value="right"> Right of line</label>
             </div>
             <button class="btn secondary" type="button" id="g-clear-mode">Clear current step</button>
+          </div>
+          <div id="pose-trigger-setup" class="sa-pose-trigger-setup" style="display:none;">
+            <div class="sa-field">
+              <label>Body-part trigger</label>
+              <p class="sa-muted sa-field-hint">Alert when any selected body part enters the ROI.</p>
+              <div class="sa-pose-parts">
+                <label><input type="checkbox" class="pose-part" value="head"> Head</label>
+                <label><input type="checkbox" class="pose-part" value="hands"> Hands</label>
+                <label><input type="checkbox" class="pose-part" value="legs"> Legs</label>
+                <label><input type="checkbox" class="pose-part" value="torso"> Torso</label>
+                <label><input type="checkbox" class="pose-part" value="whole"> Whole person</label>
+              </div>
+            </div>
           </div>
           <p class="sa-muted" id="roi-hint">Click the preview to draw ROI, or use Suggest regions (FastSAM) to click a detected area. Fall / face / vehicle can run without a polygon.</p>
           <p class="sa-muted sa-roi-preview-status" id="roi-preview-status" hidden></p>
@@ -1695,6 +1740,7 @@
 
     document.getElementById("r-goto-staff")?.addEventListener("click", () => go("staff"));
     document.getElementById("r-goto-vehicles")?.addEventListener("click", () => go("vehicles"));
+    document.getElementById("r-goto-journeys")?.addEventListener("click", () => go("journeys"));
 
     state.rules.forEach((r) => {
       const cam = state.cameras.find((c) => c.id === r.camera_id);
@@ -1713,11 +1759,34 @@
 
     const typeSel = document.getElementById("r-type");
     const gateSetup = document.getElementById("gate-setup");
+    const poseSetup = document.getElementById("pose-trigger-setup");
     const roiHint = document.getElementById("roi-hint");
     const typeHint = document.getElementById("r-type-hint");
 
     function isGateType() {
       return typeSel?.value === "gate_analytics";
+    }
+
+    function isPoseTriggerType() {
+      const t = typeSel?.value || "";
+      return t === "intrusion" || t === "danger_zone";
+    }
+
+    function defaultPoseParts(scanType) {
+      if (scanType === "intrusion") return ["legs"];
+      if (scanType === "danger_zone") return ["whole"];
+      return [];
+    }
+
+    function setPosePartChecks(parts) {
+      const set = new Set(parts || []);
+      document.querySelectorAll(".pose-part").forEach((el) => {
+        el.checked = set.has(el.value);
+      });
+    }
+
+    function selectedPoseParts() {
+      return Array.from(document.querySelectorAll(".pose-part:checked")).map((el) => el.value);
     }
 
     function syncTypeHint() {
@@ -1744,7 +1813,9 @@
 
     function syncGateUi() {
       const gate = isGateType();
+      const pose = isPoseTriggerType();
       if (gateSetup) gateSetup.style.display = gate ? "block" : "none";
+      if (poseSetup) poseSetup.style.display = pose ? "block" : "none";
       if (roiHint && !state.roiPickMode) {
         roiHint.textContent = gate
           ? "Gate rule: draw count line, gate ROI, and three distance zones — or Suggest regions and click a shape for ROI/zones."
@@ -1760,6 +1831,9 @@
     document.getElementById("r-type-info")?.addEventListener("click", () => openScanCatalogHelp());
 
     typeSel?.addEventListener("change", () => {
+      if (isPoseTriggerType()) {
+        setPosePartChecks(defaultPoseParts(typeSel.value));
+      }
       syncGateUi();
       loadRulePreview();
     });
@@ -1907,6 +1981,9 @@
       loadRulePreview();
     }
     document.getElementById("r-refresh-preview")?.addEventListener("click", () => loadRulePreview());
+    if (isPoseTriggerType() && !selectedPoseParts().length) {
+      setPosePartChecks(defaultPoseParts(typeSel?.value || ""));
+    }
     syncGateUi();
 
     document.getElementById("r-suggest")?.addEventListener("click", async () => {
@@ -1973,6 +2050,7 @@
       const channels = [];
       if (document.getElementById("ch-web").checked) channels.push("web");
       if (document.getElementById("ch-wa").checked) channels.push("whatsapp");
+      if (document.getElementById("ch-email")?.checked) channels.push("email");
       const camId = document.getElementById("r-cam").value;
       if (enabledRulesOnCamera(camId).length >= MAX_RULES_PER_CAMERA) {
         return alert(`Max ${MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.`);
@@ -1985,6 +2063,13 @@
         channels: channels.length ? channels : ["web"],
         enabled: true,
       };
+      if (scanType === "intrusion" || scanType === "danger_zone") {
+        const parts = selectedPoseParts();
+        if (!parts.length) {
+          return alert("Select at least one body part for the trigger.");
+        }
+        payload.pose_trigger = { parts, min_conf: 0.5, require_person: true };
+      }
       if (scanType === "gate_analytics") {
         const dirEl = document.querySelector('input[name="g-dir"]:checked');
         state.gateConfig.direction_in = dirEl ? dirEl.value : "left";
@@ -2459,14 +2544,28 @@
     clearMonitorFramePoll();
     if (errEl) errEl.hidden = true;
 
-    img.onload = () => hideMonitorOverlays();
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'C',location:'site-admin.js:bindMonitorStreamImg',message:'bind start',data:{useDvrPoll:!!useDvrPoll,sessionId:sessionId||'',src:(img.getAttribute('src')||'').slice(0,120),complete:!!img.complete,naturalWidth:img.naturalWidth||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+
+    img.onload = () => {
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'C',location:'site-admin.js:img.onload',message:'img loaded',data:{naturalWidth:img.naturalWidth||0,naturalHeight:img.naturalHeight||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0,useDvrPoll:!!useDvrPoll},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      hideMonitorOverlays();
+      syncMonitorHitCanvas();
+    };
     img.onerror = () => {
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'A',location:'site-admin.js:img.onerror',message:'img error',data:{useDvrPoll:!!useDvrPoll,src:(img.getAttribute('src')||'').slice(0,120)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       /* Keep overlay hidden when polling — a failed refresh must not block the last good frame */
       if (useDvrPoll) return;
     };
 
     if (img.complete && img.naturalWidth > 0) {
       hideMonitorOverlays();
+      syncMonitorHitCanvas();
     }
 
     if (useDvrPoll && sessionId) {
@@ -2475,12 +2574,366 @@
         img.src = `/api/site-admin/monitor/frame/${encodeURIComponent(sessionId)}?t=${Date.now()}`;
       };
       refresh();
+      // #region agent log
+      fetch(`/api/site-admin/monitor/frame/${encodeURIComponent(sessionId)}?t=${Date.now()}`, { method: "GET" })
+        .then((r) => r.blob().then((b) => ({ status: r.status, size: b.size, type: b.type })))
+        .then((info) => {
+          fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'B',location:'site-admin.js:frameProbe',message:'DVR frame probe',data:info,timestamp:Date.now()})}).catch(()=>{});
+        })
+        .catch((e) => {
+          fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'B',location:'site-admin.js:frameProbe',message:'DVR frame probe failed',data:{err:String(e&&e.message||e)},timestamp:Date.now()})}).catch(()=>{});
+        });
+      // #endregion
       state.monitorFramePoll = setInterval(refresh, 1000);
       window.setTimeout(hideMonitorOverlays, 4000);
       return;
     }
 
+    // #region agent log
+    window.setTimeout(() => {
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'D',location:'site-admin.js:bind+2s',message:'rtsp img state after 2s',data:{naturalWidth:img.naturalWidth||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0,complete:!!img.complete,src:(img.getAttribute('src')||'').slice(0,120)},timestamp:Date.now()})}).catch(()=>{});
+    }, 2000);
+    // #endregion
+
     window.setTimeout(hideMonitorOverlays, 2500);
+  }
+
+  function syncMonitorHitCanvas() {
+    const img = document.getElementById("sa-monitor-video");
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (!img || !canvas) return;
+    const w = img.clientWidth;
+    const h = img.clientHeight;
+    if (w < 8 || h < 8) return;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    if (state.monitorSuggestPickMode && (state.monitorSuggestions || []).length) {
+      drawMonitorSuggestions(ctx, canvas);
+      return;
+    }
+
+    const live = state._monitorJourneyLive || [];
+    live.forEach((j) => {
+      const bn = j.bbox_norm;
+      if (!bn || bn.length !== 4) return;
+      const x1 = bn[0] * w;
+      const y1 = bn[1] * h;
+      const x2 = bn[2] * w;
+      const y2 = bn[3] * h;
+      ctx.strokeStyle = j.watched ? "#f97316" : "#22d3ee";
+      ctx.lineWidth = j.watched ? 3 : 2;
+      ctx.strokeRect(x1, y1, Math.max(4, x2 - x1), Math.max(4, y2 - y1));
+      if (j.watched) {
+        ctx.fillStyle = "rgba(249, 115, 22, 0.15)";
+        ctx.fillRect(x1, y1, Math.max(4, x2 - x1), Math.max(4, y2 - y1));
+      }
+    });
+    const sam = state._samSelection;
+    if (sam && (sam.polygon || []).length >= 3) {
+      ctx.beginPath();
+      sam.polygon.forEach((p, i) => {
+        const x = p[0] * w;
+        const y = p[1] * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = "rgba(34, 211, 238, 0.28)";
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2.5;
+      ctx.fill();
+      ctx.stroke();
+      if (sam.gid) {
+        const cx = sam.polygon.reduce((s, p) => s + p[0], 0) / sam.polygon.length;
+        const cy = sam.polygon.reduce((s, p) => s + p[1], 0) / sam.polygon.length;
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "bold 13px sans-serif";
+        ctx.fillText(sam.gid + (sam.watched ? " · watching" : "") + (sam.local_track_id != null ? " · t" + sam.local_track_id : ""), cx * w - 40, cy * h);
+      }
+    }
+  }
+
+  function drawMonitorSuggestions(ctx, canvas) {
+    (state.monitorSuggestions || []).forEach((r, idx) => {
+      const pts = r.polygon || [];
+      if (pts.length < 3) return;
+      const hue = (idx * 47) % 360;
+      ctx.strokeStyle = `hsla(${hue}, 80%, 60%, 0.95)`;
+      ctx.fillStyle = `hsla(${hue}, 70%, 50%, 0.18)`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = p[0] * canvas.width;
+        const y = p[1] * canvas.height;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+      ctx.fillStyle = `hsla(${hue}, 90%, 70%, 0.95)`;
+      ctx.font = "11px sans-serif";
+      ctx.fillText(String(idx + 1), cx * canvas.width - 4, cy * canvas.height + 4);
+    });
+  }
+
+  function findMonitorSuggestionAt(nx, ny) {
+    const hit = [];
+    for (const r of state.monitorSuggestions || []) {
+      const poly = r.polygon || [];
+      if (poly.length >= 3 && pointInPoly([nx, ny], poly)) hit.push(r);
+    }
+    if (!hit.length) return null;
+    hit.sort((a, b) => (a.area || 1) - (b.area || 1));
+    return hit[0];
+  }
+
+  function freezeMonitorVideo() {
+    clearMonitorFramePoll();
+    const img = document.getElementById("sa-monitor-video");
+    if (!img || !(img.naturalWidth > 0)) return;
+    try {
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      c.getContext("2d").drawImage(img, 0, 0);
+      const dataUrl = c.toDataURL("image/jpeg", 0.85);
+      state._monitorFrozenSrc = dataUrl;
+      img.src = dataUrl;
+    } catch (_) {
+      /* keep last frame if capture fails */
+    }
+  }
+
+  function exitMonitorSuggestMode(resumeLive) {
+    state.monitorSuggestPickMode = false;
+    state.monitorSuggestions = [];
+    state.monitorSuggestBusy = false;
+    state._monitorFrozenSrc = "";
+    syncMonitorSuggestUi();
+    if (resumeLive && state.monitorSessionId) {
+      bindMonitorStreamImg(!!state.monitorUseDvrPoll, state.monitorSessionId);
+    }
+    syncMonitorHitCanvas();
+  }
+
+  async function suggestWatchRegion(region) {
+    if (!state.monitorSessionId || !region) return;
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (canvas) canvas.classList.add("sa-sam-busy");
+    try {
+      const r = await api("/monitor/suggest-watch", {
+        method: "POST",
+        json: {
+          session_id: state.monitorSessionId,
+          polygon: region.polygon || [],
+          watch: true,
+        },
+      });
+      state._samSelection = {
+        gid: r.gid,
+        polygon: r.segment?.polygon || region.polygon || [],
+        bbox_norm: r.segment?.bbox_norm || [],
+        label: r.journey?.label || "person",
+        watched: !!r.watched,
+        local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+      };
+      if (r.segment?.bbox_norm) {
+        const live = state._monitorJourneyLive || [];
+        const item = {
+          gid: r.gid,
+          label: r.journey?.label || "person",
+          bbox_norm: r.segment.bbox_norm,
+          watched: !!r.watched,
+          match_method: "person_track",
+          local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+        };
+        state._monitorJourneyLive = [item, ...live.filter((j) => j.gid !== r.gid)].slice(0, 20);
+      }
+      const msg = r.message || "Selected — watching";
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = msg;
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 3500);
+      }
+      exitMonitorSuggestMode(true);
+      if (state.view === "monitor") {
+        setTimeout(() => monitor(), 400);
+      }
+    } catch (e) {
+      alert(e.message || "Suggest watch failed");
+    } finally {
+      if (canvas) canvas.classList.remove("sa-sam-busy");
+    }
+  }
+
+  async function samSelectAtClick(nx, ny) {
+    if (!state.monitorSessionId) return;
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (canvas) canvas.classList.add("sa-sam-busy");
+    try {
+      const r = await api("/monitor/sam-select", {
+        method: "POST",
+        json: {
+          session_id: state.monitorSessionId,
+          nx,
+          ny,
+          watch: true,
+        },
+      });
+      state._samSelection = {
+        gid: r.gid,
+        polygon: r.segment?.polygon || [],
+        bbox_norm: r.segment?.bbox_norm || [],
+        label: r.journey?.label || "person",
+        watched: !!r.watched,
+        local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+      };
+      if (r.segment?.bbox_norm) {
+        const live = state._monitorJourneyLive || [];
+        const item = {
+          gid: r.gid,
+          label: r.journey?.label || "person",
+          bbox_norm: r.segment.bbox_norm,
+          watched: !!r.watched,
+          match_method: "person_track",
+          local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+        };
+        state._monitorJourneyLive = [item, ...live.filter((j) => j.gid !== r.gid)].slice(0, 20);
+      }
+      syncMonitorHitCanvas();
+      const msg = r.message || "Tracking person";
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = msg;
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 3500);
+      }
+      // Refresh watched panel without full remount if possible
+      if (state.view === "monitor") {
+        setTimeout(() => monitor(), 400);
+      }
+    } catch (e) {
+      alert(e.message || "Person select failed");
+    } finally {
+      if (canvas) canvas.classList.remove("sa-sam-busy");
+    }
+  }
+
+  function hitJourneyAt(nx, ny) {
+    const live = state._monitorJourneyLive || [];
+    let best = null;
+    let bestArea = Infinity;
+    for (const j of live) {
+      const bn = j.bbox_norm;
+      if (!bn || bn.length !== 4) continue;
+      if (nx >= bn[0] && nx <= bn[2] && ny >= bn[1] && ny <= bn[3]) {
+        const area = (bn[2] - bn[0]) * (bn[3] - bn[1]);
+        if (area < bestArea) {
+          bestArea = area;
+          best = j;
+        }
+      }
+    }
+    return best;
+  }
+
+  async function toggleWatchGid(gid, currentlyWatched) {
+    if (!gid) return;
+    try {
+      if (currentlyWatched) {
+        await api("/journeys/" + encodeURIComponent(gid) + "/watch", { method: "DELETE" });
+      } else {
+        await api("/journeys/" + encodeURIComponent(gid) + "/watch", { method: "POST" });
+      }
+      if (state.view === "monitor") monitor();
+      else if (state.view === "journeys") journeys();
+    } catch (e) {
+      alert(e.message || "Watch failed");
+    }
+  }
+
+  function bindWatchControls(root) {
+    const el = root || main;
+    el.querySelectorAll("[data-watch-gid]").forEach((b) => {
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        const gid = b.getAttribute("data-watch-gid");
+        const wrap = b.closest(".sa-journey-badge-wrap");
+        const watched = wrap?.classList.contains("is-watched") || b.textContent.trim() === "Unwatch";
+        toggleWatchGid(gid, watched);
+      };
+    });
+    el.querySelectorAll(".sa-journey-badge[data-gid]").forEach((b) => {
+      b.onclick = () => {
+        state._journeyFocus = b.getAttribute("data-gid");
+        go("journeys");
+      };
+    });
+    document.getElementById("mon-goto-alerts")?.addEventListener("click", () => go("alerts"));
+    const canvas = document.getElementById("sa-monitor-hit");
+    const img = document.getElementById("sa-monitor-video");
+    if (canvas && img) {
+      canvas.classList.toggle("sa-pick-mode", !!state.monitorSuggestPickMode);
+      canvas.onclick = async (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        const nx = (ev.clientX - rect.left) / rect.width;
+        const ny = (ev.clientY - rect.top) / rect.height;
+
+        if (state.monitorSuggestPickMode) {
+          const region = findMonitorSuggestionAt(nx, ny);
+          if (!region) {
+            const toast = document.getElementById("mon-sam-toast");
+            if (toast) {
+              toast.textContent = "Click a highlighted person to track";
+              toast.hidden = false;
+              setTimeout(() => {
+                toast.hidden = true;
+              }, 2500);
+            }
+            return;
+          }
+          await suggestWatchRegion(region);
+          return;
+        }
+
+        const hit = hitJourneyAt(nx, ny);
+        if (hit && hit.gid) {
+          await toggleWatchGid(hit.gid, !!hit.watched);
+          return;
+        }
+        // Direct click: YOLO person under cursor → track + Watch
+        await samSelectAtClick(nx, ny);
+      };
+      syncMonitorHitCanvas();
+    }
+  }
+
+  function syncMonitorSuggestUi() {
+    const btn = document.getElementById("mon-suggest");
+    const btnDone = document.getElementById("mon-suggest-done");
+    const wrap = document.querySelector(".sa-monitor-wrap");
+    const canvas = document.getElementById("sa-monitor-hit");
+    const hint = document.getElementById("mon-track-hint");
+    if (btn) {
+      btn.disabled = !!state.monitorSuggestBusy || !state.monitorSessionId;
+      btn.textContent = state.monitorSuggestBusy ? "Finding…" : "Suggest people";
+      btn.style.display = state.monitorSuggestPickMode ? "none" : "inline-block";
+    }
+    if (btnDone) btnDone.style.display = state.monitorSuggestPickMode ? "inline-block" : "none";
+    if (wrap) wrap.classList.toggle("sa-pick-active", !!state.monitorSuggestPickMode);
+    if (canvas) canvas.classList.toggle("sa-pick-mode", !!state.monitorSuggestPickMode);
+    if (hint) hint.hidden = !state.monitorSuggestPickMode;
   }
 
   async function monitor() {
@@ -2534,6 +2987,7 @@
     const hasGate = (monStatus.scan_types || []).includes("gate_analytics");
     const gl = monStatus.gate_live || {};
     const gt = gl.session_totals || {};
+    const streamLive = !!(monStatus.active && state.monitorSessionId);
     const gatePanel =
       hasGate && state.monitorSessionId
         ? `<div class="sa-gate-live sa-card">
@@ -2548,21 +3002,112 @@
           </div>`
         : "";
 
-    const streamLive = !!(monStatus.active && state.monitorSessionId);
+    // Prefer session journey_live (has bbox_norm / SAM picks) over Redis summary
+    const journeyLive = (() => {
+      const fromSession = monStatus.journey_live || [];
+      if (fromSession.some((j) => j.bbox_norm && j.bbox_norm.length === 4)) return fromSession;
+      return fromSession;
+    })();
+    state._monitorJourneyLive = journeyLive;
+    state._samSelection = monStatus.sam_selection || state._samSelection || null;
+    const journeyPanel =
+      streamLive && journeyLive.length
+        ? `<div class="sa-journey-live sa-card">
+            <h3>Journeys on this camera</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Click <strong>Watch</strong> to send hops to Alerts. Click the badge to open the path.</p>
+            <div class="sa-journey-badges">
+              ${journeyLive
+                .map((j) => {
+                  const gid = j.gid || "";
+                  const label = j.label || "unknown";
+                  const hops = j.hop_summary || "";
+                  const watched = !!j.watched;
+                  return `<div class="sa-journey-badge-wrap${watched ? " is-watched" : ""}">
+                    <button type="button" class="sa-journey-badge" data-gid="${escapeHtml(gid)}" title="${escapeHtml(hops)}">
+                      <strong>${escapeHtml(gid)}</strong>
+                      <span>${escapeHtml(label)}</span>
+                      ${hops ? `<span class="sa-muted sa-journey-hops">${escapeHtml(hops)}</span>` : ""}
+                    </button>
+                    <button type="button" class="btn ${watched ? "danger" : "primary"} sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">
+                      ${watched ? "Unwatch" : "Watch"}
+                    </button>
+                  </div>`;
+                })
+                .join("")}
+            </div>
+          </div>`
+        : "";
+
+    let watchedList = [];
+    try {
+      const wd = await api("/journeys-watched?limit=30");
+      watchedList = wd.journeys || [];
+    } catch (_) {
+      watchedList = [];
+    }
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'A',location:'site-admin.js:watchedPanel',message:'watched list for panel',data:{count:watchedList.length,items:(watchedList||[]).slice(0,5).map(j=>({gid:j.gid,label:j.label,thumb_url:(j.thumb_url||'').slice(0,80),last_thumb_url:(j.last_thumb_url||'').slice(0,80),keys:Object.keys(j||{}).filter(k=>k.includes('thumb')||k==='gid')}))},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    const watchedIds = new Set(watchedList.map((j) => j.gid).filter(Boolean));
+    // Merge watched flag onto live badges if Redis list has them
+    journeyLive.forEach((j) => {
+      if (j.gid && watchedIds.has(j.gid)) j.watched = true;
+    });
+
+    const watchedPanel =
+      watchedList.length > 0
+        ? `<div class="sa-card sa-watched-panel">
+            <h3>Watching → Alerts</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Pinned targets. New camera hops create Alerts entries.</p>
+            <div class="sa-journey-badges">
+              ${watchedList
+                .map((j) => {
+                  const gid = j.gid || "";
+                  const thumb = j.thumb_url || j.last_thumb_url || "";
+                  const thumbHtml = thumb
+                    ? `<img class="sa-watched-thumb" src="${escapeHtml(thumb)}" alt="">`
+                    : `<div class="sa-watched-thumb sa-watched-thumb--empty"></div>`;
+                  return `<div class="sa-journey-badge-wrap is-watched">
+                    <button type="button" class="sa-journey-badge sa-journey-badge--with-thumb" data-gid="${escapeHtml(gid)}">
+                      ${thumbHtml}
+                      <span class="sa-journey-badge-text">
+                        <strong>${escapeHtml(gid)}</strong>
+                        <span>${escapeHtml(j.label || "unknown")}</span>
+                        <span class="sa-muted sa-journey-hops">${escapeHtml(j.hop_summary || j.last_camera_name || "")}</span>
+                      </span>
+                    </button>
+                    <button type="button" class="btn danger sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">Unwatch</button>
+                  </div>`;
+                })
+                .join("")}
+            </div>
+            <button class="btn secondary" type="button" id="mon-goto-alerts" style="margin-top:0.5rem;width:auto;">Open Alerts</button>
+          </div>`
+        : `<div class="sa-card sa-watched-panel"><h3>Watching → Alerts</h3><p class="sa-muted">No pinned targets yet. Click a person on the video or press Watch on a journey badge.</p></div>`;
+
     const useDvrPoll = streamLive && monitorCameraType(monStatus) === "dvr";
-    const videoSrc = streamLive
-      ? useDvrPoll
-        ? `/api/site-admin/monitor/frame/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
-        : `/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
-      : "";
+    state.monitorUseDvrPoll = useDvrPoll;
+    const videoSrc =
+      streamLive && !state.monitorSuggestPickMode
+        ? useDvrPoll
+          ? `/api/site-admin/monitor/frame/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+          : `/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+        : streamLive
+          ? ""
+          : "";
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'E',location:'site-admin.js:monitor',message:'monitor render stream',data:{streamLive:!!streamLive,cameraType:monitorCameraType(monStatus),useDvrPoll:!!useDvrPoll,sessionId:state.monitorSessionId||'',camPick:state.monitorCameraPick||'',camName:monStatus.camera_name||'',scanTypes:monStatus.scan_types||[],videoSrc:(videoSrc||'').slice(0,140),active:!!monStatus.active,suggestPick:!!state.monitorSuggestPickMode},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     const streaming = streamLive
-      ? `<div class="sa-monitor-wrap">
-          <div id="sa-monitor-loading" class="sa-monitor-loading">Connecting…</div>
+      ? `<div class="sa-monitor-wrap sa-monitor-wrap--clickable${state.monitorSuggestPickMode ? " sa-pick-active" : ""}">
+          <div id="sa-monitor-loading" class="sa-monitor-loading"${state.monitorSuggestPickMode ? " hidden" : ""}>Connecting…</div>
           <div id="sa-monitor-error" class="sa-monitor-error" hidden>
             Stream unavailable — check camera or Docker network to DVR
           </div>
           <img id="sa-monitor-video" class="sa-monitor-video" alt="Live monitor"
-            src="${videoSrc}">
+            src="${videoSrc || (state._monitorFrozenSrc || "")}">
+          <canvas id="sa-monitor-hit" class="sa-monitor-hit${state.monitorSuggestPickMode ? " sa-pick-mode" : ""}" title="Suggest people or click a person to Watch"></canvas>
+          <div id="mon-sam-toast" class="sa-sam-toast" hidden></div>
         </div>
         ${monitorControlsHtml(monStatus.active ? monStatus : null)}`
       : `<div class="sa-monitor-wrap"><p class="placeholder-msg" style="padding:2rem;">Select a camera and click Watch live</p></div>`;
@@ -2571,7 +3116,7 @@
       <div class="sa-h">
         <div>
           <h2>Live monitor</h2>
-          <p>Select a camera that already has rules, then Watch live. Add cameras under Cameras and draw rules under Rules.</p>
+          <p>Select a camera with rules, then Watch live. Press <strong>Suggest people</strong> (or click a person on the video) — YOLO + ByteTrack follows them and pins Watch; hops go to <strong>Alerts</strong>. Cyan boxes are tracked journeys.</p>
         </div>
       </div>
       ${heavyNote}
@@ -2586,10 +3131,20 @@
               : `<button class="btn primary" type="button" id="mon-start" style="width:auto;">Watch live</button>`
             : `<span class="sa-muted">Viewer — watch only when Admin starts a session</span>`
         }
+        ${
+          streamLive
+            ? `<button class="btn secondary" type="button" id="mon-suggest">Suggest people</button>
+               <button class="btn secondary" type="button" id="mon-suggest-done" style="display:none;">Done picking</button>
+               <button class="btn secondary" type="button" id="mon-clear">Clear</button>`
+            : ""
+        }
         <button class="btn" type="button" id="mon-test-beep">Test beep</button>
       </div>
+      <p id="mon-track-hint" class="sa-muted" ${state.monitorSuggestPickMode ? "" : "hidden"} style="margin:-0.35rem 0 0.85rem;">Click a highlighted person to track them (Watch → Alerts). Or Done picking.</p>
       ${streaming}
       ${gatePanel}
+      ${journeyPanel}
+      ${watchedPanel}
       ${eventTrackerHtml(monStatus.events || [])}
       <div class="sa-card">
         <h3>Rules on this stream</h3>
@@ -2630,13 +3185,95 @@
     });
 
     document.getElementById("mon-stop")?.addEventListener("click", async () => {
+      exitMonitorSuggestMode(false);
       await stopMonitorIfAny();
       state.monitorCameraPick = "";
       monitor();
     });
 
-    bindMonitorStreamImg(useDvrPoll, state.monitorSessionId);
-    if (streamLive) hideMonitorOverlays();
+    document.getElementById("mon-suggest")?.addEventListener("click", async () => {
+      if (!state.monitorSessionId || state.monitorSuggestBusy) return;
+      state.monitorSuggestBusy = true;
+      syncMonitorSuggestUi();
+      try {
+        freezeMonitorVideo();
+        const data = await api("/monitor/suggest-regions", {
+          method: "POST",
+          json: { session_id: state.monitorSessionId },
+        });
+        state.monitorSuggestions = data.regions || [];
+        if (!state.monitorSuggestions.length) {
+          exitMonitorSuggestMode(true);
+          alert("No people found in this frame. Wait a moment and try again.");
+          return;
+        }
+        state.monitorSuggestPickMode = true;
+        syncMonitorSuggestUi();
+        syncMonitorHitCanvas();
+        const toast = document.getElementById("mon-sam-toast");
+        if (toast) {
+          toast.textContent = "Click a highlighted person to track";
+          toast.hidden = false;
+          setTimeout(() => {
+            toast.hidden = true;
+          }, 3000);
+        }
+      } catch (e) {
+        exitMonitorSuggestMode(true);
+        alert(e.message || "Suggest people failed");
+      } finally {
+        state.monitorSuggestBusy = false;
+        syncMonitorSuggestUi();
+      }
+    });
+    document.getElementById("mon-suggest-done")?.addEventListener("click", () => {
+      exitMonitorSuggestMode(true);
+    });
+
+    document.getElementById("mon-clear")?.addEventListener("click", async () => {
+      // Rules-parity Clear: drop suggest masks + SAM overlay only (keep Watch + live session)
+      if (state.monitorSuggestPickMode) {
+        exitMonitorSuggestMode(true);
+      }
+      state._samSelection = null;
+      syncMonitorHitCanvas();
+      if (state.monitorSessionId) {
+        try {
+          await api("/monitor/clear-selection", {
+            method: "POST",
+            json: { session_id: state.monitorSessionId },
+          });
+        } catch (_) {
+          /* client clear is enough if API unavailable */
+        }
+      }
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'F',location:'site-admin.js:mon-clear',message:'monitor clear selection',data:{sessionId:state.monitorSessionId||''},timestamp:Date.now(),runId:'post-fix'})}).catch(()=>{});
+      // #endregion
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = "Selection cleared";
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 2000);
+      }
+    });
+
+    if (streamLive && !state.monitorSuggestPickMode) {
+      bindMonitorStreamImg(useDvrPoll, state.monitorSessionId);
+      hideMonitorOverlays();
+    } else if (streamLive && state.monitorSuggestPickMode) {
+      clearMonitorFramePoll();
+      hideMonitorOverlays();
+      const img = document.getElementById("sa-monitor-video");
+      if (img && state._monitorFrozenSrc && !img.getAttribute("src")) {
+        img.src = state._monitorFrozenSrc;
+      }
+    }
+    bindWatchControls(main);
+    syncMonitorSuggestUi();
+    if (state.monitorSuggestPickMode) syncMonitorHitCanvas();
 
     bindEventTrackerClicks(main);
 
@@ -2694,6 +3331,45 @@
                 <span>Opens/closes: ${gt2.gate_opens || 0} / ${gt2.gate_closes || 0}</span>`;
             }
           }
+          const jLive = st.journey_live || [];
+          state._monitorJourneyLive = jLive;
+          syncMonitorHitCanvas();
+          let jPanel = document.querySelector(".sa-journey-live");
+          if (jLive.length) {
+            const html = `<h3>Journeys on this camera</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Click <strong>Watch</strong> to send hops to Alerts.</p>
+            <div class="sa-journey-badges">${jLive
+              .map((j) => {
+                const gid = j.gid || "";
+                const label = j.label || "unknown";
+                const hops = j.hop_summary || "";
+                const watched = !!j.watched;
+                return `<div class="sa-journey-badge-wrap${watched ? " is-watched" : ""}">
+                  <button type="button" class="sa-journey-badge" data-gid="${escapeHtml(gid)}" title="${escapeHtml(hops)}">
+                    <strong>${escapeHtml(gid)}</strong>
+                    <span>${escapeHtml(label)}</span>
+                    ${hops ? `<span class="sa-muted sa-journey-hops">${escapeHtml(hops)}</span>` : ""}
+                  </button>
+                  <button type="button" class="btn ${watched ? "danger" : "primary"} sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">
+                    ${watched ? "Unwatch" : "Watch"}
+                  </button>
+                </div>`;
+              })
+              .join("")}</div>`;
+            if (!jPanel) {
+              const wrap = document.createElement("div");
+              wrap.className = "sa-journey-live sa-card";
+              wrap.innerHTML = html;
+              const gate = document.querySelector(".sa-gate-live");
+              (gate || document.querySelector(".sa-monitor-wrap"))?.after(wrap);
+              jPanel = wrap;
+            } else {
+              jPanel.innerHTML = html;
+            }
+            bindWatchControls(jPanel);
+          } else if (jPanel) {
+            jPanel.remove();
+          }
         } catch (_) {
           /* ignore */
         }
@@ -2701,9 +3377,200 @@
     }
   }
 
+  function formatJourneyTime(ts) {
+    if (!ts) return "—";
+    try {
+      return new Date(Number(ts) * 1000).toLocaleString();
+    } catch (_) {
+      return "—";
+    }
+  }
+
+  async function journeys() {
+    const kind = state._journeyKind || "";
+    const known = state._journeyKnown || "";
+    const minutes = state._journeyMinutes || "60";
+    let q = `/journeys?limit=60&active_minutes=${encodeURIComponent(minutes)}`;
+    if (kind) q += `&kind=${encodeURIComponent(kind)}`;
+    if (known) q += `&known=${encodeURIComponent(known)}`;
+    let data = { journeys: [] };
+    try {
+      data = await api(q);
+    } catch (_) {
+      data = { journeys: [] };
+    }
+    const list = data.journeys || [];
+    const focus = state._journeyFocus || "";
+    let detailHtml = "";
+    if (focus) {
+      try {
+        const detail = await api("/journeys/" + encodeURIComponent(focus));
+        const hops = detail.hops || [];
+        const timeline = detail.timeline || [];
+        detailHtml = `<div class="sa-card sa-journey-detail" style="margin-bottom:1rem;">
+          <div class="sa-row" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">
+            <h3>${escapeHtml(detail.gid || focus)} · ${escapeHtml(detail.label || "unknown")}</h3>
+            <div class="sa-row">
+              <button class="btn ${detail.watched ? "danger" : "primary"}" type="button" id="j-watch-toggle" data-watch-gid="${escapeHtml(detail.gid || focus)}" style="width:auto;">
+                ${detail.watched ? "Unwatch" : "Watch → Alerts"}
+              </button>
+              <button class="btn danger" type="button" id="j-remove-track" data-remove-gid="${escapeHtml(detail.gid || focus)}" style="width:auto;">Remove track</button>
+              <button class="btn secondary" type="button" id="j-clear-focus">Close</button>
+            </div>
+          </div>
+          <p class="sa-muted">${escapeHtml(detail.kind || "")}${detail.person_id ? " · face " + escapeHtml(detail.person_id) : ""}${detail.plate ? " · plate " + escapeHtml(detail.plate) : ""}${detail.watched ? " · <strong>watching</strong>" : ""}</p>
+          <p class="sa-journey-path"><strong>Path:</strong> ${escapeHtml(detail.hop_summary || "—")}</p>
+          <ol class="sa-journey-hops-list">
+            ${hops
+              .map(
+                (h) =>
+                  `<li><strong>${escapeHtml(h.camera_name || h.camera_id || "?")}</strong>
+                  <span class="sa-muted">${escapeHtml(formatJourneyTime(h.first_ts))} → ${escapeHtml(formatJourneyTime(h.last_ts))}</span>
+                  <span class="sa-badge">${escapeHtml(h.match_method || "")}</span></li>`
+              )
+              .join("") || "<li class='sa-muted'>No hops yet</li>"}
+          </ol>
+          <div class="sa-journey-timeline" style="max-height:220px;overflow:auto;">
+            ${(timeline || [])
+              .slice(0, 40)
+              .map(
+                (ev) =>
+                  `<div class="sa-journey-event">
+                    <span>${escapeHtml(ev.camera_name || ev.camera_id || "")}</span>
+                    <span class="sa-muted">${escapeHtml(formatJourneyTime(ev.ts))}</span>
+                    <span class="sa-badge">${escapeHtml(ev.match_method || "")}</span>
+                    ${ev.thumb_url ? `<img src="${escapeHtml(ev.thumb_url)}" alt="" class="sa-journey-thumb">` : ""}
+                  </div>`
+              )
+              .join("")}
+          </div>
+        </div>`;
+      } catch (_) {
+        detailHtml = `<p class="sa-muted">Could not load journey ${escapeHtml(focus)}</p>`;
+      }
+    }
+
+    const rows = list
+      .map((j) => {
+        const knownTag = j.person_id || j.plate ? "known" : "anon";
+        const watchTag = j.watched ? "watching" : "";
+        return `<tr class="${focus === j.gid ? "is-camera-highlight" : ""}" data-open-journey="${escapeHtml(j.gid || "")}">
+          <td><strong>${escapeHtml(j.gid || "")}</strong></td>
+          <td>${escapeHtml(j.label || "unknown")}</td>
+          <td>${escapeHtml(j.kind || "")}</td>
+          <td><span class="sa-badge">${knownTag}</span>${watchTag ? ` <span class="sa-badge sa-badge-watch">${watchTag}</span>` : ""}</td>
+          <td>${escapeHtml(j.last_camera_name || j.last_camera_id || "—")}</td>
+          <td class="sa-muted">${escapeHtml(j.hop_summary || "—")}</td>
+          <td class="sa-muted">${escapeHtml(formatJourneyTime(j.last_seen_at))}</td>
+          <td>
+            <button type="button" class="btn danger j-row-remove" data-remove-gid="${escapeHtml(j.gid || "")}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">Remove</button>
+          </td>
+        </tr>`;
+      })
+      .join("");
+
+    main.innerHTML = `
+      <div class="sa-h">
+        <div>
+          <h2>Journeys</h2>
+          <p>Same person or vehicle across cameras. Open a row, then <strong>Watch → Alerts</strong> to pin them — or <strong>Remove track</strong> to delete that journey entirely.</p>
+        </div>
+      </div>
+      ${detailHtml}
+      <div class="sa-row" style="margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;">
+        <label class="sa-muted">Window
+          <select class="text-input" id="j-minutes" style="max-width:120px;display:inline-block;">
+            <option value="15"${minutes === "15" ? " selected" : ""}>15 min</option>
+            <option value="60"${minutes === "60" ? " selected" : ""}>1 hour</option>
+            <option value="360"${minutes === "360" ? " selected" : ""}>6 hours</option>
+            <option value="1440"${minutes === "1440" ? " selected" : ""}>24 hours</option>
+          </select>
+        </label>
+        <label class="sa-muted">Kind
+          <select class="text-input" id="j-kind" style="max-width:140px;display:inline-block;">
+            <option value=""${!kind ? " selected" : ""}>All</option>
+            <option value="person"${kind === "person" ? " selected" : ""}>People</option>
+            <option value="vehicle"${kind === "vehicle" ? " selected" : ""}>Vehicles</option>
+          </select>
+        </label>
+        <label class="sa-muted">Identity
+          <select class="text-input" id="j-known" style="max-width:140px;display:inline-block;">
+            <option value=""${!known ? " selected" : ""}>All</option>
+            <option value="known"${known === "known" ? " selected" : ""}>Known</option>
+            <option value="anonymous"${known === "anonymous" ? " selected" : ""}>Anonymous</option>
+          </select>
+        </label>
+        <button class="btn secondary" type="button" id="j-refresh">Refresh</button>
+      </div>
+      <table class="sa-table" id="j-table">
+        <thead><tr><th>ID</th><th>Label</th><th>Kind</th><th>Type</th><th>Last camera</th><th>Path</th><th>Last seen</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" class="sa-muted">No journeys in this window. Enable Go live with face, vehicle, or gate rules.</td></tr>'}</tbody>
+      </table>`;
+
+    const refresh = () => {
+      state._journeyMinutes = document.getElementById("j-minutes")?.value || "60";
+      state._journeyKind = document.getElementById("j-kind")?.value || "";
+      state._journeyKnown = document.getElementById("j-known")?.value || "";
+      journeys();
+    };
+    document.getElementById("j-refresh")?.addEventListener("click", refresh);
+    document.getElementById("j-minutes")?.addEventListener("change", refresh);
+    document.getElementById("j-kind")?.addEventListener("change", refresh);
+    document.getElementById("j-known")?.addEventListener("change", refresh);
+    document.getElementById("j-clear-focus")?.addEventListener("click", () => {
+      state._journeyFocus = "";
+      journeys();
+    });
+    document.getElementById("j-watch-toggle")?.addEventListener("click", () => {
+      const b = document.getElementById("j-watch-toggle");
+      const gid = b?.getAttribute("data-watch-gid");
+      const watched = (b?.textContent || "").includes("Unwatch");
+      toggleWatchGid(gid, watched);
+    });
+
+    async function removeJourneyTrack(gid) {
+      if (!gid) return;
+      if (!confirm("Remove track " + gid + "? This deletes the journey and stops watching. Alerts already created stay in the inbox.")) {
+        return;
+      }
+      try {
+        await api("/journeys/" + encodeURIComponent(gid), { method: "DELETE" });
+        if (state._journeyFocus === gid) state._journeyFocus = "";
+        if (state._samSelection?.gid === gid) state._samSelection = null;
+        journeys();
+      } catch (e) {
+        alert(e.message || "Could not remove track");
+      }
+    }
+
+    document.getElementById("j-remove-track")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const gid = document.getElementById("j-remove-track")?.getAttribute("data-remove-gid");
+      removeJourneyTrack(gid);
+    });
+    main.querySelectorAll(".j-row-remove").forEach((b) => {
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        removeJourneyTrack(b.getAttribute("data-remove-gid"));
+      };
+    });
+
+    main.querySelectorAll("[data-open-journey]").forEach((row) => {
+      row.style.cursor = "pointer";
+      row.onclick = () => {
+        state._journeyFocus = row.getAttribute("data-open-journey");
+        journeys();
+      };
+    });
+  }
+
   async function alerts() {
     const data = await api("/alerts?limit=80");
     state.alerts = data.alerts || [];
+    // #region agent log
+    const jw = (state.alerts || []).filter((a) => (a.scan_type || "") === "journey_watch" || (a.type || "").startsWith("journey"));
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'D',location:'site-admin.js:alerts',message:'journey_watch alert thumbs',data:{total:state.alerts.length,journeyCount:jw.length,samples:jw.slice(0,5).map(a=>({id:a.id,gid:a.gid,type:a.type,scan_type:a.scan_type,thumb_len:(a.thumb_url||'').length,thumb:(a.thumb_url||'').slice(0,60)}))},timestamp:Date.now(),runId:'post-fix'})}).catch(()=>{});
+    // #endregion
     const items = state.alerts
       .map((a) => {
         const t = a.created_at ? new Date(a.created_at * 1000).toLocaleString() : "";
@@ -2720,6 +3587,7 @@
               ${!a.acked ? `<button class="btn secondary" data-ack="${a.id}" type="button">Ack</button>` : ""}
               ${isAdmin() ? `<button class="btn secondary" data-mute="${a.id}" type="button">Mute 1h</button>` : ""}
               <button class="btn secondary" data-wa="${a.id}" type="button">WhatsApp</button>
+              ${isAdmin() ? `<button class="btn secondary" data-email="${a.id}" type="button">Email</button>` : ""}
               <button class="btn danger" data-del-alert="${a.id}" type="button">Remove</button>
             </div>
           </div>
@@ -2730,7 +3598,7 @@
       <div class="sa-h">
         <div>
           <h2>Alerts</h2>
-          <p>Inbox for rule matches. Select several and Remove selected, or remove one at a time.</p>
+          <p>Inbox for rule matches. Select several to Email or Remove, or act on one at a time.</p>
         </div>
         <div class="sa-alert-actions sa-row">
           <button class="btn secondary" type="button" id="a-refresh">Refresh</button>
@@ -2738,6 +3606,11 @@
             state.alerts.length
               ? `<button class="btn secondary" type="button" id="a-select-all">Select all</button>
                  <button class="btn secondary" type="button" id="a-clear-sel">Clear</button>
+                 ${
+                   isAdmin()
+                     ? `<button class="btn secondary" type="button" id="a-email-sel" disabled>Email selected</button>`
+                     : ""
+                 }
                  <button class="btn danger" type="button" id="a-remove-sel" disabled>Remove selected</button>`
               : ""
           }
@@ -2749,8 +3622,11 @@
       return Array.from(main.querySelectorAll(".sa-alert-cb:checked")).map((cb) => cb.value);
     }
     function syncBulkBtn() {
-      const btn = document.getElementById("a-remove-sel");
-      if (btn) btn.disabled = selectedIds().length === 0;
+      const n = selectedIds().length;
+      const removeBtn = document.getElementById("a-remove-sel");
+      const emailBtn = document.getElementById("a-email-sel");
+      if (removeBtn) removeBtn.disabled = n === 0;
+      if (emailBtn) emailBtn.disabled = n === 0;
     }
 
     document.getElementById("a-refresh").onclick = () => alerts();
@@ -2765,6 +3641,27 @@
         cb.checked = false;
       });
       syncBulkBtn();
+    });
+    document.getElementById("a-email-sel")?.addEventListener("click", async () => {
+      const ids = selectedIds();
+      if (!ids.length) return;
+      if (ids.length > 1 && !confirm("Email " + ids.length + " alerts to site recipients?")) return;
+      try {
+        const r = await api("/alerts/share-email", { method: "POST", json: { ids } });
+        if (!r.configured) {
+          alert("SMTP not configured — set PASSWORD_EMAIL / EMAIL_FROM in .env, then recreate the app container.");
+          return;
+        }
+        alert(
+          "Emailed " +
+            (r.sent || 0) +
+            " of " +
+            ids.length +
+            (r.failed ? " (" + r.failed + " failed — check Settings alert emails)" : "")
+        );
+      } catch (e) {
+        alert(e.message || "Email failed");
+      }
     });
     document.getElementById("a-remove-sel")?.addEventListener("click", async () => {
       const ids = selectedIds();
@@ -2807,6 +3704,28 @@
       b.onclick = async () => {
         const r = await api("/alerts/" + b.getAttribute("data-wa") + "/share-whatsapp", { method: "POST", json: {} });
         alert(r.configured ? JSON.stringify(r.results) : "WhatsApp API not configured. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.");
+      };
+    });
+    main.querySelectorAll("[data-email]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          const r = await api("/alerts/" + b.getAttribute("data-email") + "/share-email", {
+            method: "POST",
+            json: {},
+          });
+          if (!r.configured) {
+            alert("SMTP not configured — set PASSWORD_EMAIL / EMAIL_FROM in .env, then recreate the app container.");
+            return;
+          }
+          const ok = r.ok || (r.results || []).some((x) => x.ok);
+          alert(
+            ok
+              ? "Email sent to site recipients."
+              : "Email failed — " + ((r.results || [])[0]?.reason || "check Settings alert emails")
+          );
+        } catch (e) {
+          alert(e.message || "Email failed");
+        }
       };
     });
     main.querySelectorAll("[data-del-alert]").forEach((b) => {
@@ -2953,6 +3872,7 @@
   function settings() {
     const s = state.status?.site || {};
     const nums = (s.whatsapp_numbers || []).join(", ");
+    const emails = (s.alert_emails || []).join(", ");
     main.innerHTML = `
       <div class="sa-h"><div><h2>Settings</h2><p>Roles, quiet hours, and recipients. Viewer can only open Alerts and Reports.</p></div></div>
       <div class="sa-form">
@@ -2963,11 +3883,27 @@
           </select>
         </div>
         <div class="sa-field"><label>Admin PIN (optional)</label><input class="text-input" id="s-pin" type="password" placeholder="Leave blank for open admin" value="${escapeHtml(s.admin_pin)}"></div>
+        <div class="sa-field"><label>Contact name</label><input class="text-input" id="s-contact-name" placeholder="Primary contact" value="${escapeHtml(s.contact_name || "")}"></div>
+        <div class="sa-field">
+          <label>Contact email</label>
+          <input class="text-input" id="s-contact-email" type="email" placeholder="you@example.com" value="${escapeHtml(s.contact_email || "")}">
+          <p class="sa-muted sa-field-hint">Primary address for alerts and further communication (kept first in the list below).</p>
+        </div>
         <div class="sa-field"><label>Quiet hours start</label><input class="text-input" id="s-qh1" placeholder="22:00" value="${escapeHtml(s.quiet_hours_start)}"></div>
         <div class="sa-field"><label>Quiet hours end</label><input class="text-input" id="s-qh2" placeholder="07:00" value="${escapeHtml(s.quiet_hours_end)}"></div>
         <div class="sa-field"><label>WhatsApp numbers (comma separated, country code)</label><input class="text-input" id="s-wa" value="${escapeHtml(nums)}"></div>
+        <div class="sa-field">
+          <label>Alert emails (comma separated)</label>
+          <input class="text-input" id="s-email" value="${escapeHtml(emails)}" placeholder="ops@example.com, owner@example.com">
+          <p class="sa-muted sa-field-hint">${
+            state.status?.email_configured
+              ? "SMTP ready (PASSWORD_EMAIL / EMAIL_FROM from .env). Extra addresses allowed; contact email stays primary."
+              : "SMTP not configured — set SMTP_SERVER, USERNAME_EMAIL, PASSWORD_EMAIL, EMAIL_FROM in .env, then recreate the app container."
+          }</p>
+        </div>
         <button class="btn primary" type="button" id="s-save"${isAdmin() ? "" : " disabled"}>Save settings</button>
         <button class="btn secondary" type="button" id="s-test"${isAdmin() ? "" : " disabled"}>Send WhatsApp test</button>
+        <button class="btn secondary" type="button" id="s-test-email"${isAdmin() ? "" : " disabled"}>Send email test</button>
         <span id="s-msg" class="sa-muted"></span>
       </div>`;
     document.getElementById("s-role").onchange = async (e) => {
@@ -2977,27 +3913,53 @@
       e.target.value = state.role;
     };
     document.getElementById("s-save").onclick = async () => {
+      const contactEmail = (document.getElementById("s-contact-email")?.value || "").trim();
+      if (contactEmail && !contactEmail.includes("@")) {
+        document.getElementById("s-msg").textContent = "Enter a valid contact email.";
+        return;
+      }
       const numbers = document
         .getElementById("s-wa")
+        .value.split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const alertEmails = document
+        .getElementById("s-email")
         .value.split(",")
         .map((x) => x.trim())
         .filter(Boolean);
       await api("/site", {
         json: {
           admin_pin: document.getElementById("s-pin").value,
+          contact_name: (document.getElementById("s-contact-name")?.value || "").trim(),
+          contact_email: contactEmail,
           quiet_hours_start: document.getElementById("s-qh1").value,
           quiet_hours_end: document.getElementById("s-qh2").value,
           whatsapp_numbers: numbers,
+          alert_emails: alertEmails,
         },
       });
       await refresh();
       document.getElementById("s-msg").textContent = "Saved";
+      settings();
     };
     document.getElementById("s-test").onclick = async () => {
       const r = await api("/whatsapp/test", { method: "POST", json: { message: "Site Admin test" } });
       document.getElementById("s-msg").textContent = r.configured
-        ? "Sent (check phone)"
-        : "API not configured — set env vars";
+        ? "WhatsApp sent (check phone)"
+        : "WhatsApp API not configured — set env vars";
+    };
+    document.getElementById("s-test-email").onclick = async () => {
+      const r = await api("/email/test", {
+        method: "POST",
+        json: { message: "Site Admin email test", subject: "Camera Intelligence test" },
+      });
+      const ok = (r.results || []).some((x) => x.ok);
+      document.getElementById("s-msg").textContent = !r.configured
+        ? "SMTP not configured — set PASSWORD_EMAIL in .env"
+        : ok
+          ? "Email sent (check inbox)"
+          : "Email failed — " + ((r.results || [])[0]?.reason || "unknown");
     };
   }
 

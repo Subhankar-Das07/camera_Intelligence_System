@@ -7,13 +7,14 @@ import io
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from core import email_adapter
 from core import site_admin_common as common
 from core import site_admin_monitor
 from core import site_admin_runtime
@@ -40,7 +41,10 @@ class SitePatch(BaseModel):
     setup_complete: Optional[bool] = None
     wizard_step: Optional[int] = None
     admin_pin: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
     whatsapp_numbers: Optional[List[str]] = None
+    alert_emails: Optional[List[str]] = None
     go_live: Optional[bool] = None
 
 
@@ -67,6 +71,7 @@ class RuleIn(BaseModel):
     scan_type: str = "intrusion"
     roi_normalized: List[List[float]] = Field(default_factory=list)
     gate_config: Dict[str, Any] = Field(default_factory=dict)
+    pose_trigger: Optional[Dict[str, Any]] = None
     schedule: str = "always"
     severity: str = "high"
     channels: List[str] = Field(default_factory=lambda: ["web"])
@@ -111,10 +116,40 @@ class WhatsAppTestIn(BaseModel):
     message: str = "Camera Intelligence test alert"
 
 
+class EmailTestIn(BaseModel):
+    email: str = ""
+    message: str = "Camera Intelligence test alert"
+    subject: str = "Camera Intelligence test"
+
+
 class SuggestRoiIn(BaseModel):
     max_regions: int = 36
     conf: float = 0.25
     min_area: float = 0.0015
+
+
+class MonitorSamSelectIn(BaseModel):
+    """Normalized click on the live monitor frame → FastSAM select + Watch."""
+
+    session_id: str
+    nx: float = Field(ge=0.0, le=1.0)
+    ny: float = Field(ge=0.0, le=1.0)
+    watch: bool = True
+
+
+class MonitorSuggestRegionsIn(BaseModel):
+    session_id: str
+    max_regions: int = 36
+    conf: float = 0.25
+    min_area: float = 0.0015
+
+
+class MonitorSuggestWatchIn(BaseModel):
+    """Pick a Suggest-regions polygon on live Monitor → journey + Watch."""
+
+    session_id: str
+    polygon: List[List[float]] = Field(default_factory=list)
+    watch: bool = True
 
 
 class KnownFaceIn(BaseModel):
@@ -237,6 +272,7 @@ def status():
         "alerts": len(store.list_alerts(50)),
         "go_live": bool(site.get("go_live")),
         "whatsapp_configured": whatsapp_adapter.configured(),
+        "email_configured": email_adapter.configured(),
         "scan_types": common.available_scan_types(),
         "scan_catalog": common.SCAN_CATALOG,
         "monitor": site_admin_monitor.get_monitor_status(),
@@ -254,13 +290,31 @@ def get_site():
 def put_site(body: SitePatch, x_cis_role: Optional[str] = Header(default="admin")):
     _require_admin(x_cis_role)
     current = store.get_site()
+    prev_email = str(current.get("contact_email") or "").strip().lower()
     patch = body.model_dump(exclude_none=True)
     current.update(patch)
+    if "contact_email" in patch:
+        current["contact_email"] = str(patch.get("contact_email") or "").strip()
+    if "contact_name" in patch:
+        current["contact_name"] = str(patch.get("contact_name") or "").strip()
     saved = store.save_site(current)
     if saved.get("go_live"):
         site_admin_runtime.start_runtime()
     else:
         site_admin_monitor.clear_preview_cache()
+
+    new_email = str(saved.get("contact_email") or "").strip()
+    if new_email and "@" in new_email and email_adapter.configured():
+        # Welcome / confirm when contact email is set or changed (do not fail save).
+        if new_email.lower() != prev_email:
+            try:
+                email_adapter.send_profile_welcome(
+                    to_email=new_email,
+                    contact_name=str(saved.get("contact_name") or "").strip(),
+                    site_name=str(saved.get("name") or "").strip() or "your site",
+                )
+            except Exception:
+                pass
     return saved
 
 
@@ -517,6 +571,15 @@ def rules():
     return {"rules": store.list_rules()}
 
 
+def _rule_payload_from_body(body: RuleIn) -> Dict[str, Any]:
+    data = body.model_dump()
+    if body.scan_type in ("intrusion", "danger_zone"):
+        data["pose_trigger"] = common.normalize_pose_trigger(body.scan_type, body.pose_trigger)
+    else:
+        data.pop("pose_trigger", None)
+    return data
+
+
 @router.post("/rules")
 def create_rule(body: RuleIn, x_cis_role: Optional[str] = Header(default="admin")):
     _require_admin(x_cis_role)
@@ -534,7 +597,7 @@ def create_rule(body: RuleIn, x_cis_role: Optional[str] = Header(default="admin"
             status_code=400,
             detail=f"Max {common.MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.",
         )
-    return store.save_rule(body.model_dump())
+    return store.save_rule(_rule_payload_from_body(body))
 
 
 @router.put("/rules/{rule_id}")
@@ -555,7 +618,7 @@ def update_rule(rule_id: str, body: RuleIn, x_cis_role: Optional[str] = Header(d
             status_code=400,
             detail=f"Max {common.MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.",
         )
-    data = body.model_dump()
+    data = _rule_payload_from_body(body)
     data["id"] = rule_id
     data["created_at"] = existing.get("created_at")
     return store.save_rule(data)
@@ -661,6 +724,57 @@ def share_whatsapp(alert_id: str):
         body += f"\n{found['clip_url']}"
     results = whatsapp_adapter.notify_numbers(site.get("whatsapp_numbers") or [], body)
     return {"results": results, "configured": whatsapp_adapter.configured()}
+
+
+def _share_alert_email(alert: Dict[str, Any]) -> Dict[str, Any]:
+    site = store.get_site()
+    results = email_adapter.notify_alert_emails(
+        site.get("alert_emails") or [],
+        alert,
+        site_name=str(site.get("name") or "").strip(),
+    )
+    return {
+        "alert_id": alert.get("id"),
+        "results": results,
+        "ok": any(r.get("ok") for r in results),
+    }
+
+
+@router.post("/alerts/{alert_id}/share-email")
+def share_email(alert_id: str, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    alerts = store.list_alerts(200)
+    found = next((a for a in alerts if a.get("id") == alert_id), None)
+    if not found:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    payload = _share_alert_email(found)
+    return {
+        "configured": email_adapter.configured(),
+        "results": payload["results"],
+        "ok": payload["ok"],
+    }
+
+
+@router.post("/alerts/share-email")
+def share_email_batch(body: AlertDeleteIn, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    ids = [i for i in (body.ids or []) if i]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No alert ids provided")
+    by_id = {a.get("id"): a for a in store.list_alerts(200)}
+    items: List[Dict[str, Any]] = []
+    for aid in ids:
+        found = by_id.get(aid)
+        if not found:
+            items.append({"alert_id": aid, "ok": False, "results": [], "reason": "not_found"})
+            continue
+        items.append(_share_alert_email(found))
+    return {
+        "configured": email_adapter.configured(),
+        "items": items,
+        "sent": sum(1 for x in items if x.get("ok")),
+        "failed": sum(1 for x in items if not x.get("ok")),
+    }
 
 
 @router.get("/reports")
@@ -888,6 +1002,93 @@ def remove_known_vehicle(vehicle_id: str, x_cis_role: Optional[str] = Header(def
     return {"ok": True}
 
 
+@router.get("/journeys")
+def list_journeys(
+    limit: int = 50,
+    active_minutes: float = 60.0,
+    kind: str = "",
+    known: Optional[str] = None,
+):
+    """List recent cross-camera journeys (people / vehicles)."""
+    from core import journey_store
+
+    known_only = False
+    anonymous_only = False
+    if known in ("1", "true", "yes", "known"):
+        known_only = True
+    elif known in ("0", "false", "anonymous", "anon"):
+        anonymous_only = True
+    items = journey_store.list_journeys(
+        limit=max(1, min(200, limit)),
+        active_minutes=max(1.0, min(24 * 60.0, active_minutes)),
+        kind=(kind or "").strip(),
+        known_only=known_only,
+        anonymous_only=anonymous_only,
+    )
+    return {"journeys": items, "count": len(items)}
+
+
+@router.get("/journeys/{gid}")
+def get_journey(gid: str):
+    from core import journey_store
+
+    detail = journey_store.get_journey(gid)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Journey not found")
+    return detail
+
+
+class JourneyWatchIn(BaseModel):
+    watched: bool = True
+
+
+@router.get("/journeys-watched")
+def journeys_watched(limit: int = 50):
+    from core import journey_store
+
+    items = journey_store.list_watched(limit=max(1, min(200, limit)))
+    return {"journeys": items, "count": len(items)}
+
+
+@router.post("/journeys/{gid}/watch")
+def watch_journey(gid: str, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    from core import journey_store
+
+    meta = journey_store.watch_journey(gid)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Journey not found")
+    return {"ok": True, "watched": True, "journey": meta}
+
+
+@router.delete("/journeys/{gid}/watch")
+def unwatch_journey(gid: str, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    from core import journey_store
+
+    ok = journey_store.unwatch_journey(gid)
+    if not ok:
+        # Still 200 if already unwatched
+        pass
+    return {"ok": True, "watched": False, "gid": gid}
+
+
+@router.delete("/journeys/{gid}")
+def delete_journey(gid: str, x_cis_role: Optional[str] = Header(default="admin")):
+    """Remove a journey track entirely (Unwatch + purge Redis journey data)."""
+    _require_admin(x_cis_role)
+    from core import journey_store
+
+    ok = journey_store.delete_journey(gid)
+    try:
+        site_admin_monitor.clear_selection_for_gid(gid)
+    except Exception:
+        pass
+    if not ok:
+        raise HTTPException(status_code=404, detail="Journey not found")
+    return {"ok": True, "deleted": True, "gid": gid}
+
+
 @router.post("/whatsapp/test")
 def whatsapp_test(body: WhatsAppTestIn, x_cis_role: Optional[str] = Header(default="admin")):
     _require_admin(x_cis_role)
@@ -898,9 +1099,300 @@ def whatsapp_test(body: WhatsAppTestIn, x_cis_role: Optional[str] = Header(defau
     }
 
 
+@router.post("/email/test")
+def email_test(body: EmailTestIn, x_cis_role: Optional[str] = Header(default="admin")):
+    _require_admin(x_cis_role)
+    emails = [body.email] if body.email.strip() else store.get_site().get("alert_emails") or []
+    return {
+        "configured": email_adapter.configured(),
+        "results": email_adapter.notify_emails(emails, body.subject, body.message),
+    }
+
+
 @router.get("/monitor/status")
 def monitor_status():
     return site_admin_monitor.get_monitor_status()
+
+
+def _monitor_camera_context() -> Tuple[str, str]:
+    status = site_admin_monitor.get_monitor_status()
+    camera_id = status.get("camera_id") or ""
+    camera_name = status.get("camera_name") or camera_id
+    cam = store.get_camera(camera_id) if camera_id else None
+    if cam:
+        camera_name = cam.get("name") or camera_name
+    return camera_id, camera_name
+
+
+def _monitor_watch_from_segment(
+    session_id: str,
+    frame,
+    seg: Dict[str, Any],
+    *,
+    watch: bool = True,
+    method: str = "person_track",
+    local_track_id: Any = None,
+    label: str = "person",
+) -> Dict[str, Any]:
+    """Shared journey + Watch path for person track / suggest pick."""
+    xyxy = seg.get("xyxy") or []
+    if len(xyxy) != 4:
+        raise HTTPException(status_code=400, detail="Invalid person bbox")
+
+    from core import journey_store
+    from core.person_reid import crop_from_xyxy, embed_person_crop
+
+    camera_id, camera_name = _monitor_camera_context()
+    tid = local_track_id if local_track_id is not None else seg.get("track_id")
+    crop = crop_from_xyxy(frame, (int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])))
+    thumb_url = ""
+    if crop is not None:
+        thumb_url = common._save_frame_thumb(crop, f"person_{int(time.time() * 1000)}", common.ALERTS_DIR)
+
+    emb = embed_person_crop(crop) if crop is not None else None
+    # #region agent log
+    try:
+        import json as _json
+        _line = _json.dumps({"sessionId": "46c418", "hypothesisId": "C", "location": "site_admin_api.py:_monitor_watch_from_segment", "message": "thumb before upsert", "data": {"has_crop": crop is not None, "thumb_url": (thumb_url or "")[:80], "thumb_len": len(thumb_url or ""), "method": method, "track_id": tid}, "timestamp": int(time.time() * 1000)}) + "\n"
+        for _p in ("/app/static/debug-46c418.log", "static/debug-46c418.log", "debug-46c418.log"):
+            try:
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(_line)
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # #endregion
+    jmeta = journey_store.upsert_sam_selection(
+        embedding=emb,
+        camera_id=camera_id,
+        camera_name=camera_name,
+        bbox=[float(x) for x in xyxy],
+        thumb_url=thumb_url,
+        label=label or "person",
+        local_track_id=tid,
+    )
+
+    gid = jmeta.get("gid") or ""
+    watched = False
+    if watch and gid:
+        watched_meta = journey_store.watch_journey(gid)
+        if watched_meta:
+            jmeta = watched_meta
+            watched = True
+
+    detail = journey_store.get_journey(gid) if gid else None
+    poly = seg.get("polygon") or []
+    if len(poly) < 3 and len(xyxy) == 4:
+        # rectangle polygon from bbox
+        x0, y0, x1, y1 = [float(v) for v in xyxy]
+        h, w = frame.shape[:2]
+        poly = [
+            [x0 / w, y0 / h],
+            [x1 / w, y0 / h],
+            [x1 / w, y1 / h],
+            [x0 / w, y1 / h],
+        ]
+    bn = seg.get("bbox_norm") or []
+    if len(bn) != 4:
+        h, w = frame.shape[:2]
+        bn = [xyxy[0] / w, xyxy[1] / h, xyxy[2] / w, xyxy[3] / h]
+
+    site_admin_monitor.set_sam_selection(
+        session_id,
+        {
+            "gid": gid,
+            "polygon": poly,
+            "bbox_norm": bn,
+            "label": jmeta.get("label") or label or "person",
+            "watched": watched,
+            "local_track_id": tid,
+            "ts": time.time(),
+        },
+        {
+            "gid": gid,
+            "label": jmeta.get("label") or label or "person",
+            "bbox_norm": bn,
+            "watched": watched,
+            "match_method": method,
+            "local_track_id": tid,
+            "hop_summary": (detail or {}).get("hop_summary") or "",
+        },
+    )
+
+    return {
+        "ok": True,
+        "gid": gid,
+        "watched": watched,
+        "local_track_id": tid,
+        "journey": jmeta,
+        "segment": {
+            "polygon": poly,
+            "bbox_norm": bn,
+            "area": seg.get("area"),
+            "method": seg.get("method") or method,
+            "track_id": tid,
+        },
+        "thumb_url": thumb_url,
+        "message": (
+            f"Tracking {gid} (person) — watching; hops go to Alerts"
+            if watched
+            else f"Selected person {gid}"
+        ),
+    }
+
+
+@router.post("/monitor/suggest-regions")
+def monitor_suggest_regions(
+    body: MonitorSuggestRegionsIn,
+    x_cis_role: Optional[str] = Header(default="admin"),
+):
+    """YOLO person boxes on the current live Monitor frame (select a person to track)."""
+    _require_admin(x_cis_role)
+    if not site_admin_monitor.session_exists(body.session_id):
+        raise HTTPException(status_code=404, detail="Monitor session not found")
+    frame = site_admin_monitor.get_session_raw_frame(body.session_id)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="No frame available — wait for the stream")
+    try:
+        from core import site_admin_person_track as ptrack
+
+        regions, w, h = ptrack.suggest_person_regions(
+            frame,
+            max_regions=max(1, min(80, int(body.max_regions))),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Person detect failed: {e}") from e
+    return {
+        "ok": True,
+        "session_id": body.session_id,
+        "width": w,
+        "height": h,
+        "regions": regions,
+        "count": len(regions),
+        "mode": "person",
+    }
+
+
+@router.post("/monitor/suggest-watch")
+def monitor_suggest_watch(
+    body: MonitorSuggestWatchIn,
+    x_cis_role: Optional[str] = Header(default="admin"),
+):
+    """Click a suggested person on Monitor → ByteTrack id + journey + Watch → Alerts."""
+    _require_admin(x_cis_role)
+    if not site_admin_monitor.session_exists(body.session_id):
+        raise HTTPException(status_code=404, detail="Monitor session not found")
+    poly = body.polygon or []
+    if len(poly) < 3:
+        raise HTTPException(status_code=400, detail="Polygon needs at least 3 points")
+    frame = site_admin_monitor.get_session_raw_frame(body.session_id)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="No frame available — wait for the stream")
+
+    h, w = frame.shape[:2]
+    import numpy as np
+
+    pts = np.array(
+        [
+            [float(p[0]) * w, float(p[1]) * h]
+            for p in poly
+            if isinstance(p, (list, tuple)) and len(p) >= 2
+        ],
+        dtype=np.float32,
+    )
+    if len(pts) < 3:
+        raise HTTPException(status_code=400, detail="Invalid polygon")
+    xs, ys = pts[:, 0], pts[:, 1]
+    x0, y0 = int(xs.min()), int(ys.min())
+    x1, y1 = int(xs.max()), int(ys.max())
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(status_code=400, detail="Degenerate region")
+
+    from core import site_admin_person_track as ptrack
+
+    matched = ptrack.match_track_to_xyxy(frame, [x0, y0, x1, y1])
+    if matched:
+        seg = dict(matched)
+        seg["method"] = "person_suggest"
+        tid = matched.get("track_id")
+    else:
+        area = abs(float(cv2.contourArea(pts.reshape(-1, 1, 2)))) / float(max(1, w * h))
+        seg = {
+            "polygon": [[round(float(p[0]), 5), round(float(p[1]), 5)] for p in poly],
+            "bbox_norm": [
+                round(x0 / w, 5),
+                round(y0 / h, 5),
+                round(x1 / w, 5),
+                round(y1 / h, 5),
+            ],
+            "xyxy": [x0, y0, x1, y1],
+            "area": round(area, 5),
+            "method": "person_suggest",
+            "track_id": None,
+        }
+        tid = None
+
+    return _monitor_watch_from_segment(
+        body.session_id,
+        frame,
+        seg,
+        watch=bool(body.watch),
+        method="person_track",
+        local_track_id=tid,
+        label="person",
+    )
+
+
+@router.post("/monitor/sam-select")
+def monitor_sam_select(body: MonitorSamSelectIn, x_cis_role: Optional[str] = Header(default="admin")):
+    """
+    Click on live Monitor: YOLO person under (nx, ny) + ByteTrack id,
+    creates/matches a journey via Re-ID, and optionally pins Watch → Alerts.
+    """
+    _require_admin(x_cis_role)
+    if not site_admin_monitor.session_exists(body.session_id):
+        raise HTTPException(status_code=404, detail="Monitor session not found")
+    frame = site_admin_monitor.get_session_raw_frame(body.session_id)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="No frame available — wait for the stream")
+
+    try:
+        from core import site_admin_person_track as ptrack
+
+        seg = ptrack.person_at_point(frame, body.nx, body.ny)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Person select failed: {e}") from e
+    if not seg:
+        raise HTTPException(status_code=400, detail="No person found at that click — try Suggest people")
+
+    return _monitor_watch_from_segment(
+        body.session_id,
+        frame,
+        seg,
+        watch=bool(body.watch),
+        method="person_track",
+        local_track_id=seg.get("track_id"),
+        label="person",
+    )
+
+
+class MonitorClearSelectionIn(BaseModel):
+    session_id: str
+
+
+@router.post("/monitor/clear-selection")
+def monitor_clear_selection(
+    body: MonitorClearSelectionIn,
+    x_cis_role: Optional[str] = Header(default="admin"),
+):
+    """Clear FastSAM / suggest overlay on the live monitor (does not stop session or Unwatch)."""
+    _require_admin(x_cis_role)
+    if not site_admin_monitor.session_exists(body.session_id):
+        raise HTTPException(status_code=404, detail="Monitor session not found")
+    site_admin_monitor.clear_sam_selection(body.session_id)
+    return {"ok": True, "session_id": body.session_id}
 
 
 @router.post("/monitor/upload-temp")

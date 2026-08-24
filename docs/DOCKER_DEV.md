@@ -69,6 +69,20 @@ After changing env vars, run `docker-quick.bat` (or `docker compose up -d --forc
 
 Check logs: `docker-logs.bat` — look for `spawned scan worker for camera` and `camera worker started`.
 
+## Email alerts (SMTP)
+
+Copy [`.env.example`](../.env.example) to `.env` and set the same SMTP vars used by Zerodha Kite (`PASSWORD_EMAIL` = Gmail app password). Compose passes them into the `app` container.
+
+| Variable | Meaning |
+|----------|---------|
+| `SMTP_SERVER` | Default `smtp.gmail.com` |
+| `SMTP_PORT` | Default `465` (SSL) |
+| `USERNAME_EMAIL` | SMTP login |
+| `PASSWORD_EMAIL` | App password |
+| `EMAIL_FROM` | From address |
+
+Then: Settings → Alert emails → Save → **Send email test**. Enable **Email** on a rule’s Channels. After changing `.env`, recreate the app container so env is picked up (`docker compose up -d --force-recreate app`).
+
 ## Fall detection rule types
 
 | Rule | Use on |
@@ -93,3 +107,18 @@ Manual test (standing & lying on DVR): create the rule with an ROI over the floo
 - Go-live **Apply rules on preview** increments gate counters into Redis (same as workers/monitor); alerts stay off on preview to avoid spam.
 - Count accuracy depends on DVR snapshot poll interval (`SITE_ADMIN_TICK_*`); very fast crossings may be missed on slow polls.
 - Go-live workers evaluate up to 3 rules per camera in parallel (`SITE_ADMIN_SCAN_RULE_WORKERS=3`).
+
+## FastSAM (Suggest regions) and DVR snapshots
+
+- **Model weights offline:** Run **`download-weights.bat`** (or `docker-rebuild.bat`, which downloads automatically if `models\` is empty). Weights must exist on the **Windows host** before Docker build — the image does **not** download from GitHub during build.
+  ```powershell
+  download-weights.bat
+  docker-rebuild.bat
+  ```
+- **Suggest regions** uses **FastSAM-s.pt**. Optional runtime override: `SITE_ADMIN_FASTSAM_WEIGHTS=/app/FastSAM-s.pt`.
+- **Person Re-ID (journeys):** optional `models/osnet_x0_25.onnx`. If missing, OpenCV appearance fallback is used. Env: `JOURNEY_REID_ENABLED=1`, `JOURNEY_HANDOFF_SEC=120`, `JOURNEY_REID_THRESHOLD=0.62`, `SITE_ADMIN_REID_WEIGHTS=models/osnet_x0_25.onnx`.
+- **Emergency build without weights:** `SKIP_WEIGHT_DOWNLOAD=1` on the build arg/env lets the image build, but Suggest regions / some pipelines fail until weights exist.
+- **DVR snapshot timeouts** (`ConnectTimeout` to `192.168.x.x`) usually mean the NVR is overloaded (8 workers + preview + Rules refresh). Limit load:
+  - `SNAPSHOT_MAX_CONCURRENT_PER_HOST=2` (default) — max parallel `/picture` requests per DVR IP
+  - `SNAPSHOT_FETCH_TIMEOUT=15` — connect/read timeout seconds
+  - Slow polling: raise `SITE_ADMIN_TICK_MIN_SEC` to `1.5`–`2.0` in `docker-compose.yml`

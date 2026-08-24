@@ -169,6 +169,9 @@ def camera_worker_main(
                 elif not store.on_cooldown(rule_id):
                     if common.is_event_dict(event) or (isinstance(event, dict) and event.get("type")):
                         common.emit_site_alert(cam, hit_rule, event, frame=snap)
+                elif scan_type == "face_attendance" and isinstance(event, dict) and event.get("person_id"):
+                    # Still update journeys when alert cooldown suppresses inbox spam
+                    common.record_journey_from_hit(cam, hit_rule, event, frame=snap)
 
             now = time.time()
             store.set_runtime_worker_heartbeat(

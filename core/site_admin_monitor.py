@@ -748,6 +748,12 @@ def stop_monitor(session_id: str) -> None:
                 except Exception:
                     pass
             _cleanup_temp(session.get("temp_id"))
+    try:
+        from core import site_admin_person_track as ptrack
+
+        ptrack.reset_tracker()
+    except Exception:
+        pass
 
 
 def get_monitor_status() -> Dict[str, Any]:
@@ -772,6 +778,19 @@ def get_monitor_status() -> Dict[str, Any]:
         out.update(_playback_status(session))
         if session.get("gate_live"):
             out["gate_live"] = session.get("gate_live")
+        journey_live = session.get("journey_live")
+        if not journey_live:
+            try:
+                from core import journey_store
+
+                cam_id = session.get("camera_id") or ""
+                journey_live = journey_store.journeys_for_camera(cam_id, within_sec=90.0, limit=12)
+            except Exception:
+                journey_live = []
+        if journey_live:
+            out["journey_live"] = journey_live
+        if session.get("sam_selection"):
+            out["sam_selection"] = session.get("sam_selection")
         return out
 
 
@@ -974,20 +993,214 @@ def _process_frame(session: Dict[str, Any], frame: np.ndarray) -> np.ndarray:
     return out
 
 
+def _refresh_watched_person_tracks(session: Dict[str, Any], frame: np.ndarray) -> None:
+    """Update SAM/journey overlay bboxes from YOLO ByteTrack for pinned people."""
+    sel = session.get("sam_selection") or {}
+    tid = sel.get("local_track_id")
+    live = list(session.get("journey_live") or [])
+    need = tid is not None or any(j.get("local_track_id") is not None for j in live)
+    if not need or frame is None or getattr(frame, "size", 0) == 0:
+        return
+    now = time.time()
+    if now - float(session.get("_person_track_at") or 0) < 0.2:
+        return
+    session["_person_track_at"] = now
+    try:
+        from core import site_admin_person_track as ptrack
+        from core import journey_store
+
+        tracks = ptrack.track_persons(frame, persist=True)
+    except Exception:
+        return
+    by_id = {int(t["track_id"]): t for t in tracks if t.get("track_id") is not None}
+    cam_id = session.get("camera_id") or ""
+    last_meta_at = float(session.get("_person_track_meta_at") or 0)
+    write_meta = (now - last_meta_at) >= 1.0
+
+    def _apply(track: Dict[str, Any], item: Dict[str, Any]) -> None:
+        bn = track.get("bbox_norm") or []
+        if len(bn) == 4:
+            item["bbox_norm"] = bn
+        poly = track.get("polygon") or []
+        if len(poly) >= 3:
+            item["polygon"] = poly
+        xyxy = track.get("xyxy") or []
+        gid = item.get("gid") or ""
+        if write_meta and gid and len(xyxy) == 4:
+            try:
+                meta = journey_store.get_meta(gid)
+                if meta:
+                    meta["last_bbox"] = [float(x) for x in xyxy]
+                    meta["last_seen_at"] = now
+                    if cam_id:
+                        meta["last_camera_id"] = cam_id
+                        meta["last_camera_name"] = (session.get("camera") or {}).get("name") or cam_id
+                    journey_store._save_meta(meta)
+            except Exception:
+                pass
+
+    if tid is not None and int(tid) in by_id:
+        track = by_id[int(tid)]
+        sel = dict(sel)
+        _apply(track, sel)
+        sel["local_track_id"] = int(tid)
+        session["sam_selection"] = sel
+
+    new_live = []
+    for j in live:
+        jtid = j.get("local_track_id")
+        item = dict(j)
+        if jtid is not None and int(jtid) in by_id:
+            _apply(by_id[int(jtid)], item)
+            item["local_track_id"] = int(jtid)
+        if sel and (item.get("gid") or "") == (sel.get("gid") or "") and sel.get("bbox_norm"):
+            item["bbox_norm"] = sel["bbox_norm"]
+            if sel.get("local_track_id") is not None:
+                item["local_track_id"] = sel["local_track_id"]
+        new_live.append(item)
+    session["journey_live"] = new_live[:20]
+    if write_meta:
+        session["_person_track_meta_at"] = now
+
+
+def _process_frame_for_stream(session: Dict[str, Any], frame: np.ndarray) -> Tuple[np.ndarray, str]:
+    """
+    Live Monitor / DVR poll path: never block the HTTP response on face/vehicle.
+    Those share a singleton InsightFace/YOLO with go-live workers and can hang
+    forever under concurrent process_frame — matching go-live hero preview, we
+    only run light rules here and draw geometry for heavy ones.
+    """
+    _refresh_watched_person_tracks(session, frame)
+
+    rules: List[Dict[str, Any]] = list(session.get("rules") or [])
+    light_rules = [r for r in rules if (r.get("scan_type") or "") in PREVIEW_LIGHT_SCAN_TYPES]
+    heavy_rules = [r for r in rules if r not in light_rules]
+
+    if not light_rules:
+        out = frame.copy()
+        for rule in rules:
+            _draw_rule_geometry(out, rule, highlight=False)
+        session["frame_idx"] = int(session.get("frame_idx") or 0) + 1
+        return out, "geometry_only"
+
+    saved = session["rules"]
+    session["rules"] = light_rules
+    try:
+        out = _process_frame(session, frame)
+        for rule in heavy_rules:
+            _draw_rule_geometry(out, rule, highlight=False)
+        return out, "light_rules"
+    finally:
+        session["rules"] = saved
+
+
 def session_exists(session_id: str) -> bool:
     return session_id in _sessions
 
 
-def capture_frame_jpeg(session_id: str) -> Optional[bytes]:
-    """Single processed JPEG for DVR poll preview (and MJPEG fallback)."""
+def get_session_raw_frame(session_id: str) -> Optional[np.ndarray]:
+    """Latest raw (or freshly read) BGR frame for a live monitor session."""
     session = _sessions.get(session_id)
     if not session:
         return None
+    frame = session.get("last_raw_frame")
+    if frame is not None and getattr(frame, "size", 0) > 0:
+        return frame.copy()
+    ret, frame = _read_frame(session)
+    if ret and frame is not None:
+        session["last_raw_frame"] = frame
+        return frame.copy()
+    return None
+
+
+def set_sam_selection(session_id: str, selection: Dict[str, Any], journey_item: Dict[str, Any]) -> None:
+    """Store FastSAM click selection + enrich journey_live for Monitor overlay."""
+    with _lock:
+        sess = _sessions.get(session_id)
+        if sess is None:
+            return
+        sess["sam_selection"] = selection
+        live = list(sess.get("journey_live") or [])
+        gid = journey_item.get("gid") or ""
+        live = [x for x in live if (x.get("gid") or "") != gid]
+        live.insert(0, journey_item)
+        sess["journey_live"] = live[:20]
+
+
+def clear_sam_selection(session_id: str) -> bool:
+    """Clear FastSAM selection overlay on a live monitor session (does not unwatch)."""
+    with _lock:
+        sess = _sessions.get(session_id)
+        if sess is None:
+            return False
+        sess["sam_selection"] = None
+        return True
+
+
+def clear_selection_for_gid(gid: str) -> bool:
+    """If any live monitor session is highlighting this journey, clear it."""
+    if not gid:
+        return False
+    cleared = False
+    with _lock:
+        for sess in _sessions.values():
+            sel = sess.get("sam_selection") or {}
+            if (sel.get("gid") or "") == gid:
+                sess["sam_selection"] = None
+                cleared = True
+            live = list(sess.get("journey_live") or [])
+            filtered = [x for x in live if (x.get("gid") or "") != gid]
+            if len(filtered) != len(live):
+                sess["journey_live"] = filtered
+                cleared = True
+    return cleared
+
+
+def capture_frame_jpeg(session_id: str) -> Optional[bytes]:
+    """Single processed JPEG for DVR poll preview (and MJPEG fallback)."""
+    # #region agent log
+    def _agent_log(hyp, msg, data=None):
+        try:
+            import json as _json
+            import time as _time
+            line = _json.dumps({"sessionId": "46c418", "hypothesisId": hyp, "location": "site_admin_monitor.py:capture_frame_jpeg", "message": msg, "data": data or {}, "timestamp": int(_time.time() * 1000)}) + "\n"
+            for p in ("/app/static/debug-46c418.log", "static/debug-46c418.log", "debug-46c418.log"):
+                try:
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(line)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # #endregion
+    session = _sessions.get(session_id)
+    if not session:
+        # #region agent log
+        _agent_log("B", "capture_frame no session", {"session_id": session_id[:8] if session_id else ""})
+        # #endregion
+        return None
+    t0 = time.time()
+    # #region agent log
+    cam = session.get("camera") or {}
+    _agent_log("B", "capture_frame start", {"cam_type": cam.get("type"), "scan_types": session.get("scan_types"), "has_raw": session.get("last_raw_frame") is not None})
+    # #endregion
     ret, frame = _read_frame(session)
     if not ret or frame is None:
+        # #region agent log
+        _agent_log("B", "capture_frame read failed", {"elapsed_ms": int((time.time() - t0) * 1000)})
+        # #endregion
         return None
-    out = _process_frame(session, frame)
+    t1 = time.time()
+    # #region agent log
+    _agent_log("B", "capture_frame after read", {"read_ms": int((t1 - t0) * 1000), "shape": list(frame.shape) if frame is not None else None, "runId": "post-fix"})
+    # #endregion
+    out, mode = _process_frame_for_stream(session, frame)
+    t2 = time.time()
     ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    # #region agent log
+    _agent_log("B", "capture_frame done", {"read_ms": int((t1 - t0) * 1000), "process_ms": int((t2 - t1) * 1000), "ok": bool(ok), "jpeg_bytes": int(len(buf.tobytes()) if ok else 0), "shape": list(frame.shape) if frame is not None else None, "mode": mode, "runId": "post-fix"})
+    # #endregion
     return buf.tobytes() if ok else None
 
 
@@ -998,9 +1211,31 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
     stop_ev = _stop_events.get(session_id)
     os.makedirs(common.ALERTS_DIR, exist_ok=True)
 
+    # #region agent log
+    def _agent_log(hyp, msg, data=None):
+        try:
+            import json as _json
+            line = _json.dumps({"sessionId": "46c418", "hypothesisId": hyp, "location": "site_admin_monitor.py:mjpeg_generator", "message": msg, "data": data or {}, "timestamp": int(time.time() * 1000)}) + "\n"
+            for p in ("/app/static/debug-46c418.log", "static/debug-46c418.log", "debug-46c418.log"):
+                try:
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(line)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    cam = session.get("camera") or {}
+    _agent_log("A", "mjpeg start", {"cam_type": cam.get("type"), "has_last_jpeg": bool(session.get("last_jpeg")), "scan_types": session.get("scan_types")})
+    # #endregion
+
     try:
         if session.get("last_jpeg"):
+            # #region agent log
+            _agent_log("A", "mjpeg yield warmup", {"chunk_len": len(session.get("last_jpeg") or b"")})
+            # #endregion
             yield session["last_jpeg"]
+        _yield_n = 0
         while stop_ev and not stop_ev.is_set():
             pending_seek = session.get("seek_to_frame") is not None
             if session.get("paused") and not pending_seek and session.get("last_jpeg"):
@@ -1012,7 +1247,8 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
             if not ret or frame is None:
                 time.sleep(0.1)
                 continue
-            out = _process_frame(session, frame)
+            t0 = time.time()
+            out, mode = _process_frame_for_stream(session, frame)
             ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
             if ok:
                 chunk = (
@@ -1021,6 +1257,11 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
                     + b"\r\n"
                 )
                 session["last_jpeg"] = chunk
+                _yield_n += 1
+                # #region agent log
+                if _yield_n <= 3:
+                    _agent_log("A", "mjpeg yield frame", {"n": _yield_n, "process_ms": int((time.time() - t0) * 1000), "chunk_len": len(chunk), "mode": mode, "runId": "post-fix"})
+                # #endregion
                 yield chunk
             if session.get("paused"):
                 time.sleep(0.15)
@@ -1029,6 +1270,9 @@ def mjpeg_generator(session_id: str) -> Generator[bytes, None, None]:
     except GeneratorExit:
         pass
     except Exception as e:
+        # #region agent log
+        _agent_log("A", "mjpeg exception", {"err": str(e)[:200]})
+        # #endregion
         log.warning("monitor stream %s ended: %s", session_id, e)
 
 
@@ -1310,4 +1554,14 @@ def get_preview_status(cam_id: str) -> Dict[str, Any]:
         }
         if session.get("gate_live"):
             out["gate_live"] = session.get("gate_live")
+        journey_live = session.get("journey_live")
+        if not journey_live:
+            try:
+                from core import journey_store
+
+                journey_live = journey_store.journeys_for_camera(cam_id, within_sec=90.0, limit=12)
+            except Exception:
+                journey_live = []
+        if journey_live:
+            out["journey_live"] = journey_live
         return out

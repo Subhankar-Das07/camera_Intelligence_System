@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from core import site_admin_store as store
 from core import whatsapp_adapter
+from core import email_adapter
 
 UPLOAD_DIR = os.path.join("storage", "uploads")
 ALERTS_DIR = os.path.join("storage", "alerts")
@@ -246,6 +247,91 @@ def needs_roi(scan_type: str) -> bool:
     return scan_type in ("intrusion", "danger_zone")
 
 
+# COCO-17 keypoint groups for YOLOv8-pose (client-selectable rule triggers)
+POSE_PART_INDICES: Dict[str, List[int]] = {
+    "head": [0, 1, 2, 3, 4],
+    "hands": [7, 8, 9, 10],  # elbows + wrists
+    "legs": [13, 14, 15, 16],  # knees + ankles
+    "torso": [5, 6, 11, 12],  # shoulders + hips
+    "whole": list(range(17)),
+}
+
+POSE_PART_LABELS: Dict[str, str] = {
+    "head": "Head",
+    "hands": "Hands",
+    "legs": "Legs",
+    "torso": "Torso",
+    "whole": "Whole person",
+}
+
+POSE_KPT_NAMES: Dict[int, str] = {
+    0: "nose",
+    1: "left_eye",
+    2: "right_eye",
+    3: "left_ear",
+    4: "right_ear",
+    5: "left_shoulder",
+    6: "right_shoulder",
+    7: "left_elbow",
+    8: "right_elbow",
+    9: "left_wrist",
+    10: "right_wrist",
+    11: "left_hip",
+    12: "right_hip",
+    13: "left_knee",
+    14: "right_knee",
+    15: "left_ankle",
+    16: "right_ankle",
+}
+
+
+def default_pose_parts(scan_type: str) -> List[str]:
+    """Backward-compatible defaults matching previous hard-coded behavior."""
+    if scan_type == "intrusion":
+        return ["legs"]
+    if scan_type == "danger_zone":
+        return ["whole"]
+    return ["whole"]
+
+
+def normalize_pose_trigger(scan_type: str, pose_trigger: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Normalize / default pose_trigger for intrusion and danger_zone rules."""
+    raw = pose_trigger if isinstance(pose_trigger, dict) else {}
+    parts_in = raw.get("parts")
+    if not isinstance(parts_in, list) or not parts_in:
+        parts = default_pose_parts(scan_type)
+    else:
+        parts = []
+        for p in parts_in:
+            key = str(p or "").strip().lower()
+            if key in POSE_PART_INDICES and key not in parts:
+                parts.append(key)
+        if not parts:
+            parts = default_pose_parts(scan_type)
+    try:
+        min_conf = float(raw.get("min_conf", 0.5))
+    except (TypeError, ValueError):
+        min_conf = 0.5
+    min_conf = max(0.15, min(0.95, min_conf))
+    return {
+        "parts": parts,
+        "min_conf": min_conf,
+        "require_person": True,
+    }
+
+
+def pose_trigger_indices(pose_trigger: Dict[str, Any]) -> List[int]:
+    """Unique sorted keypoint indices for the selected body-part groups."""
+    seen = set()
+    out: List[int] = []
+    for part in pose_trigger.get("parts") or []:
+        for idx in POSE_PART_INDICES.get(part) or []:
+            if idx not in seen:
+                seen.add(idx)
+                out.append(idx)
+    return out
+
+
 def is_counter_scan(scan_type: str) -> bool:
     return scan_type == "gate_analytics"
 
@@ -343,6 +429,93 @@ def _save_frame_thumb(frame: Any, prefix: str, folder: str) -> str:
         return ""
 
 
+def record_journey_from_hit(
+    cam: Dict[str, Any],
+    rule: Dict[str, Any],
+    event: Dict[str, Any],
+    frame: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Upsert cross-camera journey from a face or vehicle hit (alerts optional)."""
+    try:
+        from core import journey_store
+
+        scan_type = rule.get("scan_type") or event.get("type") or ""
+        camera_id = cam.get("id") or ""
+        camera_name = cam.get("name") or camera_id
+        rule_id = rule.get("id") or ""
+        thumb = event.get("thumb_url") or ""
+        track_id = event.get("track_id") or event.get("local_track_id")
+        bbox = event.get("bbox") or event.get("xyxy") or []
+
+        person_id = event.get("person_id") or ""
+        plate = event.get("plate") or ""
+        if not plate and scan_type == "vehicle":
+            plate = event.get("label") or ""
+
+        merge_gid = ""
+        if track_id is not None and camera_id:
+            merge_gid = journey_store.lookup_local_track(camera_id, track_id) or ""
+
+        if person_id or scan_type in ("face_attendance",) or event.get("type") == "face_recognised":
+            if not person_id:
+                return None
+            label = event.get("label") or person_id
+            # Prefer Staff gallery display name when approved
+            try:
+                for face in store.list_known_faces(200):
+                    if (face.get("person_id") or face.get("id")) == person_id:
+                        if (face.get("status") or "") == "approved" and face.get("label"):
+                            label = face["label"]
+                        break
+            except Exception:
+                pass
+            meta = journey_store.upsert_face_sighting(
+                person_id=person_id,
+                label=label,
+                camera_id=camera_id,
+                camera_name=camera_name,
+                rule_id=rule_id,
+                scan_type=scan_type or "face_attendance",
+                local_track_id=track_id,
+                bbox=bbox if isinstance(bbox, list) else [],
+                thumb_url=thumb,
+                merge_from_gid=merge_gid,
+            )
+            if meta and track_id is not None:
+                journey_store.attach_local_track(camera_id, track_id, meta.get("gid") or "")
+            return meta
+
+        if plate or scan_type == "vehicle":
+            key = store.normalize_plate(plate)
+            if not key:
+                return None
+            label = key
+            try:
+                veh = store.get_known_vehicle_by_plate(key)
+                if veh and (veh.get("status") or "") == "approved" and veh.get("label"):
+                    label = veh["label"]
+            except Exception:
+                pass
+            meta = journey_store.upsert_plate_sighting(
+                plate=key,
+                label=label,
+                camera_id=camera_id,
+                camera_name=camera_name,
+                rule_id=rule_id,
+                scan_type=scan_type or "vehicle",
+                local_track_id=track_id,
+                bbox=bbox if isinstance(bbox, list) else [],
+                thumb_url=thumb,
+                merge_from_gid=merge_gid,
+            )
+            if meta and track_id is not None:
+                journey_store.attach_local_track(camera_id, track_id, meta.get("gid") or "")
+            return meta
+    except Exception:
+        return None
+    return None
+
+
 def emit_site_alert(
     cam: Dict[str, Any],
     rule: Dict[str, Any],
@@ -351,6 +524,7 @@ def emit_site_alert(
     *,
     skip_cooldown: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    record_journey_from_hit(cam, rule, event, frame=frame)
     rule_id = rule.get("id") or ""
     if store.is_muted(rule_id):
         return None
@@ -389,12 +563,19 @@ def emit_site_alert(
     if not skip_cooldown:
         store.set_cooldown(rule_id, int(rule.get("cooldown_sec") or 60))
     channels = stored.get("channels") or []
-    if "whatsapp" in channels and not in_quiet_hours(store.get_site()):
+    if not in_quiet_hours(store.get_site()):
         site = store.get_site()
         body = stored["message"]
         if stored.get("clip_url"):
             body += f"\nClip: {stored['clip_url']}"
-        whatsapp_adapter.notify_numbers(site.get("whatsapp_numbers") or [], body)
+        if "whatsapp" in channels:
+            whatsapp_adapter.notify_numbers(site.get("whatsapp_numbers") or [], body)
+        if "email" in channels:
+            email_adapter.notify_alert_emails(
+                site.get("alert_emails") or [],
+                stored,
+                site_name=str(site.get("name") or "").strip(),
+            )
     return stored
 
 
@@ -419,6 +600,14 @@ def handle_vehicle_sighting(
     thumb_url = event.get("thumb_url") or ""
     if not thumb_url and frame is not None:
         thumb_url = _save_frame_thumb(frame, f"veh_{key}", VEHICLES_DIR)
+
+    # Journey trail updates even when alerts are suppressed (approved / cooldown).
+    record_journey_from_hit(
+        cam,
+        rule,
+        {**event, "plate": key, "thumb_url": thumb_url or event.get("thumb_url") or ""},
+        frame=frame,
+    )
 
     record = store.upsert_known_vehicle_by_plate(
         {

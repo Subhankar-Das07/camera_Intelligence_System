@@ -45,10 +45,27 @@ def default_site() -> Dict[str, Any]:
         "setup_complete": False,
         "wizard_step": 0,
         "admin_pin": "",
+        "contact_name": "",
+        "contact_email": "",
         "whatsapp_numbers": [],
+        "alert_emails": [],
         "go_live": False,
         "updated_at": time.time(),
     }
+
+
+def sync_contact_email_into_alert_emails(site: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep contact_email first in alert_emails (dedupe, case-insensitive)."""
+    contact = str(site.get("contact_email") or "").strip()
+    existing = [str(x).strip() for x in (site.get("alert_emails") or []) if str(x).strip()]
+    if not contact or "@" not in contact:
+        site["alert_emails"] = existing
+        return site
+    contact_l = contact.lower()
+    others = [e for e in existing if e.lower() != contact_l]
+    site["contact_email"] = contact
+    site["alert_emails"] = [contact] + others
+    return site
 
 
 def get_site() -> Dict[str, Any]:
@@ -62,6 +79,7 @@ def get_site() -> Dict[str, Any]:
 def save_site(site: Dict[str, Any]) -> Dict[str, Any]:
     merged = default_site()
     merged.update(site)
+    sync_contact_email_into_alert_emails(merged)
     merged["updated_at"] = time.time()
     get_redis().set(SITE_KEY, _dumps(merged))
     return merged

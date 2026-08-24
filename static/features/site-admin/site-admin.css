@@ -842,6 +842,25 @@
     border-radius: 8px;
 }
 
+.sa-pose-trigger-setup {
+    margin: 0.75rem 0;
+}
+
+.sa-pose-parts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem 1.1rem;
+    margin-top: 0.35rem;
+}
+
+.sa-pose-parts label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0;
+    font-weight: 400;
+}
+
 .sa-gate-steps {
     flex-wrap: wrap;
     gap: 0.4rem;
@@ -1269,6 +1288,166 @@
 .sa-h .sa-row .btn.secondary.active {
     border-color: #38bdf8;
     color: #e0f2fe;
+}
+
+.sa-journey-live {
+    margin-top: 0.75rem;
+}
+
+.sa-journey-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.sa-journey-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: rgba(15, 23, 42, 0.55);
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+    max-width: 220px;
+}
+
+.sa-journey-badge-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    align-items: stretch;
+}
+
+.sa-journey-badge-wrap.is-watched .sa-journey-badge {
+    border-color: #f97316;
+    box-shadow: 0 0 0 1px rgba(249, 115, 22, 0.35);
+}
+
+.sa-badge-watch {
+    background: rgba(249, 115, 22, 0.25);
+    color: #fdba74;
+}
+
+.sa-monitor-wrap--clickable {
+    position: relative;
+}
+
+.sa-monitor-wrap.sa-pick-active {
+    outline: 2px solid #22d3ee;
+    outline-offset: 2px;
+}
+
+.sa-monitor-hit {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    cursor: default;
+    z-index: 2;
+}
+
+.sa-monitor-hit.sa-pick-mode {
+    cursor: crosshair;
+}
+
+.sa-monitor-hit.sa-sam-busy {
+    cursor: wait;
+    opacity: 0.85;
+}
+
+.sa-sam-toast {
+    position: absolute;
+    left: 50%;
+    bottom: 1rem;
+    transform: translateX(-50%);
+    z-index: 3;
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid #22d3ee;
+    color: #e0f2fe;
+    padding: 0.5rem 0.85rem;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    max-width: 90%;
+    pointer-events: none;
+}
+
+.sa-watched-panel {
+    margin-top: 0.75rem;
+}
+
+.sa-journey-badge--with-thumb {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    text-align: left;
+}
+
+.sa-journey-badge-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+}
+
+.sa-watched-thumb {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 6px;
+    flex-shrink: 0;
+    background: #0f172a;
+    border: 1px solid rgba(45, 212, 191, 0.35);
+}
+
+.sa-watched-thumb--empty {
+    background: rgba(15, 23, 42, 0.8);
+}
+
+.sa-journey-badge:hover {
+    border-color: #38bdf8;
+}
+
+.sa-journey-hops {
+    font-size: 0.75rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+}
+
+.sa-journey-path {
+    margin: 0.5rem 0;
+}
+
+.sa-journey-hops-list {
+    margin: 0.5rem 0 1rem 1.1rem;
+    padding: 0;
+}
+
+.sa-journey-hops-list li {
+    margin-bottom: 0.35rem;
+}
+
+.sa-journey-event {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+}
+
+.sa-journey-thumb {
+    width: 48px;
+    height: 36px;
+    object-fit: cover;
+    border-radius: 4px;
 }
 
 @media (max-width: 860px) {

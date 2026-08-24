@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -13,29 +16,59 @@ from requests.auth import HTTPDigestAuth
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_TIMEOUT = float(os.environ.get("SNAPSHOT_FETCH_TIMEOUT", "15"))
+_MAX_CONCURRENT = max(1, int(os.environ.get("SNAPSHOT_MAX_CONCURRENT_PER_HOST", "2")))
+_host_sems: Dict[str, threading.Semaphore] = {}
+_host_sem_lock = threading.Lock()
+
+
+def _snapshot_host(url: str) -> str:
+    try:
+        parsed = urlparse((url or "").strip())
+        if parsed.netloc:
+            return parsed.netloc.lower()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _host_semaphore(host: str) -> threading.Semaphore:
+    with _host_sem_lock:
+        if host not in _host_sems:
+            _host_sems[host] = threading.Semaphore(_MAX_CONCURRENT)
+        return _host_sems[host]
+
 
 def fetch_snapshot_jpeg(
     url: str,
     user: str = "",
     password: str = "",
-    timeout: float = 10.0,
+    timeout: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """Fetch one JPEG frame from an ISAPI /picture URL."""
     url = (url or "").strip()
     if not url:
         return None
+    host = _snapshot_host(url)
+    sem = _host_semaphore(host)
+    req_timeout = timeout if timeout is not None else _DEFAULT_TIMEOUT
+    acquired = sem.acquire(timeout=req_timeout)
+    if not acquired:
+        log.warning("snapshot fetch queued too long for host=%s", host)
+        return None
     auth = HTTPDigestAuth(user, password) if user else None
     try:
-        resp = requests.get(url, auth=auth, timeout=timeout)
+        resp = requests.get(url, auth=auth, timeout=req_timeout)
         if resp.status_code != 200 or len(resp.content) < 500:
             log.warning("snapshot fetch failed: status=%s bytes=%s", resp.status_code, len(resp.content))
             return None
         arr = np.frombuffer(resp.content, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        return frame
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
     except Exception as e:
         log.warning("snapshot fetch error: %s", e)
         return None
+    finally:
+        sem.release()
 
 
 class SnapshotCamera:
@@ -50,13 +83,13 @@ class SnapshotCamera:
         user: str = "",
         password: str = "",
         poll_interval: float = 1.5,
-        timeout: float = 10.0,
+        timeout: Optional[float] = None,
     ):
         self.url = (url or "").strip()
         self.user = user or ""
         self.password = password or ""
         self.poll_interval = max(0.5, float(poll_interval))
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else _DEFAULT_TIMEOUT
         self._frame: Optional[np.ndarray] = None
         self._last_fetch = 0.0
         self._opened = bool(self.url)

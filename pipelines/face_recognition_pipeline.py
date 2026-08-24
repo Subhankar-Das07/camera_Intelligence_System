@@ -182,6 +182,8 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
                             "confidence": rec.confidence,
                             "timestamp": time.strftime("%H:%M:%S"),
                             "type":      "face_recognised",
+                            "track_id":  tf.track_id,
+                            "bbox":      list(tf.bbox) if tf.bbox is not None else [],
                         }
             else:
                 active_recognizer = self._attendance_recognizer if mode == "attendance" else self._visitor_recognizer

@@ -180,6 +180,13 @@ def build_pose_cache(frame: np.ndarray) -> Dict[str, Any]:
     return cache
 
 
+def _part_for_kpt(kpt_idx: int, parts: List[str]) -> str:
+    for part in parts:
+        if kpt_idx in (common.POSE_PART_INDICES.get(part) or []):
+            return part
+    return "whole"
+
+
 def _evaluate_pose_from_keypoints(
     keypoints_xy: np.ndarray,
     keypoints_conf: np.ndarray,
@@ -195,16 +202,33 @@ def _evaluate_pose_from_keypoints(
     machine_active = scan_type == "danger_zone"
     buffered = roi_poly.buffer(20) if machine_active else roi_poly
 
+    trigger = common.normalize_pose_trigger(scan_type, rule.get("pose_trigger"))
+    indices = common.pose_trigger_indices(trigger)
+    min_conf = float(trigger.get("min_conf") or 0.5)
+    parts = list(trigger.get("parts") or [])
+    rule_name = rule.get("name") or scan_type.replace("_", " ")
+
     for person_kpts, conf in zip(keypoints_xy, keypoints_conf):
-        indices = [15, 16] if scan_type == "intrusion" else range(len(person_kpts))
         for kpt_idx in indices:
-            if conf[kpt_idx] <= 0.5:
+            if kpt_idx >= len(person_kpts) or kpt_idx >= len(conf):
+                continue
+            if float(conf[kpt_idx]) <= min_conf:
                 continue
             x, y = person_kpts[kpt_idx]
-            pt = Point(x, y)
+            pt = Point(float(x), float(y))
             inside = buffered.contains(pt) if machine_active else roi_poly.contains(pt)
             if inside:
-                return {"type": scan_type, "severity": rule.get("severity") or "high"}
+                kpt_name = common.POSE_KPT_NAMES.get(int(kpt_idx), f"kpt_{kpt_idx}")
+                body_part = _part_for_kpt(int(kpt_idx), parts)
+                part_label = common.POSE_PART_LABELS.get(body_part, body_part)
+                return {
+                    "type": scan_type,
+                    "severity": rule.get("severity") or "high",
+                    "body_part": body_part,
+                    "keypoint": kpt_name,
+                    "keypoint_idx": int(kpt_idx),
+                    "message": f"{rule_name} — {kpt_name.replace('_', ' ')} ({part_label}) in area",
+                }
     return None
 
 
@@ -236,21 +260,120 @@ def _evaluate_pose_rule(
 
     keypoints_xy = results.keypoints.xy.cpu().numpy()
     keypoints_conf = results.keypoints.conf.cpu().numpy()
+    return _evaluate_pose_from_keypoints(keypoints_xy, keypoints_conf, rule, scan_type, w, h)
 
-    for person_kpts, conf in zip(keypoints_xy, keypoints_conf):
-        indices = [15, 16] if scan_type == "intrusion" else range(len(person_kpts))
-        for kpt_idx in indices:
-            if conf[kpt_idx] <= 0.5:
-                continue
-            x, y = person_kpts[kpt_idx]
-            pt = Point(x, y)
-            roi_poly = Polygon(_denorm_roi(roi, w, h))
-            machine_active = scan_type == "danger_zone"
-            buffered = roi_poly.buffer(20) if machine_active else roi_poly
-            inside = buffered.contains(pt) if machine_active else roi_poly.contains(pt)
-            if inside:
-                return {"type": scan_type, "severity": rule.get("severity") or "high"}
-    return None
+
+def _apply_person_journeys(
+    cam: Dict[str, Any],
+    rule: Dict[str, Any],
+    frame: np.ndarray,
+    meta: Dict[str, Any],
+    state: Dict[str, Any],
+    *,
+    pipe: Any = None,
+    rule_id: str = "",
+) -> np.ndarray:
+    """Match person crops to cross-camera journeys and annotate global IDs."""
+    from core import journey_store
+    from core.person_reid import crop_from_xyxy, embed_person_crop, reid_enabled
+
+    if not reid_enabled():
+        return frame
+    tracks = meta.get("person_tracks") or []
+    if not tracks or frame is None or frame.size == 0:
+        return frame
+
+    camera_id = cam.get("id") or ""
+    camera_name = cam.get("name") or camera_id
+    frame_idx = int(state.get("frame_idx") or 0)
+    # Re-ID every 3rd tick per worker to limit load
+    if frame_idx % 3 != 0:
+        # Still refresh journey_live from cached labels
+        labels = {}
+        if pipe is not None and hasattr(pipe, "_state"):
+            labels = dict((pipe._state(rule_id) or {}).get("journey_labels") or {})
+        live = []
+        for tid, lab in labels.items():
+            live.append({"gid": lab.split()[0] if lab else "", "local_track_id": tid, "label": lab})
+        meta["journey_live"] = live
+        return frame
+
+    journey_live: List[Dict[str, Any]] = []
+    labels: Dict[int, str] = {}
+    if pipe is not None and hasattr(pipe, "_state") and rule_id:
+        labels = dict((pipe._state(rule_id) or {}).get("journey_labels") or {})
+
+    for tr in tracks[:6]:
+        tid = int(tr.get("track_id") or 0)
+        xyxy = tr.get("xyxy") or []
+        if len(xyxy) != 4:
+            continue
+        crop = crop_from_xyxy(frame, (int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])))
+        emb = embed_person_crop(crop) if crop is not None else None
+        if emb is None:
+            continue
+        try:
+            jmeta = journey_store.match_or_create_reid(
+                emb,
+                camera_id=camera_id,
+                camera_name=camera_name,
+                rule_id=rule.get("id") or rule_id,
+                scan_type=rule.get("scan_type") or "gate_analytics",
+                local_track_id=tid,
+                bbox=[float(x) for x in xyxy],
+            )
+        except Exception as e:
+            log.warning("journey reid: %s", e)
+            continue
+        gid = jmeta.get("gid") or ""
+        label = jmeta.get("label") or "unknown"
+        display = f"{gid}" if label in ("", "unknown") else f"{gid}·{label}"
+        labels[tid] = display
+        journey_store.attach_local_track(camera_id, tid, gid)
+        journey_live.append(
+            {
+                "gid": gid,
+                "label": label,
+                "local_track_id": tid,
+                "match_method": jmeta.get("match_method"),
+                "hop_summary": "",
+                "bbox": [float(x) for x in xyxy],
+                "bbox_norm": [
+                    float(xyxy[0]) / max(1, frame.shape[1]),
+                    float(xyxy[1]) / max(1, frame.shape[0]),
+                    float(xyxy[2]) / max(1, frame.shape[1]),
+                    float(xyxy[3]) / max(1, frame.shape[0]),
+                ],
+                "watched": journey_store.is_watched(gid),
+            }
+        )
+        # Annotate once more with gid
+        x1, y1, x2, y2 = [int(v) for v in xyxy]
+        cv2.putText(
+            frame,
+            display,
+            (x1, max(14, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            2,
+        )
+
+    if pipe is not None and hasattr(pipe, "_state") and rule_id:
+        st = pipe._state(rule_id)
+        st["journey_labels"] = labels
+
+    # Enrich hop summaries
+    for item in journey_live:
+        gid = item.get("gid") or ""
+        if gid and not item.get("hop_summary"):
+            detail = journey_store.get_journey(gid, timeline_limit=10)
+            if detail:
+                item["hop_summary"] = detail.get("hop_summary") or ""
+                item["label"] = detail.get("label") or item.get("label")
+
+    meta["journey_live"] = journey_live
+    return frame
 
 
 def _with_pipe_lock(state: Dict[str, Any], fn):
@@ -342,11 +465,17 @@ def evaluate_rule_on_frame(
                     counters = meta.get("counters") or {}
                     if counters and not state.get("skip_gate_store"):
                         store.increment_gate_counters(rule_id, counters)
+                    if not state.get("skip_gate_store"):
+                        out = _apply_person_journeys(
+                            cam, rule, out, meta, state, pipe=pipe, rule_id=rule_id
+                        )
                     monitor_session = state.get("monitor_session")
                     session_lock = state.get("session_lock")
                     if monitor_session is not None and session_lock is not None:
                         with session_lock:
                             monitor_session["gate_live"] = meta.get("live") or {}
+                            if meta.get("journey_live"):
+                                monitor_session["journey_live"] = meta.get("journey_live")
                     if meta.get("band") == "near" and meta.get("alert_near"):
                         if not store.on_cooldown(rule_id):
                             return (
