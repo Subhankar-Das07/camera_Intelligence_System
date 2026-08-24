@@ -475,7 +475,7 @@ def stop_analysis(session_id: str):
             "unknown_visitors": list(unknown_map.values())
         }
         
-        r = redis_client.get_redis()
+        r = get_redis()
         r.hset("reports:visitor", session_id, json.dumps(report))
         
     return {"status": "stopped"}
@@ -727,14 +727,14 @@ async def delete_identity(person_id: str, mode: str = "visitor"):
 @app.get("/api/reports")
 async def list_reports(mode: str = "visitor"):
     """Return all session reports for the given mode."""
-    r = redis_client.get_redis()
+    r = get_redis()
     key = f"reports:{mode}"
     raw_hash = r.hgetall(key)
     
     reports = []
     for sess_id_bytes, meta_bytes in raw_hash.items():
         try:
-            report_data = json.loads(redis_client.redis_str(meta_bytes))
+            report_data = json.loads(redis_str(meta_bytes))
             # Just return summary data for the list
             summary = {
                 "session_id": report_data.get("session_id"),
@@ -759,14 +759,14 @@ async def list_reports(mode: str = "visitor"):
 @app.get("/api/reports/{session_id}")
 async def get_report(session_id: str, mode: str = "visitor"):
     """Return the full details of a specific report."""
-    r = redis_client.get_redis()
+    r = get_redis()
     key = f"reports:{mode}"
     raw = r.hget(key, session_id)
     if not raw:
         raise HTTPException(status_code=404, detail="Report not found")
     
     try:
-        report_data = json.loads(redis_client.redis_str(raw))
+        report_data = json.loads(redis_str(raw))
         return report_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -825,7 +825,7 @@ def stop_attendance_session():
     }
     
     # Save to Redis
-    r = redis_client.get_redis()
+    r = get_redis()
     r.hset("reports:attendance", session_id, json.dumps(report))
     
     return {"status": "stopped", "session_id": session_id, "present_ids": present_ids}
