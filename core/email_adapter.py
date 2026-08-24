@@ -176,6 +176,7 @@ def build_alert_email(
     """
     cam = str(alert.get("camera_name") or alert.get("camera_id") or "Camera").strip()
     scan = str(alert.get("scan_type") or alert.get("type") or "event").strip()
+    rule_name = str(alert.get("rule_name") or "").strip() or scan.replace("_", " ")
     severity = str(alert.get("severity") or "high").strip().upper()
     msg = str(alert.get("message") or "Camera Intelligence alert").strip()
     site = (site_name or "").strip() or "your site"
@@ -187,7 +188,7 @@ def build_alert_email(
         except (TypeError, ValueError):
             when = ""
 
-    subject = f"[Alert] {cam} — {scan}"
+    subject = f"[Alert] {rule_name} — {cam}"
 
     thumb_path = resolve_storage_path(str(alert.get("thumb_url") or ""))
     inline_images: List[Dict[str, str]] = []
@@ -201,6 +202,7 @@ def build_alert_email(
     text_lines = [
         "Camera Intelligence — Alert",
         f"Site: {site}",
+        f"Rule broken: {rule_name}",
         f"Camera: {cam}",
         f"Type: {scan}",
         f"Severity: {severity}",
@@ -209,7 +211,7 @@ def build_alert_email(
     if when:
         text_lines.append(f"Time: {when}")
     if has_thumb:
-        text_lines.append("Snapshot: attached")
+        text_lines.append("Snapshot: attached (ROI outlined)")
     if clip:
         text_lines.append(f"Clip: {clip}")
     text_lines.append("")
@@ -222,8 +224,9 @@ def build_alert_email(
         f"""
         <tr>
           <td style="padding:16px 24px 8px 24px;">
-            <img src="cid:alert-thumb" alt="Alert snapshot"
+            <img src="cid:alert-thumb" alt="Alert snapshot with rule ROI"
                  style="display:block;width:100%;max-width:520px;height:auto;border-radius:6px;border:1px solid #e2e8f0;" />
+            <div style="font-size:12px;color:#64748b;margin-top:8px;">Snapshot with breached rule zone outlined</div>
           </td>
         </tr>
         """
@@ -275,7 +278,15 @@ def build_alert_email(
             </td>
           </tr>
           <tr>
-            <td style="padding:4px 24px 0 24px;font-size:20px;font-weight:600;color:#0f172a;">{esc(cam)}</td>
+            <td style="padding:8px 24px 0 24px;font-size:12px;font-weight:600;letter-spacing:0.04em;color:#b45309;text-transform:uppercase;">
+              Rule broken
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:4px 24px 0 24px;font-size:22px;font-weight:600;color:#0f172a;">{esc(rule_name)}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 24px 0 24px;font-size:14px;color:#64748b;">Camera: {esc(cam)}</td>
           </tr>
           <tr>
             <td style="padding:10px 24px 4px 24px;font-size:15px;line-height:1.5;color:#334155;">{esc(msg)}</td>
@@ -285,7 +296,7 @@ def build_alert_email(
           {clip_block}
           <tr>
             <td style="padding:20px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8;">
-              Automated alert from Camera Intelligence. Manage recipients in Site Admin → Settings.
+              Automated alert from Camera Intelligence. The snapshot highlights the rule zone that was breached.
             </td>
           </tr>
         </table>

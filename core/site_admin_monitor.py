@@ -83,83 +83,27 @@ class FrameFeed:
 
 
 def _rule_color(rule_id: str) -> Tuple[int, int, int]:
-    idx = abs(hash(rule_id)) % len(RULE_COLORS)
-    return RULE_COLORS[idx]
+    return common.rule_overlay_color(rule_id)  # type: ignore[return-value]
 
 
 def _denorm_roi(roi_normalized: List, width: int, height: int) -> np.ndarray:
-    pts = [[int(x * width), int(y * height)] for x, y in roi_normalized]
-    return np.array(pts, dtype=np.int32)
+    return common.denorm_roi_points(roi_normalized, width, height)
 
 
 def _draw_all_rois(frame: np.ndarray, rules: List[Dict[str, Any]]) -> None:
-    h, w = frame.shape[:2]
     for rule in rules:
-        _draw_rule_geometry(frame, rule, highlight=False)
+        common.draw_rule_geometry(frame, rule, highlight=False)
 
 
 def _draw_rule_geometry(frame: np.ndarray, rule: Dict[str, Any], highlight: bool = False) -> None:
     """Draw one rule's ROI or gate geometry; optional highlight for breach."""
-    h, w = frame.shape[:2]
-    rule_id = rule.get("id") or ""
-    color = _rule_color(rule_id)
-    thickness = 4 if highlight else 2
-
-    scan_type = rule.get("scan_type") or ""
-    if scan_type == "gate_analytics":
-        gc = rule.get("gate_config") or {}
-        count_line = gc.get("count_line") or []
-        if len(count_line) == 2:
-            pts = _denorm_roi(count_line, w, h)
-            cv2.polylines(frame, [pts], False, (0, 255, 255), thickness)
-        gate_roi = gc.get("gate_roi") or []
-        if len(gate_roi) >= 3:
-            pts = _denorm_roi(gate_roi, w, h)
-            if highlight:
-                overlay = frame.copy()
-                cv2.fillPoly(overlay, [pts], (200, 120, 255))
-                cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
-            cv2.polylines(frame, [pts], True, (200, 120, 255), thickness)
-        zones = gc.get("distance_zones") or {}
-        zone_colors = {"near": (68, 68, 255), "medium": (0, 170, 255), "far": (102, 204, 68)}
-        for band, zc in zone_colors.items():
-            z = zones.get(band) or []
-            if len(z) >= 3:
-                pts = _denorm_roi(z, w, h)
-                cv2.polylines(frame, [pts], True, zc, max(1, thickness - 1))
-        return
-
-    roi = rule.get("roi_normalized") or []
-    if len(roi) < 3:
-        if highlight:
-            label = f"BREACH: {rule.get('name') or scan_type}"
-            cv2.rectangle(frame, (8, 8), (min(w - 8, 8 + len(label) * 11), 36), color, -1)
-            cv2.putText(
-                frame, label, (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
-            )
-        return
-
-    pts = _denorm_roi(roi, w, h)
-    if highlight:
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [pts], color)
-        cv2.addWeighted(overlay, 0.32, frame, 0.68, 0, frame)
-    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
-    label = f"{rule.get('name', 'Rule')} ({scan_type})"
-    cx = int(np.mean(pts[:, 0]))
-    cy = int(np.mean(pts[:, 1]))
-    cv2.putText(
-        frame, label, (cx, max(20, cy - 8)),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.5 if highlight else 0.45, color, 2 if highlight else 1, cv2.LINE_AA,
-    )
+    common.draw_rule_geometry(frame, rule, highlight=highlight)
 
 
 def _frame_with_rule_emphasis(frame: np.ndarray, rule: Dict[str, Any]) -> np.ndarray:
     """Copy frame with this rule's zone highlighted for event thumbs."""
-    out = frame.copy()
-    _draw_rule_geometry(out, rule, highlight=True)
-    return out
+    out = common.frame_with_rule_emphasis(frame, rule)
+    return out if out is not None else frame.copy()
 
 
 def _get_pose_model():

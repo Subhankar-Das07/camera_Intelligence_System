@@ -429,6 +429,221 @@ def _save_frame_thumb(frame: Any, prefix: str, folder: str) -> str:
         return ""
 
 
+RULE_OVERLAY_COLORS = [
+    (34, 211, 238),
+    (251, 191, 36),
+    (74, 222, 128),
+    (244, 114, 182),
+    (129, 140, 248),
+    (248, 113, 113),
+]
+
+
+def rule_overlay_color(rule_id: str) -> tuple:
+    idx = abs(hash(rule_id or "")) % len(RULE_OVERLAY_COLORS)
+    return RULE_OVERLAY_COLORS[idx]
+
+
+def denorm_roi_points(roi_normalized: List, width: int, height: int):
+    import numpy as np
+
+    pts = [[int(x * width), int(y * height)] for x, y in (roi_normalized or [])]
+    return np.array(pts, dtype=np.int32)
+
+
+def draw_rule_geometry(frame: Any, rule: Dict[str, Any], highlight: bool = False) -> None:
+    """Draw one rule's ROI or gate geometry onto frame (in place)."""
+    if frame is None:
+        return
+    try:
+        import cv2
+        import numpy as np
+
+        if not isinstance(frame, np.ndarray) or frame.size == 0:
+            return
+        h, w = frame.shape[:2]
+        rule_id = rule.get("id") or ""
+        color = rule_overlay_color(rule_id)
+        thickness = 4 if highlight else 2
+        scan_type = rule.get("scan_type") or ""
+
+        if scan_type == "gate_analytics":
+            gc = rule.get("gate_config") or {}
+            count_line = gc.get("count_line") or []
+            if len(count_line) == 2:
+                pts = denorm_roi_points(count_line, w, h)
+                cv2.polylines(frame, [pts], False, (0, 255, 255), thickness)
+            gate_roi = gc.get("gate_roi") or []
+            if len(gate_roi) >= 3:
+                pts = denorm_roi_points(gate_roi, w, h)
+                if highlight:
+                    overlay = frame.copy()
+                    cv2.fillPoly(overlay, [pts], (200, 120, 255))
+                    cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
+                cv2.polylines(frame, [pts], True, (200, 120, 255), thickness)
+            zones = gc.get("distance_zones") or {}
+            zone_colors = {"near": (68, 68, 255), "medium": (0, 170, 255), "far": (102, 204, 68)}
+            for band, zc in zone_colors.items():
+                z = zones.get(band) or []
+                if len(z) >= 3:
+                    pts = denorm_roi_points(z, w, h)
+                    cv2.polylines(frame, [pts], True, zc, max(1, thickness - 1))
+            name = rule.get("name") or "Gate"
+            cv2.putText(
+                frame,
+                f"{name} ({scan_type})",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55 if highlight else 0.45,
+                (0, 255, 255),
+                2 if highlight else 1,
+                cv2.LINE_AA,
+            )
+            return
+
+        roi = rule.get("roi_normalized") or []
+        if len(roi) < 3:
+            if highlight:
+                label = f"BREACH: {rule.get('name') or scan_type}"
+                cv2.rectangle(frame, (8, 8), (min(w - 8, 8 + len(label) * 11), 36), color, -1)
+                cv2.putText(
+                    frame,
+                    label,
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            return
+
+        pts = denorm_roi_points(roi, w, h)
+        if highlight:
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.addWeighted(overlay, 0.32, frame, 0.68, 0, frame)
+        cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+        label = f"{rule.get('name') or 'Rule'} ({scan_type})"
+        cx = int(np.mean(pts[:, 0]))
+        cy = int(np.mean(pts[:, 1]))
+        cv2.putText(
+            frame,
+            label,
+            (cx, max(20, cy - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5 if highlight else 0.45,
+            color,
+            2 if highlight else 1,
+            cv2.LINE_AA,
+        )
+    except Exception:
+        return
+
+
+def frame_with_rule_emphasis(frame: Any, rule: Dict[str, Any]) -> Any:
+    """Copy frame with this rule's zone highlighted for alert thumbs."""
+    if frame is None:
+        return None
+    try:
+        import numpy as np
+
+        if not isinstance(frame, np.ndarray) or frame.size == 0:
+            return frame
+        out = frame.copy()
+        draw_rule_geometry(out, rule, highlight=True)
+        return out
+    except Exception:
+        return frame
+
+
+def _alert_message(cam: Dict[str, Any], rule: Dict[str, Any], event: Dict[str, Any], scan_type: str) -> str:
+    rule_name = (rule.get("name") or scan_type.replace("_", " ")).strip()
+    detail = (event.get("message") or "").strip()
+    cam_name = (cam.get("name") or cam.get("id") or "Camera").strip()
+    scan_label = scan_type.replace("_", " ")
+    if detail:
+        # Avoid duplicating rule name if event message already starts with it
+        if detail.lower().startswith(rule_name.lower()):
+            return f"{cam_name}: {detail}"
+        return f"{cam_name}: {rule_name} — {detail}"
+    return f"{cam_name}: {rule_name} — {scan_label}"
+
+
+def emit_site_alert(
+    cam: Dict[str, Any],
+    rule: Dict[str, Any],
+    event: Dict[str, Any],
+    frame: Any = None,
+    *,
+    skip_cooldown: bool = False,
+) -> Optional[Dict[str, Any]]:
+    record_journey_from_hit(cam, rule, event, frame=frame)
+    rule_id = rule.get("id") or ""
+    if store.is_muted(rule_id):
+        return None
+    if not skip_cooldown and store.on_cooldown(rule_id):
+        return None
+    scan_type = rule.get("scan_type") or "unknown"
+    label = event.get("type") or scan_type
+    rule_name = (rule.get("name") or scan_type.replace("_", " ")).strip()
+    msg = _alert_message(cam, rule, event, scan_type)
+
+    alert = {
+        "camera_id": cam.get("id"),
+        "camera_name": cam.get("name") or cam.get("id"),
+        "rule_id": rule_id,
+        "rule_name": rule_name,
+        "scan_type": scan_type,
+        "type": label,
+        "severity": event.get("severity") or rule.get("severity") or "high",
+        "clip_url": event.get("clip_url"),
+        "thumb_url": event.get("thumb_url") or "",
+        "person_id": event.get("person_id"),
+        "label": event.get("label") or event.get("plate"),
+        "channels": rule.get("channels") or ["web"],
+        "message": msg,
+        "roi_normalized": rule.get("roi_normalized") or [],
+        "gate_config": rule.get("gate_config") or {},
+    }
+    stored = store.append_alert(alert)
+
+    # Always prefer ROI-stamped snapshot when a frame is available
+    if frame is not None:
+        stamped = frame_with_rule_emphasis(frame, rule)
+        thumb_url = _save_frame_thumb(
+            stamped if stamped is not None else frame,
+            stored.get("id") or "snap",
+            ALERTS_DIR,
+        )
+        if thumb_url:
+            stored = store.update_alert(
+                stored["id"],
+                {"thumb_url": thumb_url, "rule_name": rule_name},
+            ) or stored
+
+    if not skip_cooldown:
+        store.set_cooldown(rule_id, int(rule.get("cooldown_sec") or 60))
+
+    channels = stored.get("channels") or []
+    if not in_quiet_hours(store.get_site()):
+        site = store.get_site()
+        body = stored.get("message") or msg
+        if stored.get("clip_url"):
+            body += f"\nClip: {stored['clip_url']}"
+        if "whatsapp" in channels:
+            whatsapp_adapter.notify_numbers(site.get("whatsapp_numbers") or [], body)
+        # Email immediately when SMTP + recipients exist (not channel-gated)
+        recipients = site.get("alert_emails") or []
+        if email_adapter.configured() and recipients:
+            email_adapter.notify_alert_emails(
+                recipients,
+                stored,
+                site_name=str(site.get("name") or "").strip(),
+            )
+    return stored
+
+
 def record_journey_from_hit(
     cam: Dict[str, Any],
     rule: Dict[str, Any],
@@ -516,69 +731,6 @@ def record_journey_from_hit(
     return None
 
 
-def emit_site_alert(
-    cam: Dict[str, Any],
-    rule: Dict[str, Any],
-    event: Dict[str, Any],
-    frame: Any = None,
-    *,
-    skip_cooldown: bool = False,
-) -> Optional[Dict[str, Any]]:
-    record_journey_from_hit(cam, rule, event, frame=frame)
-    rule_id = rule.get("id") or ""
-    if store.is_muted(rule_id):
-        return None
-    if not skip_cooldown and store.on_cooldown(rule_id):
-        return None
-    scan_type = rule.get("scan_type") or "unknown"
-    label = event.get("type") or scan_type
-    alert_id = event.get("id") or ""
-    thumb_url = event.get("thumb_url") or ""
-    msg = event.get("message") or (
-        f"{cam.get('name') or 'Camera'}: {rule.get('name') or scan_type.replace('_', ' ')} "
-        f"— {scan_type.replace('_', ' ')}"
-    )
-
-    alert = {
-        "camera_id": cam.get("id"),
-        "camera_name": cam.get("name") or cam.get("id"),
-        "rule_id": rule_id,
-        "scan_type": scan_type,
-        "type": label,
-        "severity": event.get("severity") or rule.get("severity") or "high",
-        "clip_url": event.get("clip_url"),
-        "thumb_url": thumb_url,
-        "person_id": event.get("person_id"),
-        "label": event.get("label") or event.get("plate"),
-        "channels": rule.get("channels") or ["web"],
-        "message": msg,
-    }
-    stored = store.append_alert(alert)
-
-    if not stored.get("thumb_url") and frame is not None:
-        thumb_url = _save_frame_thumb(frame, stored.get("id") or alert_id or "snap", ALERTS_DIR)
-        if thumb_url:
-            stored = store.update_alert(stored["id"], {"thumb_url": thumb_url}) or stored
-
-    if not skip_cooldown:
-        store.set_cooldown(rule_id, int(rule.get("cooldown_sec") or 60))
-    channels = stored.get("channels") or []
-    if not in_quiet_hours(store.get_site()):
-        site = store.get_site()
-        body = stored["message"]
-        if stored.get("clip_url"):
-            body += f"\nClip: {stored['clip_url']}"
-        if "whatsapp" in channels:
-            whatsapp_adapter.notify_numbers(site.get("whatsapp_numbers") or [], body)
-        if "email" in channels:
-            email_adapter.notify_alert_emails(
-                site.get("alert_emails") or [],
-                stored,
-                site_name=str(site.get("name") or "").strip(),
-            )
-    return stored
-
-
 def handle_vehicle_sighting(
     cam: Dict[str, Any],
     rule: Dict[str, Any],
@@ -599,7 +751,8 @@ def handle_vehicle_sighting(
 
     thumb_url = event.get("thumb_url") or ""
     if not thumb_url and frame is not None:
-        thumb_url = _save_frame_thumb(frame, f"veh_{key}", VEHICLES_DIR)
+        stamped = frame_with_rule_emphasis(frame, rule)
+        thumb_url = _save_frame_thumb(stamped if stamped is not None else frame, f"veh_{key}", VEHICLES_DIR)
 
     # Journey trail updates even when alerts are suppressed (approved / cooldown).
     record_journey_from_hit(
