@@ -89,12 +89,14 @@ class FaceEmbedder:
         except Exception as e:
             raise RuntimeError(f"Failed to load InsightFace model: {e}") from e
 
-    def detect_and_embed(self, frame: np.ndarray) -> List[FaceResult]:
+    def get_faces(self, frame: np.ndarray, extract_embeddings: bool = True) -> List[FaceResult]:
         """
-        Run SCRFD detection + ArcFace embedding on a BGR frame.
+        Run SCRFD detection on a BGR frame, optionally followed by ArcFace embedding.
 
         Args:
             frame: BGR numpy array from OpenCV
+            extract_embeddings: If True, runs the heavy ArcFace model on detected quality faces.
+                                If False, only runs SCRFD detection.
 
         Returns:
             List of FaceResult, one per detected face.
@@ -106,20 +108,26 @@ class FaceEmbedder:
             return []
 
         try:
-            faces = self._app.get(frame)
+            # Bypass self._app.get() to manually decouple detection and recognition
+            bboxes, kpss = self._app.det_model.detect(frame)
         except Exception as e:
             log.warning("[FaceEmbedder] Detection failed: %s", e)
             return []
+            
+        if bboxes.shape[0] == 0:
+            return []
 
         results: List[FaceResult] = []
+        from insightface.app.common import Face
 
-        for face in faces:
+        for i in range(bboxes.shape[0]):
             # SCRFD confidence gate
-            score = float(face.det_score)
+            score = float(bboxes[i, 4])
             if score < DETECTION_THRESHOLD:
                 continue
 
-            bbox = face.bbox.astype(int)   # [x1, y1, x2, y2]
+            bbox = bboxes[i, 0:4].astype(int)   # [x1, y1, x2, y2]
+            kps = kpss[i] if kpss is not None else None
             x1, y1, x2, y2 = bbox
             w = x2 - x1
             h = y2 - y1
@@ -130,7 +138,7 @@ class FaceEmbedder:
                 crop = _safe_crop(frame, x1, y1, x2, y2)
                 results.append(FaceResult(
                     bbox=bbox, score=score, crop=crop,
-                    is_quality=False, kps=face.kps,
+                    is_quality=False, kps=kps,
                     embedding=None,
                 ))
                 continue
@@ -141,25 +149,23 @@ class FaceEmbedder:
             if not _is_sharp(crop):
                 results.append(FaceResult(
                     bbox=bbox, score=score, crop=crop,
-                    is_quality=False, kps=face.kps,
+                    is_quality=False, kps=kps,
                     embedding=None,
                 ))
                 continue
 
-            # All quality gates passed — extract embedding
-            emb = face.embedding   # shape (512,) already L2-normalised by InsightFace
-            if emb is None:
-                results.append(FaceResult(
-                    bbox=bbox, score=score, crop=crop,
-                    is_quality=False, kps=face.kps,
-                    embedding=None,
-                ))
-                continue
+            # All quality gates passed — extract embedding if requested
+            embedding = None
+            if extract_embeddings:
+                face_obj = Face(bbox=bboxes[i, 0:4], kps=kps, det_score=bboxes[i, 4])
+                self._app.models['recognition'].get(frame, face_obj)
+                if face_obj.embedding is not None:
+                    embedding = face_obj.embedding.astype(np.float32)
 
             results.append(FaceResult(
                 bbox=bbox, score=score, crop=crop,
-                is_quality=True, kps=face.kps,
-                embedding=emb.astype(np.float32),
+                is_quality=True, kps=kps,
+                embedding=embedding,
             ))
 
         return results

@@ -149,8 +149,8 @@ class FaceRecognitionPipeline(BaseVideoPipeline):
         mode = config.get("mode", "visitor")
         do_recognition = (frame_idx % RECOGNITION_EVERY_N_FRAMES == 0)
 
-        # Step 1: Detect + embed (every frame, but embedding gated by quality)
-        face_results = self._embedder.detect_and_embed(frame)
+        # Step 1: Detect (+ embed only on recognition frames)
+        face_results = self._embedder.get_faces(frame, extract_embeddings=do_recognition)
 
         # Step 2: Track (every frame — ByteTrack keeps IDs stable)
         tracked_faces = self._tracker.update(face_results, frame)

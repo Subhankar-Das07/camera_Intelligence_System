@@ -653,7 +653,7 @@ async def register_face(
     if img is None:
         raise HTTPException(status_code=400, detail="Could not decode image.")
 
-    faces = embedder.detect_and_embed(img)
+    faces = embedder.get_faces(img)
     quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
     if not quality_faces:
         raise HTTPException(
@@ -687,7 +687,7 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None, mod
     im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
-    faces = embedder.detect_and_embed(frame)
+    faces = embedder.get_faces(frame)
     quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
     if not quality_faces:
         raise HTTPException(status_code=422, detail="No clear face in current frame.")
