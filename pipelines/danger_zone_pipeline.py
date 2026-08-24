@@ -121,12 +121,12 @@ class DangerZonePipeline(BaseVideoPipeline):
                     cooldown_frames = cooldown_frames_max
                     alert_id = str(uuid.uuid4())
                     alert_start_frame = frame_idx
-                    alert_path = os.path.join(output_dir, f"alert_{alert_id}.webm")
+                    alert_path = os.path.join(output_dir, f"alert_{alert_id}.mp4")
                     # Dynamically calculate actual processing FPS to prevent fast-forwarding
                     elapsed_time = time.time() - start_time
                     actual_fps = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
-                    fourcc = cv2.VideoWriter_fourcc(*"vp80") if "'" not in "vp80" else cv2.VideoWriter_fourcc(*"vp80")
-                    alert_writer = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"vp80"), actual_fps, (width, height))
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v") if "'" not in "mp4v" else cv2.VideoWriter_fourcc(*"mp4v")
+                    alert_writer = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"mp4v"), actual_fps, (width, height))
                 elif intrusion_active:
                     if current_severity == "SEVERE":
                         alert_severity = "SEVERE"
@@ -147,7 +147,7 @@ class DangerZonePipeline(BaseVideoPipeline):
                                 "id": alert_id,
                                 "timestamp_sec": timestamp_sec,
                                 "formatted_time": f"{int(timestamp_sec // 60):02d}:{int(timestamp_sec % 60):02d}",
-                                "clip_url": f"/storage/alerts/alert_{alert_id}.webm",
+                                "clip_url": f"/storage/alerts/alert_{alert_id}.mp4",
                                 "immediate_buzzer_trigger": (alert_severity == "SEVERE"),
                                 "severity": alert_severity
                             }
@@ -163,7 +163,7 @@ class DangerZonePipeline(BaseVideoPipeline):
                         "id": alert_id,
                         "timestamp_sec": timestamp_sec,
                         "formatted_time": f"{int(timestamp_sec // 60):02d}:{int(timestamp_sec % 60):02d}",
-                        "clip_url": f"/storage/alerts/alert_{alert_id}.webm",
+                        "clip_url": f"/storage/alerts/alert_{alert_id}.mp4",
                         "immediate_buzzer_trigger": (alert_severity == "SEVERE"),
                         "severity": alert_severity
                     }
@@ -178,7 +178,7 @@ class DangerZonePipeline(BaseVideoPipeline):
                 "id": alert_id,
                 "timestamp_sec": timestamp_sec,
                 "formatted_time": f"{int(timestamp_sec // 60):02d}:{int(timestamp_sec % 60):02d}",
-                "clip_url": f"/storage/alerts/alert_{alert_id}.webm",
+                "clip_url": f"/storage/alerts/alert_{alert_id}.mp4",
                 "immediate_buzzer_trigger": (alert_severity == "SEVERE"),
                 "severity": alert_severity
             }

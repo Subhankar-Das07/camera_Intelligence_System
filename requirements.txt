@@ -21,8 +21,37 @@ supervision
 Pillow
 
 # ── Vehicle Recognition module (Pratyush) ────────────────────────────────────
+fastapi
+uvicorn
+opencv-python
+ultralytics
+lap>=0.5.12
+shapely
+python-multipart
+numpy
+websockets
+
+# ── Face Recognition module (Ayush) ──────────────────────────────────────────
+# InsightFace: SCRFD detector + ArcFace recognition (buffalo_l model pack)
+insightface
+# ONNX Runtime: CPU-only inference. GPU upgrade: pip install onnxruntime-gpu
+onnxruntime
+# FAISS: fast vector similarity search for face embeddings
+faiss-cpu
+# ByteTrack tracker via Supervision (Roboflow)
+supervision
+# Image I/O for face crop saving
+Pillow
+
+# ── Vehicle Recognition module (Pratyush) ────────────────────────────────────
 # RapidOCR (ONNX) for license plate text reading
 rapidocr-onnxruntime
 
 # ── Redis (single application database) ──────────────────────────────────────
 redis
+
+# ── Intel Hardware Acceleration ──────────────────────────────────────────────
+openvino
+
+# ── Tracking and Inference ───────────────────────────────────────────────────
+trackers==2.3.0

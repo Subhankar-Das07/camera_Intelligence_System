@@ -35,6 +35,7 @@ services:
       - ./core:/app/core
       - ./static:/app/static
       - ./main.py:/app/main.py
+      - ./best.pt:/app/best.pt
     depends_on:
       redis:
         condition: service_healthy

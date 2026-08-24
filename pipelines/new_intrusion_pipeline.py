@@ -245,12 +245,15 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                     self._ov_device     = device
                     self._ppp_enabled   = ppp_ok
                     self._use_openvino  = True
-                    log.info("[NewIntrusion] OpenVINO active | device=%s | PPP=%s", device, ppp_ok)
+                    print(f"[NewIntrusion] OpenVINO active | device={device} | PPP={ppp_ok}")
                 except Exception as exc:
-                    log.warning("[NewIntrusion] Engine build failed (%s). Falling back.", exc)
+                    print(f"[NewIntrusion] Engine build failed ({exc}). Falling back.")
+                    self._use_openvino = False
+            else:
+                self._use_openvino = False
 
         if not self._use_openvino:
-            log.info("[NewIntrusion] Using Ultralytics CPU fallback.")
+            print("[NewIntrusion] Using Ultralytics CPU fallback.")
             from ultralytics import YOLO
             self._ul_model = YOLO(model_weight)
 
@@ -361,10 +364,10 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                     cooldown_frames   = cooldown_frames_max
                     alert_id          = str(uuid.uuid4())
                     alert_start_frame = frame_idx
-                    alert_path        = os.path.join(output_dir, f"alert_{alert_id}.webm")
+                    alert_path        = os.path.join(output_dir, f"alert_{alert_id}.mp4")
                     elapsed_time      = time.time() - start_time
                     actual_fps        = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
-                    alert_writer      = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"vp80"), actual_fps, (width, height))
+                    alert_writer      = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"mp4v"), actual_fps, (width, height))
                 if intrusion_active:
                     intrusion_frames_without_detection = 0
             else:
@@ -379,7 +382,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                             alert_event = {
                                 "id": alert_id, "timestamp_sec": ts,
                                 "formatted_time": f"{int(ts//60):02d}:{int(ts%60):02d}",
-                                "clip_url": f"/storage/alerts/alert_{alert_id}.webm",
+                                "clip_url": f"/storage/alerts/alert_{alert_id}.mp4",
                             }
 
             if intrusion_active and alert_writer:
@@ -395,7 +398,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
             ts = alert_start_frame / fps
             yield None, {"id": alert_id, "timestamp_sec": ts,
                          "formatted_time": f"{int(ts//60):02d}:{int(ts%60):02d}",
-                         "clip_url": f"/storage/alerts/alert_{alert_id}.webm"}
+                         "clip_url": f"/storage/alerts/alert_{alert_id}.mp4"}
         cap.release()
 
     def run_on_video(self, input_path, output_dir, roi_normalized, config):
@@ -487,10 +490,10 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                         cooldown_frames   = cooldown_frames_max
                         alert_id          = str(uuid.uuid4())
                         alert_start_frame = result["frame_idx"]
-                        alert_path        = os.path.join(output_dir, f"alert_{alert_id}.webm")
+                        alert_path        = os.path.join(output_dir, f"alert_{alert_id}.mp4")
                         elapsed_time      = time.time() - start_time
                         actual_fps        = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
-                        alert_writer      = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"vp80"), actual_fps, (width, height))
+                        alert_writer      = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"mp4v"), actual_fps, (width, height))
                     if intrusion_active:
                         intrusion_frames_without_detection = 0
                 else:
@@ -505,7 +508,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
                                 alert_event = {
                                     "id": alert_id, "timestamp_sec": ts,
                                     "formatted_time": f"{int(ts//60):02d}:{int(ts%60):02d}",
-                                    "clip_url": f"/storage/alerts/alert_{alert_id}.webm",
+                                    "clip_url": f"/storage/alerts/alert_{alert_id}.mp4",
                                 }
 
                 if intrusion_active and alert_writer:
@@ -532,6 +535,6 @@ class NewIntrusionPipeline(BaseVideoPipeline):
             ts = alert_start_frame / fps
             yield None, {"id": alert_id, "timestamp_sec": ts,
                          "formatted_time": f"{int(ts//60):02d}:{int(ts%60):02d}",
-                         "clip_url": f"/storage/alerts/alert_{alert_id}.webm"}
+                         "clip_url": f"/storage/alerts/alert_{alert_id}.mp4"}
         cap.release()
         log.info("[NewIntrusion] Stream ended after %d frames.", frame_idx)

@@ -276,6 +276,8 @@
             const rect = mainVideoImg.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
 
+            const containerRect = mainVideoImg.parentElement.getBoundingClientRect();
+
             const imgRatio = state.imageWidth / state.imageHeight;
             const boxRatio = rect.width / rect.height;
             let renderW, renderH, offsetX, offsetY;
@@ -288,10 +290,13 @@
                 offsetX = (rect.width - renderW) / 2; offsetY = 0;
             }
 
+            const finalLeft = (rect.left - containerRect.left) + offsetX;
+            const finalTop  = (rect.top - containerRect.top) + offsetY;
+
             roiCanvas.style.width  = renderW + "px";
             roiCanvas.style.height = renderH + "px";
-            roiCanvas.style.left   = offsetX + "px";
-            roiCanvas.style.top    = offsetY + "px";
+            roiCanvas.style.left   = finalLeft + "px";
+            roiCanvas.style.top    = finalTop + "px";
         }
 
         window.addEventListener("resize", () => { if (state.active) alignCanvas(); });

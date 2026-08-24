@@ -4,6 +4,8 @@ document.addEventListener("DOMContentLoaded", () => {
     "new_intrusion",
     "danger_zone",
     "fall_detection",
+    "fall_detection_v2",   // Enhanced V2: 4-signal AND-gate, Kalman filter, stillness check
+    "cascaded_fall",       // Custom Two-Stage: YOLO-NAS + best.pt fall classification
     "room_guardian",
   ]);
 
@@ -48,6 +50,8 @@ document.addEventListener("DOMContentLoaded", () => {
           if (p === "new_intrusion") displayName = "Intrusion Detection (OpenVINO)";
           if (p === "danger_zone") displayName = "Danger Zone";
           if (p === "fall_detection") displayName = "Fall Detection";
+          if (p === "fall_detection_v2") displayName = "Fall Detection V2 (Enhanced)";  // New enhanced pipeline
+          if (p === "cascaded_fall") displayName = "Cascaded Fall (YOLO-NAS + best.pt)";
           if (p === "room_guardian") displayName = "Object Tracking";
           opt.textContent = displayName;
           pipelineSelect.appendChild(opt);
@@ -166,6 +170,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!imageWidth || !imageHeight) return;
     const rect = mainVideoImg.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
+
+    const containerRect = mainVideoImg.parentElement.getBoundingClientRect();
+
     const imgRatio = imageWidth / imageHeight;
     const boxRatio = rect.width / rect.height;
     let renderWidth, renderHeight, offsetX, offsetY;
@@ -180,10 +187,14 @@ document.addEventListener("DOMContentLoaded", () => {
       offsetX = (rect.width - renderWidth) / 2;
       offsetY = 0;
     }
+
+    const finalLeft = (rect.left - containerRect.left) + offsetX;
+    const finalTop  = (rect.top - containerRect.top) + offsetY;
+
     roiCanvas.style.width = renderWidth + "px";
     roiCanvas.style.height = renderHeight + "px";
-    roiCanvas.style.left = offsetX + "px";
-    roiCanvas.style.top = offsetY + "px";
+    roiCanvas.style.left = finalLeft + "px";
+    roiCanvas.style.top = finalTop + "px";
   }
 
   window.addEventListener("resize", alignCanvas);
@@ -279,7 +290,7 @@ document.addEventListener("DOMContentLoaded", () => {
       startAnalysisMode();
     } catch (err) {
       console.error(err);
-      alert("Error starting analysis.");
+      alert("Error starting analysis: " + err.message);
       runBtn.disabled = false;
     }
   });

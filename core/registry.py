@@ -6,6 +6,7 @@ from pipelines.face_recognition_pipeline import FaceRecognitionPipeline
 from pipelines.fall_detection_pipeline import FallDetectionPipeline
 # Add Room Guardian pipeline to track static objects
 from pipelines.room_guardian_pipeline import RoomGuardianPipeline
+from pipelines.cascaded_fall_pipeline import CascadedFallPipeline
 
 class PipelineRegistry:
     def __init__(self):
@@ -46,7 +47,15 @@ registry.register("fall_detection", FallDetectionPipeline)
 
 # ── Room Guardian pipeline ───────────────────────────────────────────────────
 registry.register("room_guardian", RoomGuardianPipeline)
+registry.register("cascaded_fall", CascadedFallPipeline)
 
 # ── New Intrusion pipeline (OpenVINO hardware-accelerated) ────────────────────
 from pipelines.new_intrusion_pipeline import NewIntrusionPipeline
 registry.register("new_intrusion", NewIntrusionPipeline)
+
+# ── Fall Detection V2 pipeline (enhanced, decoupled, 4-signal AND-gate) ───────
+# This is a drop-in upgrade to "fall_detection". It has the identical API and
+# alert schema. Use "pipeline_type": "fall_detection_v2" in your API request
+# to route to this pipeline. The original "fall_detection" is NOT affected.
+from pipelines.new_fall_detection_pipeline import FallDetectionPipelineV2
+registry.register("fall_detection_v2", FallDetectionPipelineV2)

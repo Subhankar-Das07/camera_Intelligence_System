@@ -35,30 +35,14 @@ registry.register("gate_analytics", GateAnalyticsPipeline)
 
 # ── Guardian scan models — loaded ONCE at startup, never reloaded per request ──
 # This eliminates the 2-5s cold-load that was happening on every scan click.
-_guardian_fastsam: Optional[_FastSAM] = None
-_guardian_yolo:    Optional[_YOLO]    = None
+_guardian_yolo: Optional[_YOLO] = None
 
 def _get_guardian_models():
-    """Lazy-load guardian scan models as singletons."""
-    global _guardian_fastsam, _guardian_yolo
-    if _guardian_fastsam is None:
-        _guardian_fastsam = _FastSAM("FastSAM-s.pt")
+    """Lazy-load guardian scan model as singleton."""
+    global _guardian_yolo
     if _guardian_yolo is None:
-        # Use the existing YOLO model already present in the image for class labeling
-        _guardian_yolo = _YOLO("yolov8n-pose.pt")
-    return _guardian_fastsam, _guardian_yolo
-
-
-def _guardian_iou(boxA, boxB) -> float:
-    """IoU between two [x,y,w,h] boxes."""
-    ax1, ay1, ax2, ay2 = boxA[0], boxA[1], boxA[0]+boxA[2], boxA[1]+boxA[3]
-    bx1, by1, bx2, by2 = boxB[0], boxB[1], boxB[0]+boxB[2], boxB[1]+boxB[3]
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-    if inter == 0: return 0.0
-    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
-    return inter / union if union > 0 else 0.0
+        _guardian_yolo = _YOLO("yolov8s.pt")
+    return _guardian_yolo
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -735,63 +719,38 @@ async def guardian_scan(request: GuardianScanRequest):
     preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
     cv2.imwrite(preview_path, frame)
 
-    # Run both models in thread pool (non-blocking) using singletons
+    # Run model in thread pool (non-blocking) using singleton
     loop = asyncio.get_running_loop()
-    fastsam_model, yolo_model = _get_guardian_models()
-    CONF_GATE = 0.60
+    yolo_model = _get_guardian_models()
+    CONF_GATE = 0.25
 
     def _infer():
-        # 1. FastSAM: class-agnostic segments
-        sam_results  = fastsam_model(frame, conf=CONF_GATE, verbose=False)[0]
-        # 2. YOLOv8: class-aware detections for labeling
-        yolo_results = yolo_model(frame, conf=0.35, verbose=False)[0]
-        return sam_results, yolo_results
+        return yolo_model(frame, conf=CONF_GATE, verbose=False)[0]
 
-    sam_results, yolo_results = await loop.run_in_executor(None, _infer)
-
-    # Build YOLO label lookup: list of (bbox_xywh_abs, class_name)
-    yolo_boxes = []
-    if yolo_results.boxes is not None:
-        names = yolo_results.names or {}
-        for box in yolo_results.boxes:
-            cls_id = int(box.cls[0])
-            xywh   = box.xywh[0].cpu().numpy()
-            cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
-            yolo_boxes.append({
-                "bbox":  [int(cx - bw/2), int(cy - bh/2), int(bw), int(bh)],
-                "label": names.get(cls_id, f"cls_{cls_id}"),
-            })
-
-    def _match_label(sam_bbox_abs):
-        """Find best-matching YOLO class label for a FastSAM box."""
-        best_iou, best_label = 0.0, "Object"
-        for yb in yolo_boxes:
-            iou = _guardian_iou(sam_bbox_abs, yb["bbox"])
-            if iou > best_iou:
-                best_iou  = iou
-                best_label = yb["label"]
-        # Only use label if IoU is convincing (>=0.3)
-        return best_label if best_iou >= 0.30 else "Object"
+    yolo_results = await loop.run_in_executor(None, _infer)
 
     detections = []
-    if sam_results.boxes is not None:
-        for i, box in enumerate(sam_results.boxes):
+    if yolo_results.boxes is not None:
+        names = yolo_results.names or {}
+        for i, box in enumerate(yolo_results.boxes):
             conf = float(box.conf[0])
-            if conf < CONF_GATE:
-                continue   # strict confidence gate
+            cls_id = int(box.cls[0])
+            label = names.get(cls_id, f"cls_{cls_id}")
+            
             xywh = box.xywh[0].cpu().numpy()
             cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
             bx_abs = int(cx - bw/2)
             by_abs = int(cy - bh/2)
-            nx  = bx_abs / width
-            ny  = by_abs / height
-            nw  = bw / width
-            nh  = bh / height
-            label = _match_label([bx_abs, by_abs, int(bw), int(bh)])
+            
+            nx = bx_abs / width
+            ny = by_abs / height
+            nw = bw / width
+            nh = bh / height
+            
             detections.append({
-                "id":              f"sam-{i}-{str(uuid.uuid4())[:8]}",
+                "id":              f"yolo-{i}-{str(uuid.uuid4())[:8]}",
                 "label":           label,
-                "class_id":        None,
+                "class_id":        cls_id,
                 "confidence":      round(conf, 2),
                 "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
             })
