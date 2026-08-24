@@ -324,6 +324,35 @@ def camera_snapshot(cam_id: str):
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
+@router.get("/cameras/{cam_id}/fresh-preview")
+def camera_fresh_preview(cam_id: str):
+    """Grab a live frame for Rules ROI setup — updates saved preview_url (no go_live required)."""
+    cam = store.get_camera(cam_id)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    frame = _grab_camera_frame(cam)
+    if frame is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read a frame from this camera — check URL, credentials, and network",
+        )
+    saved = _save_preview_frame(frame)
+    preview_url = saved.get("preview_url") or ""
+    store.save_camera({
+        **cam,
+        "preview_url": preview_url,
+        "health": "online",
+        "last_error": "",
+        "last_frame_at": time.time(),
+    })
+    return {
+        "ok": True,
+        "preview_url": preview_url,
+        "width": saved.get("width"),
+        "height": saved.get("height"),
+    }
+
+
 @router.get("/cameras/{cam_id}/preview-frame")
 def camera_preview_frame(cam_id: str, apply_rules: bool = False):
     """Go-live hero preview — raw or with rule overlays (no alerts)."""
@@ -343,6 +372,17 @@ def camera_preview_frame(cam_id: str, apply_rules: bool = False):
     if not data:
         raise HTTPException(status_code=400, detail="Could not render preview frame")
     return Response(content=data, media_type="image/jpeg")
+
+
+@router.get("/cameras/{cam_id}/preview-status")
+def camera_preview_status(cam_id: str):
+    """Go-live hero preview — rule legend, live hits, gate counters (JSON)."""
+    if not store.get_site().get("go_live"):
+        raise HTTPException(status_code=409, detail="Scanning is not active")
+    cam = store.get_camera(cam_id)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return site_admin_monitor.get_preview_status(cam_id)
 
 
 @router.post("/cameras/{cam_id}/suggest-roi")
@@ -657,51 +697,122 @@ def reports_csv(hours: float = 24.0):
 
 
 @router.get("/reports/gate")
-def reports_gate(hours: float = 24.0, rule_id: Optional[str] = None):
-    until = time.time()
-    since = until - max(0.1, hours) * 3600
-    return store.gate_report_summary(since, until, rule_id)
+def reports_gate(
+    hours: float = 24.0,
+    rule_id: Optional[str] = None,
+    period: str = "hours",
+    since: Optional[float] = None,
+    until: Optional[float] = None,
+):
+    period = (period or "hours").lower()
+    if period not in ("hours", "daily", "weekly", "monthly"):
+        period = "hours"
+    if since is not None and until is not None:
+        return store.gate_report_by_period(
+            period=period,
+            rule_id=rule_id,
+            since_ts=since,
+            until_ts=until,
+        )
+    return store.gate_report_by_period(period=period, rule_id=rule_id, hours=hours)
 
 
 @router.get("/reports/gate/csv")
-def reports_gate_csv(hours: float = 24.0, rule_id: Optional[str] = None):
-    until = time.time()
-    since = until - max(0.1, hours) * 3600
-    data = store.gate_report_summary(since, until, rule_id)
+def reports_gate_csv(
+    hours: float = 24.0,
+    rule_id: Optional[str] = None,
+    period: str = "hours",
+    since: Optional[float] = None,
+    until: Optional[float] = None,
+):
+    period = (period or "hours").lower()
+    if period not in ("hours", "daily", "weekly", "monthly"):
+        period = "hours"
+    if since is not None and until is not None:
+        data = store.gate_report_by_period(
+            period=period,
+            rule_id=rule_id,
+            since_ts=since,
+            until_ts=until,
+        )
+    else:
+        data = store.gate_report_by_period(period=period, rule_id=rule_id, hours=hours)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow([
-        "rule_id",
-        "rule_name",
-        "gate_opens",
-        "gate_closes",
-        "persons_in",
-        "persons_out",
-        "cars_in",
-        "cars_out",
-        "bikes_in",
-        "bikes_out",
-        "near_events",
-        "medium_events",
-        "far_events",
-    ])
-    for row in data.get("rules") or []:
-        t = row.get("totals") or {}
+    if period in ("daily", "weekly", "monthly") and data.get("daily"):
         w.writerow([
-            row.get("rule_id"),
-            row.get("rule_name"),
-            t.get("gate_opens", 0),
-            t.get("gate_closes", 0),
-            t.get("persons_in", 0),
-            t.get("persons_out", 0),
-            t.get("cars_in", 0),
-            t.get("cars_out", 0),
-            t.get("bikes_in", 0),
-            t.get("bikes_out", 0),
-            t.get("near_events", 0),
-            t.get("medium_events", 0),
-            t.get("far_events", 0),
+            "date",
+            "rule_id",
+            "footfall",
+            "persons_in",
+            "persons_out",
+            "cars_in",
+            "cars_out",
+            "vehicle_crossings",
+            "gate_opens",
+            "gate_closes",
+            "bikes_in",
+            "bikes_out",
+            "near_events",
+            "medium_events",
+            "far_events",
         ])
+        for row in data.get("daily") or []:
+            t = row.get("counters") or {}
+            w.writerow([
+                row.get("date"),
+                row.get("rule_id"),
+                t.get("footfall", 0),
+                t.get("persons_in", 0),
+                t.get("persons_out", 0),
+                t.get("cars_in", 0),
+                t.get("cars_out", 0),
+                t.get("vehicle_crossings", 0),
+                t.get("gate_opens", 0),
+                t.get("gate_closes", 0),
+                t.get("bikes_in", 0),
+                t.get("bikes_out", 0),
+                t.get("near_events", 0),
+                t.get("medium_events", 0),
+                t.get("far_events", 0),
+            ])
+    else:
+        w.writerow([
+            "rule_id",
+            "rule_name",
+            "footfall",
+            "gate_opens",
+            "gate_closes",
+            "persons_in",
+            "persons_out",
+            "cars_in",
+            "cars_out",
+            "vehicle_crossings",
+            "bikes_in",
+            "bikes_out",
+            "near_events",
+            "medium_events",
+            "far_events",
+        ])
+        for row in data.get("rules") or []:
+            t = row.get("totals") or {}
+            w.writerow([
+                row.get("rule_id"),
+                row.get("rule_name"),
+                t.get("footfall", 0),
+                t.get("gate_opens", 0),
+                t.get("gate_closes", 0),
+                t.get("persons_in", 0),
+                t.get("persons_out", 0),
+                t.get("cars_in", 0),
+                t.get("cars_out", 0),
+                t.get("vehicle_crossings", 0),
+                t.get("bikes_in", 0),
+                t.get("bikes_out", 0),
+                t.get("near_events", 0),
+                t.get("medium_events", 0),
+                t.get("far_events", 0),
+            ])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),

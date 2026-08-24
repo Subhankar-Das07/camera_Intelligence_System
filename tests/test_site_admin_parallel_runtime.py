@@ -55,6 +55,16 @@ class TickSleepTests(unittest.TestCase):
         self.assertEqual(low, 3.0)
 
 
+class ScanParallelConfigTests(unittest.TestCase):
+    def test_scan_rule_workers_default(self):
+        self.assertGreaterEqual(scan.SCAN_RULE_WORKERS, 1)
+        self.assertLessEqual(scan.SCAN_RULE_WORKERS, 3)
+
+    def test_worker_state_has_pipe_lock(self):
+        state = scan.new_worker_state()
+        self.assertIn("pipe_lock", state)
+
+
 class RuntimeStatusTests(unittest.TestCase):
     @patch("core.site_admin_runtime.store.list_runtime_worker_heartbeats")
     @patch("core.site_admin_runtime.store.get_site")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.redis_client import get_redis, redis_str
 
@@ -226,6 +226,10 @@ def _gate_hourly_key(rule_id: str, hour_bucket: str) -> str:
     return f"gate:hourly:{rule_id}:{hour_bucket}"
 
 
+def _gate_daily_key(rule_id: str, day_bucket: str) -> str:
+    return f"gate:daily:{rule_id}:{day_bucket}"
+
+
 def _gate_events_key(rule_id: str) -> str:
     return f"gate:events:{rule_id}"
 
@@ -242,7 +246,9 @@ def increment_gate_counters(rule_id: str, deltas: Dict[str, int]) -> None:
     if not rule_id or not deltas:
         return
     r = get_redis()
-    hour_bucket = time.strftime("%Y%m%d%H", time.localtime())
+    now = time.time()
+    hour_bucket = time.strftime("%Y%m%d%H", time.localtime(now))
+    day_bucket = time.strftime("%Y%m%d", time.localtime(now))
     pipe = r.pipeline()
     for field, val in deltas.items():
         if field not in GATE_COUNTER_FIELDS:
@@ -252,6 +258,7 @@ def increment_gate_counters(rule_id: str, deltas: Dict[str, int]) -> None:
             continue
         pipe.hincrby(_gate_totals_key(rule_id), field, n)
         pipe.hincrby(_gate_hourly_key(rule_id, hour_bucket), field, n)
+        pipe.hincrby(_gate_daily_key(rule_id, day_bucket), field, n)
     pipe.execute()
 
 
@@ -301,6 +308,95 @@ def _sum_hourly_hash(data: Dict[Any, Any]) -> Dict[str, int]:
     return out
 
 
+def _sum_counters(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
+    out = _empty_gate_counters()
+    for field in GATE_COUNTER_FIELDS:
+        out[field] = int(a.get(field, 0)) + int(b.get(field, 0))
+    return out
+
+
+def _add_derived_counters(counters: Dict[str, int]) -> Dict[str, int]:
+    out = dict(counters)
+    out["footfall"] = int(out.get("persons_in", 0)) + int(out.get("persons_out", 0))
+    out["vehicle_crossings"] = int(out.get("cars_in", 0)) + int(out.get("cars_out", 0))
+    return out
+
+
+def _local_day_start(ts: float) -> float:
+    lt = time.localtime(ts)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+
+
+def _iter_day_starts(since_ts: float, until_ts: float) -> List[float]:
+    day_start = _local_day_start(since_ts)
+    days: List[float] = []
+    while day_start <= until_ts:
+        days.append(day_start)
+        day_start += 86400
+    return days
+
+
+def _sum_hourly_window(
+    r: Any,
+    rule_id: str,
+    since_ts: float,
+    until_ts: float,
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    window_totals = _empty_gate_counters()
+    hourly: List[Dict[str, Any]] = []
+    t = since_ts
+    while t <= until_ts:
+        bucket = time.strftime("%Y%m%d%H", time.localtime(t))
+        hdata = r.hgetall(_gate_hourly_key(rule_id, bucket))
+        if hdata:
+            summed = _sum_hourly_hash(hdata)
+            if any(summed.values()):
+                hourly.append({
+                    "rule_id": rule_id,
+                    "hour": bucket,
+                    "counters": _add_derived_counters(summed),
+                })
+            window_totals = _sum_counters(window_totals, summed)
+        t += 3600
+    return window_totals, hourly
+
+
+def _sum_daily_window(
+    r: Any,
+    rule_id: str,
+    since_ts: float,
+    until_ts: float,
+) -> List[Dict[str, Any]]:
+    daily: List[Dict[str, Any]] = []
+    for day_start in _iter_day_starts(since_ts, until_ts):
+        bucket = time.strftime("%Y%m%d", time.localtime(day_start))
+        ddata = r.hgetall(_gate_daily_key(rule_id, bucket))
+        if not ddata:
+            continue
+        summed = _sum_hourly_hash(ddata)
+        if any(summed.values()):
+            daily.append({
+                "date": bucket,
+                "rule_id": rule_id,
+                "counters": _add_derived_counters(summed),
+            })
+    return daily
+
+
+def gate_report_period_bounds(period: str, hours: float = 24.0) -> Tuple[float, float]:
+    until = time.time()
+    if period == "daily":
+        since = _local_day_start(until)
+    elif period == "weekly":
+        since = _local_day_start(until) - 6 * 86400
+    elif period == "monthly":
+        lt = time.localtime(until)
+        since = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, lt.tm_isdst))
+    else:
+        since = until - max(0.1, hours) * 3600
+    return since, until
+
+
 def gate_report_summary(
     since_ts: float,
     until_ts: float,
@@ -314,43 +410,52 @@ def gate_report_summary(
     per_rule: List[Dict[str, Any]] = []
     totals = _empty_gate_counters()
     hourly: List[Dict[str, Any]] = []
+    daily: List[Dict[str, Any]] = []
 
     r = get_redis()
     for rule in gate_rules:
         rid = rule.get("id") or ""
         if not rid:
             continue
-        rule_totals = get_gate_totals(rid)
+        window_totals, rule_hourly = _sum_hourly_window(r, rid, since_ts, until_ts)
+        rule_daily = _sum_daily_window(r, rid, since_ts, until_ts)
+        hourly.extend(rule_hourly)
+        daily.extend(rule_daily)
+        lifetime_totals = get_gate_totals(rid)
         per_rule.append({
             "rule_id": rid,
             "rule_name": rule.get("name"),
             "camera_id": rule.get("camera_id"),
-            "totals": rule_totals,
+            "totals": _add_derived_counters(window_totals),
+            "lifetime": _add_derived_counters(lifetime_totals),
+            "footfall": window_totals.get("persons_in", 0) + window_totals.get("persons_out", 0),
         })
-        for field in GATE_COUNTER_FIELDS:
-            totals[field] += rule_totals.get(field, 0)
-
-        t = since_ts
-        while t <= until_ts:
-            bucket = time.strftime("%Y%m%d%H", time.localtime(t))
-            hdata = r.hgetall(_gate_hourly_key(rid, bucket))
-            if hdata:
-                summed = _sum_hourly_hash(hdata)
-                if any(summed.values()):
-                    hourly.append({
-                        "rule_id": rid,
-                        "hour": bucket,
-                        "counters": summed,
-                    })
-            t += 3600
+        totals = _sum_counters(totals, window_totals)
 
     return {
         "from": since_ts,
         "to": until_ts,
         "rules": per_rule,
-        "totals": totals,
+        "totals": _add_derived_counters(totals),
         "hourly": hourly,
+        "daily": daily,
     }
+
+
+def gate_report_by_period(
+    period: str = "hours",
+    rule_id: Optional[str] = None,
+    hours: float = 24.0,
+    since_ts: Optional[float] = None,
+    until_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    if since_ts is not None and until_ts is not None:
+        since, until = float(since_ts), float(until_ts)
+    else:
+        since, until = gate_report_period_bounds(period, hours)
+    summary = gate_report_summary(since, until, rule_id)
+    summary["period"] = period
+    return summary
 
 
 def report_summary(since_ts: float, until_ts: float) -> Dict[str, Any]:

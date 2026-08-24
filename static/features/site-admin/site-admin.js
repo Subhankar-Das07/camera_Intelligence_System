@@ -44,6 +44,7 @@
     scanPreviewApplyRules: false,
     scanPreviewFocusCamId: "",
     scanPreviewLastHeroAt: 0,
+    scanPreviewStatusTimer: null,
   };
 
   function emptyGateConfig() {
@@ -725,6 +726,123 @@
       clearInterval(state.scanPreviewTimer);
       state.scanPreviewTimer = null;
     }
+    clearPreviewStatusTimer();
+  }
+
+  function clearPreviewStatusTimer() {
+    if (state.scanPreviewStatusTimer) {
+      clearInterval(state.scanPreviewStatusTimer);
+      state.scanPreviewStatusTimer = null;
+    }
+  }
+
+  function relativePreviewTime(ts) {
+    if (!ts) return "";
+    const sec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (sec < 60) return sec + "s ago";
+    return Math.floor(sec / 60) + "m ago";
+  }
+
+  function renderPreviewStatusPanel(st) {
+    const legendEl = document.getElementById("w-preview-legend");
+    const gateEl = document.getElementById("w-preview-gate");
+    const eventsEl = document.getElementById("w-preview-events");
+    const show = !!(state.scanPreviewApplyRules && st?.active);
+    if (legendEl) {
+      if (!show) {
+        legendEl.hidden = true;
+        legendEl.innerHTML = "";
+      } else {
+        const ruleStatus = st.rule_status || st.rules || [];
+        const parallelHint =
+          (ruleStatus.length || 0) > 1
+            ? `<p class="sa-preview-parallel-hint">Parallel (up to ${st.parallel_workers || 3})</p>`
+            : "";
+        const items = ruleStatus
+          .map((r) => {
+            const dotCls =
+              r.state === "triggered" ? "sa-preview-rule-dot--triggered" : r.state === "running" ? "sa-preview-rule-dot--running" : "sa-preview-rule-dot--idle";
+            return `<div class="sa-legend-item">
+              <span class="sa-preview-rule-dot ${dotCls}"></span>
+              <span class="sa-legend-swatch" style="background:${escapeHtml(r.css_color || "#666")}"></span>
+              <span>${escapeHtml(r.name || r.id)} — ${escapeHtml(r.scan_type || "")}</span>
+            </div>`;
+          })
+          .join("");
+        legendEl.innerHTML = parallelHint + (items || '<span class="sa-muted">No rules</span>');
+        legendEl.hidden = false;
+      }
+    }
+    if (gateEl) {
+      const gl = st?.gate_live;
+      const hasGate = show && gl && (st.scan_types || []).includes("gate_analytics");
+      if (!hasGate) {
+        gateEl.hidden = true;
+        gateEl.innerHTML = "";
+      } else {
+        const gt = gl.session_totals || {};
+        gateEl.innerHTML = `
+          <span class="sa-gate-badge sa-gate-badge--${escapeHtml(gl.gate_state || "unknown")}">Gate: ${escapeHtml((gl.gate_state || "unknown").toUpperCase())}</span>
+          <div class="sa-gate-stats">
+            <span>Footfall: ${(gt.persons_in || 0) + (gt.persons_out || 0)}</span>
+            <span>People in/out: ${gt.persons_in || 0} / ${gt.persons_out || 0}</span>
+            <span>Cars in/out: ${gt.cars_in || 0} / ${gt.cars_out || 0}</span>
+            <span>Opens/closes: ${gt.gate_opens || 0} / ${gt.gate_closes || 0}</span>
+          </div>`;
+        gateEl.hidden = false;
+      }
+    }
+    if (eventsEl) {
+      const events = show ? (st.events || []).slice(-5).reverse() : [];
+      if (!events.length) {
+        eventsEl.hidden = true;
+        eventsEl.innerHTML = "";
+      } else {
+        eventsEl.innerHTML = events
+          .map(
+            (ev) =>
+              `<span class="sa-preview-event-chip" style="border-color:${escapeHtml(ev.css_color || "#666")}">
+                <span class="sa-legend-swatch" style="background:${escapeHtml(ev.css_color || "#666")}"></span>
+                ${escapeHtml(ev.message || ev.rule_name || "Event")}
+                <span class="sa-muted">${escapeHtml(relativePreviewTime(ev.ts))}</span>
+              </span>`
+          )
+          .join("");
+        eventsEl.hidden = false;
+      }
+    }
+  }
+
+  async function refreshPreviewStatus(gen) {
+    if (gen !== state.scanPreviewGen || !scanPreviewWanted() || !state.scanPreviewWizard) return;
+    if (!state.scanPreviewApplyRules) {
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    const camId = resolvePreviewFocusCamId();
+    if (!camId) {
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    try {
+      const st = await api("/cameras/" + encodeURIComponent(camId) + "/preview-status");
+      if (gen !== state.scanPreviewGen) return;
+      renderPreviewStatusPanel(st);
+    } catch (_) {
+      if (gen === state.scanPreviewGen) renderPreviewStatusPanel(null);
+    }
+  }
+
+  function ensurePreviewStatusLoop() {
+    if (!scanPreviewWanted() || !state.scanPreviewWizard || !state.scanPreviewApplyRules) {
+      clearPreviewStatusTimer();
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    if (state.scanPreviewStatusTimer) return;
+    const gen = state.scanPreviewGen;
+    refreshPreviewStatus(gen);
+    state.scanPreviewStatusTimer = setInterval(() => refreshPreviewStatus(state.scanPreviewGen), 2000);
   }
 
   function stopScanPreview() {
@@ -835,7 +953,9 @@
         state.scanPreviewFocusCamId = camId;
         updatePreviewHighlights();
         state.scanPreviewGen += 1;
+        clearPreviewStatusTimer();
         refreshHeroPreview(state.scanPreviewGen);
+        ensurePreviewStatusLoop();
       };
     });
   }
@@ -845,6 +965,7 @@
     const camId = resolvePreviewFocusCamId();
     const img = document.getElementById("w-preview-hero-img");
     if (!img || !camId) return Promise.resolve();
+    const apply = previewHeroApplyRules(camId);
     const url = previewHeroUrl(camId);
     return new Promise((resolve) => {
       img.onerror = () => {
@@ -953,6 +1074,9 @@
                <p class="sa-preview-rules-hint" id="w-preview-rules-hint" hidden>Select a camera with rules to preview overlays.</p>
                <div class="sa-preview-hero">
                  <img id="w-preview-hero-img" alt="" />
+                 <div id="w-preview-gate" class="sa-gate-live sa-preview-gate" hidden></div>
+                 <div id="w-preview-legend" class="sa-preview-legend" hidden></div>
+                 <div id="w-preview-events" class="sa-preview-events" hidden></div>
                  <span class="sa-preview-hero-label" id="w-preview-hero-label"></span>
                </div>
                ${buildPreviewGridSectionsHtml()}`
@@ -964,7 +1088,9 @@
               state.scanPreviewApplyRules = rulesInner.checked;
               state.scanPreviewLastHeroAt = 0;
               state.scanPreviewGen += 1;
+              clearPreviewStatusTimer();
               refreshHeroPreview(state.scanPreviewGen);
+              ensurePreviewStatusLoop();
             };
           }
           bindPreviewGridClicks();
@@ -978,8 +1104,10 @@
 
     if (scanPreviewWanted()) {
       ensureScanPreviewLoop();
+      ensurePreviewStatusLoop();
     } else {
       clearScanPreviewTimer();
+      renderPreviewStatusPanel(null);
     }
   }
 
@@ -1487,7 +1615,7 @@
               </button>
             </td>`
           : `<td class="sa-rule-thumb-cell"><span class="sa-alert-thumb sa-alert-thumb--empty">No preview</span></td>`;
-        return `<tr>
+        return `<tr data-rule-camera-id="${escapeHtml(r.camera_id)}">
           ${thumbCell}
           <td>${escapeHtml(r.name)}</td>
           <td>${escapeHtml(cam?.name || r.camera_id)}</td>
@@ -1544,11 +1672,13 @@
             <button class="btn secondary" type="button" id="g-clear-mode">Clear current step</button>
           </div>
           <p class="sa-muted" id="roi-hint">Click the preview to draw ROI, or use Suggest regions (FastSAM) to click a detected area. Fall / face / vehicle can run without a polygon.</p>
+          <p class="sa-muted sa-roi-preview-status" id="roi-preview-status" hidden></p>
           <div class="sa-canvas-wrap" id="roi-wrap" style="display:none;">
             <img id="roi-img" alt="Preview">
             <canvas id="roi-cv"></canvas>
           </div>
           <div class="sa-row">
+            <button class="btn secondary" type="button" id="r-refresh-preview">Refresh preview</button>
             <button class="btn secondary" type="button" id="r-suggest">Suggest regions</button>
             <button class="btn secondary" type="button" id="r-suggest-done" style="display:none;">Done picking</button>
             <button class="btn secondary" type="button" id="r-clear">Clear ROI</button>
@@ -1558,7 +1688,7 @@
       </div>`
           : ""
       }
-      <table class="sa-table">
+      <table class="sa-table" id="r-rules-table">
         <thead><tr><th>Preview</th><th>Name</th><th>Camera</th><th>Scan</th><th>Geometry</th><th>On</th><th></th></tr></thead>
         <tbody>${rows || '<tr><td colspan="7" class="sa-muted">No rules yet</td></tr>'}</tbody>
       </table>`;
@@ -1631,7 +1761,7 @@
 
     typeSel?.addEventListener("change", () => {
       syncGateUi();
-      showPreview();
+      loadRulePreview();
     });
 
     document.querySelectorAll(".sa-gate-step").forEach((b) => {
@@ -1673,27 +1803,110 @@
           : `${n} of ${MAX_RULES_PER_CAMERA} enabled rules on this camera. Monitor runs all rules in parallel.`;
     }
 
-    function showPreview() {
-      const cam = state.cameras.find((c) => c.id === camSel?.value);
+    function syncRulesTableCameraHighlight(camId) {
+      document.querySelectorAll("#r-rules-table tbody tr[data-rule-camera-id]").forEach((row) => {
+        const rowCamId = row.getAttribute("data-rule-camera-id") || "";
+        const match = !!camId && rowCamId === camId;
+        row.classList.toggle("is-camera-highlight", match);
+        row.classList.toggle("is-camera-dimmed", !!camId && !match);
+      });
+    }
+
+    function setRoiPreviewStatus(msg, isError) {
+      const el = document.getElementById("roi-preview-status");
+      if (!el) return;
+      if (!msg) {
+        el.hidden = true;
+        el.textContent = "";
+        el.classList.remove("sa-roi-preview-status--error");
+        return;
+      }
+      el.hidden = false;
+      el.textContent = msg;
+      el.classList.toggle("sa-roi-preview-status--error", !!isError);
+    }
+
+    function applyRoiImage(url) {
       const wrap = document.getElementById("roi-wrap");
       const img = document.getElementById("roi-img");
-      state.roiSuggestions = [];
-      state.roiPickMode = false;
-      if (!wrap || !img || !cam?.preview_url) {
+      if (!wrap || !img || !url) {
         if (wrap) wrap.style.display = "none";
-        syncRoiPickUi();
         return;
       }
       wrap.style.display = "inline-block";
+      wrap.classList.remove("sa-roi-loading");
       img.onload = () => bindCanvas(img, document.getElementById("roi-cv"), isGateType());
-      img.src = cam.preview_url;
+      img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
+    }
+
+    async function loadRulePreview() {
+      const camId = camSel?.value;
+      const cam = state.cameras.find((c) => c.id === camId);
+      const wrap = document.getElementById("roi-wrap");
+      const refreshBtn = document.getElementById("r-refresh-preview");
+      state.roiSuggestions = [];
+      state.roiPickMode = false;
       syncRoiPickUi();
       syncCameraRuleLimitHint();
+      syncRulesTableCameraHighlight(camId || "");
+
+      if (!camId || !cam) {
+        if (wrap) wrap.style.display = "none";
+        setRoiPreviewStatus("");
+        return;
+      }
+
+      if (wrap) {
+        wrap.style.display = "inline-block";
+        wrap.classList.add("sa-roi-loading");
+      }
+      if (refreshBtn) refreshBtn.disabled = true;
+      setRoiPreviewStatus("Loading latest frame…");
+
+      try {
+        const data = await api("/cameras/" + encodeURIComponent(camId) + "/fresh-preview");
+        const previewUrl = data.preview_url || "";
+        if (previewUrl) {
+          const idx = state.cameras.findIndex((c) => c.id === camId);
+          if (idx >= 0) {
+            state.cameras[idx] = { ...state.cameras[idx], preview_url: previewUrl, health: "online" };
+          }
+          setRoiPreviewStatus("");
+          applyRoiImage(previewUrl);
+          return;
+        }
+        throw new Error("No preview returned");
+      } catch (e) {
+        const fallback = cam.preview_url || "";
+        if (fallback) {
+          setRoiPreviewStatus(
+            "Could not reach camera — showing last saved preview. " + (e.message || ""),
+            true
+          );
+          applyRoiImage(fallback);
+        } else {
+          if (wrap) {
+            wrap.style.display = "none";
+            wrap.classList.remove("sa-roi-loading");
+          }
+          setRoiPreviewStatus(
+            "Could not reach camera — re-test the connection under Cameras. " + (e.message || ""),
+            true
+          );
+        }
+      } finally {
+        if (refreshBtn) refreshBtn.disabled = false;
+      }
     }
+
     if (camSel) {
-      camSel.onchange = showPreview;
-      showPreview();
+      camSel.onchange = () => {
+        syncRulesTableCameraHighlight(camSel.value);
+        loadRulePreview();
+      };
+      loadRulePreview();
     }
+    document.getElementById("r-refresh-preview")?.addEventListener("click", () => loadRulePreview());
     syncGateUi();
 
     document.getElementById("r-suggest")?.addEventListener("click", async () => {
@@ -2611,12 +2824,15 @@
 
   async function reports() {
     await loadLists();
+    const period = document.getElementById("rep-period")?.value || "daily";
     const hours = document.getElementById("rep-hours")?.value || "24";
     const ruleFilter = document.getElementById("rep-gate-rule")?.value || "";
     const data = await api("/reports?hours=" + hours);
-    let gateData = { totals: {}, rules: [] };
+    let gateData = { totals: {}, rules: [], daily: [] };
     try {
-      const q = "/reports/gate?hours=" + hours + (ruleFilter ? "&rule_id=" + encodeURIComponent(ruleFilter) : "");
+      let q = "/reports/gate?period=" + encodeURIComponent(period);
+      if (period === "hours") q += "&hours=" + encodeURIComponent(hours);
+      if (ruleFilter) q += "&rule_id=" + encodeURIComponent(ruleFilter);
       gateData = await api(q);
     } catch (_) {
       /* ignore */
@@ -2632,10 +2848,48 @@
     const gateRuleOpts = gateRules
       .map((r) => `<option value="${r.id}"${ruleFilter === r.id ? " selected" : ""}>${escapeHtml(r.name)}</option>`)
       .join("");
+    const periodLabels = { daily: "Today", weekly: "Last 7 days", monthly: "This month", hours: "Custom hours" };
+    const periodLabel = periodLabels[period] || period;
+    const showHoursInput = period === "hours";
+    const showDailyTable = period !== "hours" && (gateData.daily || []).length > 0;
+    const ruleNameById = Object.fromEntries(gateRules.map((r) => [r.id, r.name]));
+    const dailyRows = (gateData.daily || [])
+      .map((row) => {
+        const c = row.counters || {};
+        const dateStr = row.date
+          ? row.date.slice(0, 4) + "-" + row.date.slice(4, 6) + "-" + row.date.slice(6, 8)
+          : "—";
+        const rname = ruleNameById[row.rule_id] || row.rule_id || "—";
+        return `<tr>
+          <td>${escapeHtml(dateStr)}</td>
+          <td>${escapeHtml(rname)}</td>
+          <td>${c.footfall || 0}</td>
+          <td>${c.persons_in || 0}</td>
+          <td>${c.persons_out || 0}</td>
+          <td>${c.cars_in || 0}</td>
+          <td>${c.cars_out || 0}</td>
+          <td>${c.gate_opens || 0}</td>
+          <td>${c.gate_closes || 0}</td>
+        </tr>`;
+      })
+      .join("");
+    let gateCsvQ = "/reports/gate/csv?period=" + encodeURIComponent(period);
+    if (period === "hours") gateCsvQ += "&hours=" + encodeURIComponent(hours);
+    if (ruleFilter) gateCsvQ += "&rule_id=" + encodeURIComponent(ruleFilter);
     main.innerHTML = `
-      <div class="sa-h"><div><h2>Reports</h2><p>Alert summaries and gate activity counters. Export CSV when you need a file.</p></div></div>
-      <div class="sa-row" style="margin-bottom:1rem;">
-        <label class="sa-muted">Hours <input class="text-input" id="rep-hours" type="number" min="1" value="${escapeHtml(hours)}" style="width:6rem;display:inline-block;"></label>
+      <div class="sa-h"><div><h2>Reports</h2><p>Alert summaries and gate activity (footfall = people in + out). Export CSV when you need a file.</p></div></div>
+      <div class="sa-row" style="margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;">
+        <label class="sa-muted">Period
+          <select class="text-input" id="rep-period" style="max-width:160px;display:inline-block;">
+            <option value="daily"${period === "daily" ? " selected" : ""}>Today</option>
+            <option value="weekly"${period === "weekly" ? " selected" : ""}>Last 7 days</option>
+            <option value="monthly"${period === "monthly" ? " selected" : ""}>This month</option>
+            <option value="hours"${period === "hours" ? " selected" : ""}>Custom hours</option>
+          </select>
+        </label>
+        <label class="sa-muted"${showHoursInput ? "" : ' style="display:none;"'} id="rep-hours-wrap">Hours
+          <input class="text-input" id="rep-hours" type="number" min="1" value="${escapeHtml(hours)}" style="width:6rem;display:inline-block;">
+        </label>
         <button class="btn secondary" type="button" id="rep-go">Generate</button>
         <a class="btn secondary" href="${API}/reports/csv?hours=${escapeHtml(hours)}" style="display:inline-block;text-decoration:none;">Alerts CSV</a>
       </div>
@@ -2645,7 +2899,7 @@
         <div class="sa-card"><h3>People seen</h3><p>${(data.attendance_people || []).map(escapeHtml).join(", ") || "—"}</p></div>
       </div>
       <div class="sa-card" style="margin-top:1rem;">
-        <h3>Gate activity</h3>
+        <h3>Gate activity — ${escapeHtml(periodLabel)}</h3>
         <div class="sa-row" style="margin-bottom:0.75rem;">
           <label class="sa-muted">Gate rule
             <select class="text-input" id="rep-gate-rule" style="max-width:220px;display:inline-block;">
@@ -2653,26 +2907,47 @@
               ${gateRuleOpts}
             </select>
           </label>
-          <a class="btn secondary" href="${API}/reports/gate/csv?hours=${escapeHtml(hours)}${ruleFilter ? "&rule_id=" + encodeURIComponent(ruleFilter) : ""}" style="display:inline-block;text-decoration:none;">Gate CSV</a>
+          <a class="btn secondary" href="${API}${gateCsvQ}" style="display:inline-block;text-decoration:none;">Gate CSV</a>
         </div>
         <div class="sa-gate-report-grid">
-          <div class="sa-card sa-gate-stat"><h4>Gate opens</h4><div class="sa-stat">${gt.gate_opens || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Gate closes</h4><div class="sa-stat">${gt.gate_closes || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Footfall</h4><div class="sa-stat">${gt.footfall || 0}</div><p class="sa-muted">People in + out</p></div>
           <div class="sa-card sa-gate-stat"><h4>People in</h4><div class="sa-stat">${gt.persons_in || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>People out</h4><div class="sa-stat">${gt.persons_out || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Cars in</h4><div class="sa-stat">${gt.cars_in || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Cars out</h4><div class="sa-stat">${gt.cars_out || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Bikes in</h4><div class="sa-stat">${gt.bikes_in || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Bikes out</h4><div class="sa-stat">${gt.bikes_out || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Vehicle crossings</h4><div class="sa-stat">${gt.vehicle_crossings || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Gate opens</h4><div class="sa-stat">${gt.gate_opens || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Gate closes</h4><div class="sa-stat">${gt.gate_closes || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Bikes in/out</h4><div class="sa-stat">${gt.bikes_in || 0} / ${gt.bikes_out || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Near zone</h4><div class="sa-stat">${gt.near_events || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Medium zone</h4><div class="sa-stat">${gt.medium_events || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Far zone</h4><div class="sa-stat">${gt.far_events || 0}</div></div>
         </div>
+        ${
+          showDailyTable
+            ? `<div class="sa-daily-report" style="margin-top:1rem;overflow-x:auto;">
+          <h4>Daily breakdown</h4>
+          <table class="sa-table">
+            <thead><tr>
+              <th>Date</th><th>Rule</th><th>Footfall</th><th>In</th><th>Out</th>
+              <th>Cars in</th><th>Cars out</th><th>Opens</th><th>Closes</th>
+            </tr></thead>
+            <tbody>${dailyRows || "<tr><td colspan='9'>No daily data in this period</td></tr>"}</tbody>
+          </table>
+        </div>`
+            : ""
+        }
       </div>
       <div class="sa-card"><h3>By type</h3><ul class="sa-muted">${types || "<li>None</li>"}</ul></div>
       <div class="sa-card" style="margin-top:0.8rem;"><h3>By camera</h3><ul class="sa-muted">${cams || "<li>None</li>"}</ul></div>`;
     document.getElementById("rep-go").onclick = () => reports();
     document.getElementById("rep-gate-rule")?.addEventListener("change", () => reports());
+    document.getElementById("rep-period")?.addEventListener("change", () => {
+      const p = document.getElementById("rep-period")?.value;
+      const wrap = document.getElementById("rep-hours-wrap");
+      if (wrap) wrap.style.display = p === "hours" ? "" : "none";
+      if (p !== "hours") reports();
+    });
   }
 
   function settings() {

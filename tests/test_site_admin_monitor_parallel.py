@@ -84,5 +84,57 @@ class ParallelEvalConfigTests(unittest.TestCase):
         self.assertLessEqual(monitor.MONITOR_RULE_WORKERS, 3)
 
 
+class PreviewPersistStatsTests(unittest.TestCase):
+    def test_skip_gate_store_when_preview_without_persist(self):
+        session = {"preview_only": True, "persist_stats": False}
+        state = monitor._monitor_eval_state(session, 0, None)
+        self.assertTrue(state["skip_gate_store"])
+
+    def test_persist_gate_store_when_preview_with_persist(self):
+        session = {"preview_only": True, "persist_stats": True}
+        state = monitor._monitor_eval_state(session, 0, None)
+        self.assertFalse(state["skip_gate_store"])
+
+    def test_preview_only_skips_monitor_detection(self):
+        session = {"preview_only": True, "events": [], "monitor_debounce": {}}
+        rule = {"id": "r1", "name": "Intrusion", "scan_type": "intrusion"}
+        entry = monitor._record_monitor_detection(session, rule, {"type": "intrusion"}, frame=None)
+        self.assertIsNone(entry)
+
+    def test_record_preview_event(self):
+        session = {
+            "preview_only": True,
+            "preview_events": [],
+            "event_lock": __import__("threading").Lock(),
+        }
+        rule = {"id": "r1", "name": "Gate", "scan_type": "gate_analytics"}
+        monitor._record_preview_event(session, rule, {"type": "gate_near"})
+        self.assertEqual(len(session["preview_events"]), 1)
+        self.assertIn("css_color", session["preview_events"][0])
+
+    def test_get_preview_status_active_and_inactive(self):
+        cam_id = "cam-preview-test"
+        monitor._preview_cache[cam_id] = {
+            "camera": {"name": "Front"},
+            "rules": [{"id": "r1", "name": "Gate", "scan_type": "gate_analytics"}],
+            "scan_types": ["gate_analytics"],
+            "rule_status": [{"id": "r1", "name": "Gate", "scan_type": "gate_analytics", "state": "running"}],
+            "preview_events": [],
+            "last_frame_at": time.time(),
+            "last_access": time.time(),
+            "persist_stats": True,
+        }
+        try:
+            st = monitor.get_preview_status(cam_id)
+            self.assertTrue(st["active"])
+            self.assertEqual(st["rule_count"], 1)
+            self.assertEqual(len(st.get("rule_status") or []), 1)
+        finally:
+            monitor._preview_cache.pop(cam_id, None)
+
+        missing = monitor.get_preview_status("no-such-camera")
+        self.assertFalse(missing["active"])
+
+
 if __name__ == "__main__":
     unittest.main()

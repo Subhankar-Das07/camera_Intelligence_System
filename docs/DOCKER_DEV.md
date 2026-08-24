@@ -85,3 +85,11 @@ Manual test (standing & lying on DVR): create the rule with an ROI over the floo
 - **Event tracker + beep**: uses a **3s debounce per rule** (`SITE_ADMIN_MONITOR_DEBOUNCE_SEC`); Alerts tab still uses each rule's **60s cooldown**.
 - **Parallel workers**: `SITE_ADMIN_MONITOR_RULE_WORKERS=3` (default 3).
 - Click **Test beep** on Monitor before expecting automatic event sounds (unlocks browser audio).
+
+## Gate analytics reports
+
+- **Footfall** in Reports = `persons_in + persons_out` from **Gate / entrance analytics** rules.
+- Reports support **Today**, **Last 7 days**, **This month**, and custom **hours** windows (window totals, not lifetime).
+- Go-live **Apply rules on preview** increments gate counters into Redis (same as workers/monitor); alerts stay off on preview to avoid spam.
+- Count accuracy depends on DVR snapshot poll interval (`SITE_ADMIN_TICK_*`); very fast crossings may be missed on slow polls.
+- Go-live workers evaluate up to 3 rules per camera in parallel (`SITE_ADMIN_SCAN_RULE_WORKERS=3`).

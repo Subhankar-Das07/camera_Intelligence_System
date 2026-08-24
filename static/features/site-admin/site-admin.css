@@ -234,13 +234,114 @@
 .sa-preview-hero-label {
     position: absolute;
     left: 0.65rem;
-    bottom: 0.55rem;
+    top: 0.55rem;
     padding: 0.25rem 0.55rem;
     border-radius: 6px;
     background: rgba(15, 23, 42, 0.82);
     border: 1px solid rgba(148, 163, 184, 0.35);
     font-size: 0.78rem;
     color: #e2e8f0;
+    z-index: 2;
+}
+
+.sa-preview-legend {
+    position: absolute;
+    left: 0.5rem;
+    right: 0.5rem;
+    bottom: 0.4rem;
+    padding: 0.35rem 0.5rem;
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 8px;
+    z-index: 2;
+    max-height: 28%;
+    overflow-y: auto;
+    pointer-events: none;
+}
+
+.sa-preview-legend .sa-legend {
+    margin: 0;
+    gap: 0.35rem;
+}
+
+.sa-preview-legend .sa-legend-item {
+    font-size: 0.78rem;
+    color: #e2e8f0;
+}
+
+.sa-preview-parallel-hint {
+    margin: 0 0 0.35rem;
+    font-size: 0.72rem;
+    color: #94a3b8;
+}
+
+.sa-preview-rule-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #64748b;
+}
+
+.sa-preview-rule-dot--idle {
+    background: #64748b;
+}
+
+.sa-preview-rule-dot--running {
+    background: #4ade80;
+}
+
+.sa-preview-rule-dot--triggered {
+    background: #f87171;
+    box-shadow: 0 0 6px rgba(248, 113, 113, 0.7);
+}
+
+.sa-preview-gate {
+    position: absolute;
+    top: 0.55rem;
+    right: 0.55rem;
+    left: auto;
+    max-width: min(320px, 55%);
+    padding: 0.45rem 0.6rem;
+    margin: 0;
+    z-index: 2;
+    font-size: 0.75rem;
+}
+
+.sa-preview-gate .sa-gate-stats {
+    flex-wrap: wrap;
+    gap: 0.35rem 0.65rem;
+    font-size: 0.72rem;
+}
+
+.sa-preview-events {
+    position: absolute;
+    left: 0.65rem;
+    right: 0.65rem;
+    bottom: 3.2rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.sa-preview-event-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.45rem;
+    border-radius: 6px;
+    border: 1px solid rgba(148, 163, 184, 0.45);
+    background: rgba(15, 23, 42, 0.88);
+    font-size: 0.72rem;
+    color: #e2e8f0;
+    max-width: 100%;
+}
+
+.sa-preview-event-chip .sa-legend-swatch {
+    width: 10px;
+    height: 10px;
 }
 
 .sa-preview-grid {
@@ -465,6 +566,24 @@
 
 .sa-table th { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
 
+.sa-table tbody tr.is-camera-highlight td {
+    background: rgba(56, 189, 248, 0.08);
+    border-bottom-color: rgba(56, 189, 248, 0.25);
+}
+
+.sa-table tbody tr.is-camera-highlight td:first-child {
+    box-shadow: inset 3px 0 0 #38bdf8;
+}
+
+.sa-table tbody tr.is-camera-dimmed td {
+    opacity: 0.45;
+}
+
+.sa-table tbody tr.is-camera-highlight td,
+.sa-table tbody tr.is-camera-dimmed td {
+    transition: background 0.15s, opacity 0.15s;
+}
+
 .sa-badge {
     display: inline-block;
     font-size: 0.72rem;
@@ -555,6 +674,19 @@
 
 .sa-canvas-wrap canvas.sa-pick-mode {
     cursor: pointer;
+}
+
+.sa-canvas-wrap.sa-roi-loading {
+    opacity: 0.55;
+}
+
+.sa-roi-preview-status {
+    margin: 0.35rem 0 0.5rem;
+    font-size: 0.85rem;
+}
+
+.sa-roi-preview-status--error {
+    color: #fca5a5;
 }
 
 .sa-alert {

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -16,6 +18,8 @@ from core.registry import registry
 from core.video_source import get_video_source
 
 log = logging.getLogger("site_admin.scan")
+
+SCAN_RULE_WORKERS = max(1, min(3, int(os.environ.get("SITE_ADMIN_SCAN_RULE_WORKERS", "3"))))
 
 _pose_model = None
 
@@ -61,6 +65,7 @@ def new_worker_state() -> Dict[str, Any]:
         "frame_feeds": {},
         "fall_sl": {},
         "pipelines_initialized": False,
+        "pipe_lock": threading.Lock(),
         "width": 640,
         "height": 480,
         "fps": 30.0,
@@ -404,12 +409,32 @@ def evaluate_camera_frame(
     frame: np.ndarray,
     state: Dict[str, Any],
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]]:
-    """Evaluate all rules on one frame; returns alert candidates."""
+    """Evaluate all rules on one frame in parallel; returns alert candidates."""
     hits: List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]] = []
-    for rule in rules:
-        hit = evaluate_rule_on_frame(cam, rule, frame, state)
-        if hit:
-            hits.append(hit)
+    needs_pose = any((r.get("scan_type") or "") in ("intrusion", "danger_zone") for r in rules)
+    state["pose_cache"] = build_pose_cache(frame) if needs_pose else None
+    workers = min(SCAN_RULE_WORKERS, max(1, len(rules)))
+
+    def _eval_one(rule: Dict[str, Any]):
+        fr = frame.copy()
+        return evaluate_rule_on_frame(cam, rule, fr, state)
+
+    if workers <= 1 or len(rules) <= 1:
+        for rule in rules:
+            hit = _eval_one(rule)
+            if hit:
+                hits.append(hit)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_eval_one, rule): rule for rule in rules}
+            for fut in as_completed(futures):
+                try:
+                    hit = fut.result()
+                    if hit:
+                        hits.append(hit)
+                except Exception as e:
+                    log.warning("parallel scan rule: %s", e)
+
     state["frame_idx"] = int(state.get("frame_idx") or 0) + 1
     return hits
 

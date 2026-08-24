@@ -28,6 +28,9 @@ os.makedirs(MONITOR_TEMP_DIR, exist_ok=True)
 os.makedirs(MONITOR_TEMP_PREVIEW_DIR, exist_ok=True)
 
 MAX_SESSION_EVENTS = 50
+MAX_PREVIEW_EVENTS = 20
+# Heavy pipelines block the go-live preview lock for minutes; run them in workers only.
+PREVIEW_LIGHT_SCAN_TYPES = frozenset({"intrusion", "danger_zone", "gate_analytics"})
 MONITOR_RULE_WORKERS = max(1, min(3, int(os.environ.get("SITE_ADMIN_MONITOR_RULE_WORKERS", "3"))))
 
 RULE_COLORS = [
@@ -346,6 +349,57 @@ def _record_monitor_detection(
     return entry
 
 
+def _record_preview_event(
+    session: Dict[str, Any],
+    rule: Dict[str, Any],
+    event: Dict[str, Any],
+) -> None:
+    if not session.get("preview_only"):
+        return
+    rule_id = rule.get("id") or ""
+    scan_type = rule.get("scan_type") or event.get("type") or ""
+    msg = event.get("message") or (
+        f"{rule.get('name') or scan_type.replace('_', ' ')} — {scan_type.replace('_', ' ')}"
+    )
+    entry = {
+        "ts": time.time(),
+        "rule_id": rule_id,
+        "rule_name": rule.get("name"),
+        "scan_type": scan_type,
+        "message": msg,
+        "css_color": _rule_css_color(rule_id),
+    }
+
+    def _append() -> None:
+        events = session.setdefault("preview_events", [])
+        events.append(entry)
+        if len(events) > MAX_PREVIEW_EVENTS:
+            session["preview_events"] = events[-MAX_PREVIEW_EVENTS:]
+
+    lock = session.get("event_lock")
+    if lock:
+        with lock:
+            _append()
+    else:
+        _append()
+
+
+def _update_session_rule_status(
+    session: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+    hit_rule_ids: set,
+) -> None:
+    rule_status = []
+    for rule in rules:
+        rid = rule.get("id") or ""
+        payload = _rule_payload(rule)
+        payload["state"] = "triggered" if rid in hit_rule_ids else "running"
+        rule_status.append(payload)
+    session["rule_status"] = rule_status
+    session["last_hit_rule_ids"] = hit_rule_ids
+    session["last_frame_at"] = time.time()
+
+
 def _handle_rule_hit(
     session: Dict[str, Any],
     cam: Dict[str, Any],
@@ -422,7 +476,7 @@ def _monitor_eval_state(session: Dict[str, Any], frame_idx: int, pose_cache: Opt
         "pipe_lock": session.get("pipe_lock"),
         "monitor_session": session,
         "session_lock": session.get("session_lock"),
-        "skip_gate_store": bool(session.get("preview_only")),
+        "skip_gate_store": bool(session.get("preview_only")) and not session.get("persist_stats"),
     }
 
 
@@ -892,17 +946,24 @@ def _process_frame(session: Dict[str, Any], frame: np.ndarray) -> np.ndarray:
     for rule, event, annotated in hits:
         snap = annotated if annotated is not None else out
         _handle_rule_hit(session, cam, rule, event, snap)
+        if session.get("preview_only"):
+            _record_preview_event(session, rule, event)
         _draw_rule_geometry(out, rule, highlight=True)
         if annotated is not None and annotated is not out:
             _blend_overlay(out, annotated)
 
+    _update_session_rule_status(session, rules, hit_rule_ids)
+
+    # YOLO results.plot() paints green skeletons and washes the preview feed.
+    # Keep markers + ROI outlines on preview; full plot only for Live Monitor.
     if pose_cache and pose_cache.get("results") is not None:
-        try:
-            plotted = pose_cache["results"].plot()
-            if plotted is not None and plotted.shape == out.shape:
-                cv2.addWeighted(plotted, 0.3, out, 0.7, 0, out)
-        except Exception:
-            pass
+        if not session.get("preview_only"):
+            try:
+                plotted = pose_cache["results"].plot()
+                if plotted is not None and plotted.shape == out.shape:
+                    cv2.addWeighted(plotted, 0.3, out, 0.7, 0, out)
+            except Exception:
+                pass
         _draw_pose_cache_markers(out, rules, pose_cache, hit_rule_ids)
 
     for rule in rules:
@@ -1076,6 +1137,20 @@ def _ensure_preview_session(cam_id: str) -> Optional[Dict[str, Any]]:
         session = _preview_cache.get(cam_id)
         if session:
             session["last_access"] = now
+            # Refresh rules each hit so newly saved ROIs appear on preview
+            cam = store.get_camera(cam_id) or session.get("camera") or {}
+            rules = [
+                r
+                for r in store.list_rules()
+                if r.get("camera_id") == cam_id and r.get("enabled", True)
+            ]
+            scan_types = sorted({r.get("scan_type") for r in rules if r.get("scan_type")})
+            old_types = set(session.get("scan_types") or [])
+            session["camera"] = cam
+            session["rules"] = rules
+            session["scan_types"] = scan_types
+            if set(scan_types) != old_types:
+                session["pipelines_initialized"] = False
             return session
 
         cam = store.get_camera(cam_id)
@@ -1097,6 +1172,17 @@ def _ensure_preview_session(cam_id: str) -> Optional[Dict[str, Any]]:
             "generators": {},
             "frame_feeds": {},
             "preview_only": True,
+            "persist_stats": False,
+            "preview_events": [],
+            "rule_status": [{**_rule_payload(r), "state": "idle"} for r in rules],
+            "last_hit_rule_ids": set(),
+            "last_frame_at": 0.0,
+            "pipe_lock": threading.Lock(),
+            "session_lock": threading.Lock(),
+            "event_lock": threading.Lock(),
+            "render_lock": threading.Lock(),
+            "render_busy": False,
+            "last_overlay_jpeg": None,
             "last_access": now,
             "width": 640,
             "height": 480,
@@ -1125,13 +1211,103 @@ def render_preview_frame(cam_id: str, apply_rules: bool) -> Optional[bytes]:
         return buf.tobytes() if ok else None
 
     session["last_access"] = time.time()
-    _init_preview_pipelines(session, frame)
+    session["persist_stats"] = True
+    if "render_lock" not in session:
+        session["render_lock"] = threading.Lock()
     session["last_raw_frame"] = frame
-    if not session.get("rules"):
+    rules = session.get("rules") or []
+    if not rules:
         out = frame.copy()
         ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
         return buf.tobytes() if ok else None
 
-    out = _process_frame(session, frame)
+    # Fast path: always draw rule outlines so preview stays responsive
+    geometry_out = frame.copy()
+    for rule in rules:
+        _draw_rule_geometry(geometry_out, rule, highlight=False)
+
+    light_rules = [r for r in rules if (r.get("scan_type") or "") in PREVIEW_LIGHT_SCAN_TYPES]
+    # Face/vehicle-only cameras: outlines only (workers do detection). No lock needed.
+    if not light_rules:
+        ok, buf = cv2.imencode(".jpg", geometry_out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        data = buf.tobytes() if ok else None
+        if data:
+            session["last_overlay_jpeg"] = data
+            session["last_frame_at"] = time.time()
+        return data
+
+    lock = session["render_lock"]
+    # Drop orphaned lock from a previous hung face/vehicle process (pre-fix)
+    if session.get("render_busy") and float(session.get("busy_since") or 0) > 0:
+        if time.time() - float(session["busy_since"]) > 8.0:
+            session["render_busy"] = False
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+
+    got_lock = lock.acquire(blocking=False)
+    if not got_lock:
+        ok, buf = cv2.imencode(".jpg", geometry_out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        data = buf.tobytes() if ok else None
+        if data:
+            session["last_overlay_jpeg"] = data
+        return data
+
+    session["render_busy"] = True
+    session["busy_since"] = time.time()
+    try:
+        # Preview: evaluate only light rules so face/vehicle cannot hold the lock forever.
+        # Go-live workers still run ALL rules on every camera in parallel processes.
+        saved_rules = session["rules"]
+        session["rules"] = light_rules
+        _init_preview_pipelines(session, frame)
+        out = _process_frame(session, frame)
+        # Ensure every rule outline is present (including heavy types)
+        for rule in saved_rules:
+            if (rule.get("scan_type") or "") not in PREVIEW_LIGHT_SCAN_TYPES:
+                _draw_rule_geometry(out, rule, highlight=False)
+        session["rules"] = saved_rules
+    except Exception:
+        session["rules"] = rules
+        out = geometry_out
+    finally:
+        session["render_busy"] = False
+        session["busy_since"] = 0.0
+        lock.release()
+
     ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-    return buf.tobytes() if ok else None
+    data = buf.tobytes() if ok else None
+    if data:
+        session["last_overlay_jpeg"] = data
+    return data
+
+
+def get_preview_status(cam_id: str) -> Dict[str, Any]:
+    """JSON status for go-live hero preview — rules, hits, gate live, preview events."""
+    now = time.time()
+    with _preview_lock:
+        session = _preview_cache.get(cam_id)
+        if not session:
+            return {"active": False, "camera_id": cam_id}
+        last = float(session.get("last_frame_at") or session.get("last_access") or 0)
+        if now - last > PREVIEW_CACHE_TTL:
+            return {"active": False, "camera_id": cam_id}
+        cam = session.get("camera") or {}
+        rules = session.get("rules") or []
+        out: Dict[str, Any] = {
+            "active": True,
+            "camera_id": cam_id,
+            "camera_name": cam.get("name"),
+            "persist_stats": bool(session.get("persist_stats")),
+            "rule_count": len(rules),
+            "scan_types": session.get("scan_types") or [],
+            "rules": [_rule_payload(r) for r in rules],
+            "rule_status": list(session.get("rule_status") or []),
+            "events": list(session.get("preview_events") or []),
+            "parallel_workers": MONITOR_RULE_WORKERS,
+            "last_frame_at": session.get("last_frame_at") or 0,
+        }
+        if session.get("gate_live"):
+            out["gate_live"] = session.get("gate_live")
+        return out

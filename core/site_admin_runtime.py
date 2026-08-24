@@ -151,21 +151,17 @@ def camera_worker_main(
             )
 
             last_wait_ms = 0.0
-            for rule in rules:
+            t0 = time.time()
+            inference_sem.acquire()
+            last_wait_ms = (time.time() - t0) * 1000.0
+            try:
+                hits = scan.evaluate_camera_frame(cam, rules, frame, state)
+            finally:
+                inference_sem.release()
+
+            for hit_rule, event, snap in hits:
                 if stop_flag.is_set():
                     break
-                t0 = time.time()
-                inference_sem.acquire()
-                wait_ms = (time.time() - t0) * 1000.0
-                last_wait_ms = max(last_wait_ms, wait_ms)
-                try:
-                    hit = scan.evaluate_rule_on_frame(cam, rule, frame, state)
-                finally:
-                    inference_sem.release()
-
-                if not hit:
-                    continue
-                hit_rule, event, snap = hit
                 rule_id = hit_rule.get("id") or ""
                 scan_type = hit_rule.get("scan_type") or ""
                 if scan_type == "vehicle":
