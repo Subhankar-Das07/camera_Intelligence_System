@@ -102,9 +102,15 @@ def _build_ov_engine(xml_path: str, ov):
             device = candidate
             break
 
+    try:
+        core.set_property(device, {"PERFORMANCE_HINT": "THROUGHPUT"})
+        log.info("[NewIntrusion] Set PERFORMANCE_HINT to THROUGHPUT for %s", device)
+    except Exception as e:
+        log.warning("[NewIntrusion] Could not set PERFORMANCE_HINT: %s", e)
+
     ppp_enabled = False
     try:
-        from openvino.preprocess import PrePostProcessor, ColorFormat
+        from openvino.preprocess import PrePostProcessor, ColorFormat, ResizeAlgorithm
         from openvino import Layout, Type
 
         model = core.read_model(xml_path)
@@ -114,15 +120,17 @@ def _build_ov_engine(xml_path: str, ov):
         # =========================================================================
         # [NEW_INTRUSION_ENHANCEMENT: PrePostProcessor Zero-Copy Input]
         # Architectural Shift: PPP accepts raw OpenCV BGR frames (H,W,3 uint8).
-        #                      C++ backend handles HWC->NCHW, BGR->RGB, /255.
+        #                      C++ backend handles Resize, HWC->NCHW, BGR->RGB, /255.
         # Reason: Eliminates per-frame NumPy allocations in the Python hot path.
         # =========================================================================
         inp.tensor() \
+            .set_spatial_dynamic_shape() \
             .set_element_type(Type.u8) \
             .set_color_format(ColorFormat.BGR) \
             .set_layout(Layout("NHWC"))
         inp.model().set_layout(Layout("NCHW"))
         inp.preprocess() \
+            .resize(ResizeAlgorithm.RESIZE_LINEAR) \
             .convert_color(ColorFormat.RGB) \
             .convert_element_type(Type.f32) \
             .scale(255.0)
@@ -426,8 +434,9 @@ class NewIntrusionPipeline(BaseVideoPipeline):
 
         import openvino as ov
 
-        result_q: queue.Queue = queue.Queue(maxsize=8)
-        async_queue = ov.AsyncInferQueue(self._ov_compiled, jobs=2)
+        num_jobs = 4
+        result_q: queue.Queue = queue.Queue(maxsize=num_jobs * 2)
+        async_queue = ov.AsyncInferQueue(self._ov_compiled, jobs=num_jobs)
         async_queue.set_callback(self._make_async_callback(result_q))
 
         frame_idx = 0
@@ -457,7 +466,7 @@ class NewIntrusionPipeline(BaseVideoPipeline):
             #                      but still drain ready results so the UI stays live.
             # Reason: Prevents latency accumulation on high-FPS / slow iGPU combos.
             # =========================================================================
-            if async_queue.is_ready() or in_flight < 2:
+            if async_queue.is_ready() or in_flight < num_jobs:
                 if self._ppp_enabled:
                     input_tensor = frame[np.newaxis]
                 else:

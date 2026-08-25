@@ -55,3 +55,4 @@ openvino
 
 # ── Tracking and Inference ───────────────────────────────────────────────────
 trackers==2.3.0
+git+https://github.com/openai/CLIP.git

@@ -142,11 +142,19 @@
             setStatus("Scanning scene...", "info");
             scanBtn.disabled = true;
 
+            const vocabInput = document.getElementById("guardian-vocab-input");
+            let vocabulary = null;
+            if (vocabInput && vocabInput.value.trim() !== "") {
+                vocabulary = vocabInput.value.split(",").map(s => s.trim()).filter(s => s);
+            }
+            
+            const payload = { ...src, vocabulary };
+
             try {
                 const res = await fetch("/api/guardian/scan", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(src),
+                    body: JSON.stringify(payload),
                 });
                 if (!res.ok) {
                     const err = await res.json();
@@ -377,6 +385,12 @@
 
             const src = getSourcePayload();
 
+            const vocabInput = document.getElementById("guardian-vocab-input");
+            let vocabulary = null;
+            if (vocabInput && vocabInput.value.trim() !== "") {
+                vocabulary = vocabInput.value.split(",").map(s => s.trim()).filter(s => s);
+            }
+
             setStatus("Starting tracking session...", "info");
             startGuardBtn.disabled = true;
 
@@ -389,6 +403,7 @@
                         video_id:        src.video_id,
                         filename:        src.filename,
                         watched_objects: enrolled,
+                        config:          { vocabulary }
                     }),
                 });
                 if (!res.ok) {

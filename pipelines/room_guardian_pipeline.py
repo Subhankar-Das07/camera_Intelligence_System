@@ -1,12 +1,10 @@
 """
-Room Guardian Pipeline  v4.0 - YOLOv8 + ByteTrack Edition
+Room Guardian Pipeline  v5.0 - YOLO-World + OpenVINO Async + ByteTrack
 ============================================================================
-Refactored to use ultralytics, supervision, and trackers libraries.
-- Leverages state-of-the-art YOLOv8 for extremely fast CPU detection.
-- Uses ByteTrackTracker for robust object tracking.
-- Removed legacy custom Kalman Filter and appearance matching in favor of 
-  efficient built-in tracking mechanisms.
-- Maintains missing object alerts (3 seconds out of frame).
+- Open-Vocabulary YOLO-World (detect any object by text).
+- OpenVINO FP16 IR export and AsyncInferQueue multithreading.
+- PrePostProcessor (PPP) for zero-copy iGPU resizing.
+- ByteTrack for robust object tracking on the async results.
 """
 
 import cv2
@@ -14,11 +12,12 @@ import numpy as np
 import uuid
 import os
 import logging
+import queue
+import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from collections import deque
 
-from ultralytics import YOLO
 import supervision as sv
 from trackers import ByteTrackTracker
 
@@ -32,37 +31,24 @@ CONF_THRESHOLD   = 0.20       # Detection confidence threshold
 ANCHOR_IOU       = 0.40       # Min IoU to anchor user's scan box to a ByteTrack box
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-COLOR_PRESENT  = (0, 255, 100)   # green  - tracking OK
-COLOR_MISSING  = (0, 165, 255)   # orange - counting down
-COLOR_ALERT    = (0, 0, 255)     # red    - alert fired, still absent
+COLOR_PRESENT  = (0, 255, 100)
+COLOR_MISSING  = (0, 165, 255)
+COLOR_ALERT    = (0, 0, 255)
 COLOR_LABEL_BG = (20, 20, 20)
-
-
-# ── WatchedObject ─────────────────────────────────────────────────────────────
 
 @dataclass
 class WatchedObject:
-    """All state needed to track one user-selected object via ByteTrack."""
-    id:             str                  # unique id from frontend scan
-    label:          str                  # class name or "Object"
-    last_bbox:      List[int]            # [x, y, w, h] pixels (absolute)
+    id:             str
+    label:          str
+    last_bbox:      List[int]            # [x, y, w, h] absolute px
 
-    # ByteTrack state
-    track_id:       Optional[int] = None # The assigned global track ID
-    track_ok:       bool = False         # Was it found in the latest frame?
-
-    # Tracking counters
-    missing_frames: int = 0             # frames since object is truly absent
-
-    # Alert state
+    track_id:       Optional[int] = None
+    track_ok:       bool = False
+    missing_frames: int = 0
     alert_fired:    bool = False
     center_history: deque = field(default_factory=lambda: deque(maxlen=30), repr=False)
 
-
-# ── Utility functions ─────────────────────────────────────────────────────────
-
 def _iou(boxA: List[int], boxB: List[int]) -> float:
-    """Compute IoU between two [x, y, w, h] boxes (absolute pixels)."""
     ax1, ay1 = boxA[0], boxA[1]
     ax2, ay2 = ax1 + boxA[2], ay1 + boxA[3]
     bx1, by1 = boxB[0], boxB[1]
@@ -70,306 +56,292 @@ def _iou(boxA: List[int], boxB: List[int]) -> float:
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
+    if inter == 0: return 0.0
     union = boxA[2] * boxA[3] + boxB[2] * boxB[3] - inter
     return inter / union if union > 0 else 0.0
 
 def _draw_label(frame: np.ndarray, text: str, x: int, y: int, color: tuple) -> None:
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    scale     = 0.55
-    thickness = 1
+    font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
     (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
     pad = 4
     cv2.rectangle(frame, (x, y - th - pad * 2), (x + tw + pad * 2, y), COLOR_LABEL_BG, -1)
     cv2.putText(frame, text, (x + pad, y - pad), font, scale, color, thickness, cv2.LINE_AA)
 
-
 def _write_clip(frames: list, output_path: str, fps: float, size: tuple) -> bool:
-    """Write a list/deque of frames to a .mp4 file. Returns True on success."""
-    if not frames:
-        return False
+    if not frames: return False
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, size)
-    if not writer.isOpened():
-        log.error("[Guardian] Could not open VideoWriter for %s", output_path)
-        return False
-    for f in frames:
-        writer.write(f)
+    if not writer.isOpened(): return False
+    for f in frames: writer.write(f)
     writer.release()
     return True
 
-
-# ── Robust Exit Detection ────────────────────────────────────────────────────
-
 def _detect_exit(center_history: deque, width: int, height: int, margin: float = 0.05) -> str:
-    """
-    Determine exit type based on trajectory.
-    Returns 'left_frame', 'occluded_or_removed', or 'unknown'.
-    """
-    if len(center_history) < 3:
-        return "unknown"
-    # Use last 3 points for velocity
+    if len(center_history) < 3: return "unknown"
     pts = list(center_history)[-3:]
-    dx = pts[-1][0] - pts[0][0]
-    dy = pts[-1][1] - pts[0][1]
+    dx, dy = pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]
     last_x, last_y = pts[-1]
-
-    near_right = last_x > width * (1 - margin)
-    near_left  = last_x < width * margin
-    near_bottom = last_y > height * (1 - margin)
-    near_top   = last_y < height * margin
-
-    # Motion outward if near edge and moving further outward
-    if (near_right and dx > 0) or (near_left and dx < 0) or (near_bottom and dy > 0) or (near_top and dy < 0):
+    if ((last_x > width*(1-margin) and dx > 0) or (last_x < width*margin and dx < 0) or
+        (last_y > height*(1-margin) and dy > 0) or (last_y < height*margin and dy < 0)):
         return "left_frame"
+    return "occluded_or_removed"
+
+# ── OpenVINO Logic ───────────────────────────────────────────────────────────
+
+def _ensure_openvino_model(pt_path: str, vocabulary: List[str] = None) -> Optional[str]:
+    base = os.path.splitext(pt_path)[0]
+    if vocabulary:
+        import hashlib
+        vocab_str = "_".join(sorted(vocabulary))
+        vocab_hash = hashlib.md5(vocab_str.encode()).hexdigest()[:8]
+        ov_dir = f"{base}_ov_{vocab_hash}"
     else:
-        return "occluded_or_removed"
+        ov_dir = f"{base}_openvino_model"
+        
+    xml_path = os.path.join(ov_dir, f"{os.path.basename(base)}.xml")
+    if os.path.isfile(xml_path):
+        return xml_path
 
+    try:
+        from ultralytics import YOLOWorld
+        model = YOLOWorld(pt_path)
+        if vocabulary:
+            model.set_classes(vocabulary)
+        log.info("[Guardian] Exporting YOLO-World to OpenVINO FP16...")
+        export_path = model.export(format="openvino", half=True, imgsz=640)
+        if isinstance(export_path, str) and export_path.endswith(".xml"):
+            return export_path
+        if os.path.isfile(xml_path):
+            return xml_path
+        return None
+    except Exception as exc:
+        log.warning("[Guardian] OpenVINO export failed (%s).", exc)
+        return None
 
-# ── Environment profiles ──────────────────────────────────────────────────────
-ENV_PROFILES = {
-    "home":    {"absence_seconds": 5,  "conf_threshold": CONF_THRESHOLD},
-    "shop":    {"absence_seconds": 3,  "conf_threshold": CONF_THRESHOLD},
-    "factory": {"absence_seconds": 8,  "conf_threshold": CONF_THRESHOLD},
-}
+def _build_ov_engine(xml_path: str, ov):
+    core = ov.Core()
+    available = core.available_devices
+    device = "CPU"
+    for candidate in ("GPU", "CPU"):
+        if candidate in available:
+            device = candidate
+            break
+    try:
+        core.set_property(device, {"PERFORMANCE_HINT": "THROUGHPUT"})
+    except Exception:
+        pass
 
+    ppp_enabled = False
+    try:
+        from openvino.preprocess import PrePostProcessor, ColorFormat, ResizeAlgorithm
+        from openvino import Layout, Type
+        model = core.read_model(xml_path)
+        ppp = PrePostProcessor(model)
+        inp = ppp.input()
+        inp.tensor().set_spatial_dynamic_shape().set_element_type(Type.u8)\
+            .set_color_format(ColorFormat.BGR).set_layout(Layout("NHWC"))
+        inp.model().set_layout(Layout("NCHW"))
+        inp.preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)\
+            .convert_color(ColorFormat.RGB).convert_element_type(Type.f32).scale(255.0)
+        model = ppp.build()
+        compiled = core.compile_model(model, device)
+        ppp_enabled = True
+    except Exception:
+        compiled = core.compile_model(xml_path, device)
+    
+    return compiled, compiled.inputs[0].any_name, [o.any_name for o in compiled.outputs], device, ppp_enabled
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
+def _preprocess_frame(frame: np.ndarray, imgsz: int = 640) -> np.ndarray:
+    h, w = frame.shape[:2]
+    r = min(imgsz / h, imgsz / w)
+    new_w, new_h = int(w * r), int(h * r)
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
+    dw, dh = (imgsz - new_w) // 2, (imgsz - new_h) // 2
+    canvas[dh:dh+new_h, dw:dw+new_w, :] = resized
+    tensor = canvas.transpose((2, 0, 1))[np.newaxis, ...]
+    tensor = tensor.astype(np.float32) / 255.0
+    return tensor
+
+def _postprocess_ov(output_tensor, img_w, img_h, imgsz=640, conf_thres=0.20):
+    boxes = output_tensor[0]
+    boxes = np.transpose(boxes)
+    scores = np.max(boxes[:, 4:], axis=1)
+    mask = scores > conf_thres
+    boxes = boxes[mask]
+    scores = scores[mask]
+    
+    if len(boxes) == 0:
+        return np.array([]), np.array([]), np.array([])
+        
+    class_ids = np.argmax(boxes[:, 4:], axis=1)
+    
+    r = min(imgsz / img_h, imgsz / img_w)
+    dw, dh = (imgsz - int(img_w * r)) / 2, (imgsz - int(img_h * r)) / 2
+    
+    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = (cx - w / 2 - dw) / r
+    y1 = (cy - h / 2 - dh) / r
+    x2 = (cx + w / 2 - dw) / r
+    y2 = (cy + h / 2 - dh) / r
+    
+    xyxy = np.column_stack([x1, y1, x2, y2])
+    
+    # NMS
+    indices = cv2.dnn.NMSBoxes(xyxy.tolist(), scores.tolist(), conf_thres, 0.45)
+    if len(indices) == 0:
+        return np.array([]), np.array([]), np.array([])
+    indices = indices.flatten()
+    
+    return xyxy[indices], scores[indices], class_ids[indices]
 
 class RoomGuardianPipeline(BaseVideoPipeline):
-    """
-    Room Object Guardian pipeline — v4.0 (ultralytics + trackers Edition).
-    """
-
-    def initialize(self, model_weight: str = "yolov8s-640", **kwargs) -> None:
-        if not model_weight.endswith(".pt"):
-            model_weight = "yolov8s.pt"
-        self.model      = YOLO(model_weight)
-        self.model_name = model_weight
-        self.tracker    = ByteTrackTracker()
-        log.info("[Guardian] v4.0 initialized with model: %s", model_weight)
+    def initialize(self, model_weight: str = "yolov8s-worldv2.pt", **kwargs) -> None:
+        self.pt_path = model_weight
+        self.tracker = ByteTrackTracker()
 
     def process_frame(self, frame, frame_idx, roi_polygon, config):
         return frame, {}
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-
     def run_on_video(self, input_path, output_dir, roi_normalized, config):
-        """
-        Generator: yields (annotated_frame, alert_event_or_None).
-        """
-        cap    = get_video_source(input_path)
-        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap = get_video_source(input_path)
+        width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        # Profile settings
-        env_profile_name  = config.get("environment_profile", "home")
-        profile           = ENV_PROFILES.get(env_profile_name, ENV_PROFILES["home"])
-        absence_threshold = max(1, int(fps * profile["absence_seconds"]))
-        ring_buf_size     = max(1, int(fps * 4.5))   # 4.5s ring buffer
-        conf_threshold    = profile["conf_threshold"]
+        absence_threshold = int(fps * 5)
+        ring_buffer = deque(maxlen=int(fps * 4.5))
+        pending_alerts = []
+        frame_idx = 0
 
-        # Reload Model if model weight changed
-        req_weight = config.get("model_weight", "yolov8s-640")
-        if not hasattr(self, "model_name") or self.model_name != req_weight:
-            if not req_weight.endswith(".pt"):
-                req_weight = "yolov8s.pt"
-            self.model      = YOLO(req_weight)
-            self.model_name = req_weight
-            log.info("[Guardian] Reloaded model: %s", req_weight)
-
-        # ── Build WatchedObject list ──────────────────────────────────────────
-        raw_objects: List[Dict] = config.get("watched_objects", [])
-        if not raw_objects:
-            log.warning("[Guardian] No watched_objects in config — nothing to guard.")
-
+        raw_objects = config.get("watched_objects", [])
+        vocabulary = config.get("config", {}).get("vocabulary", None)
+        
         watched: List[WatchedObject] = []
         for obj in raw_objects:
             bn = obj.get("bbox_normalized", [0, 0, 0.1, 0.1])
-            px = [
-                int(bn[0] * width),
-                int(bn[1] * height),
-                int(bn[2] * width),
-                int(bn[3] * height),
-            ]
-            wo = WatchedObject(
-                id       = obj.get("id", str(uuid.uuid4())),
-                label    = obj.get("label", "Object"),
-                last_bbox= px,
-            )
-            watched.append(wo)
+            px = [int(bn[0]*width), int(bn[1]*height), int(bn[2]*width), int(bn[3]*height)]
+            watched.append(WatchedObject(id=obj.get("id", str(uuid.uuid4())), label=obj.get("label", "Object"), last_bbox=px))
 
-        # Rolling ring buffer (raw un-annotated frames)
-        ring_buffer: deque  = deque(maxlen=ring_buf_size)
-        pending_alerts: list = []
-        frame_idx   = 0
-
-        # Reset tracker state
         self.tracker.reset()
 
-        # ── Frame loop ────────────────────────────────────────────────────────
+        import openvino as ov
+        xml_path = _ensure_openvino_model(self.pt_path, vocabulary)
+        if not xml_path:
+            log.error("[Guardian] OpenVINO compilation failed. Aborting.")
+            return
+
+        compiled, in_name, out_names, device, ppp_enabled = _build_ov_engine(xml_path, ov)
+        
+        num_jobs = 4
+        result_q = queue.Queue(maxsize=num_jobs * 2)
+        async_queue = ov.AsyncInferQueue(compiled, jobs=num_jobs)
+        
+        def cb(infer_request, userdata):
+            out_tensor = infer_request.get_output_tensor(0).data
+            xyxy, scores, class_ids = _postprocess_ov(out_tensor, userdata["img_w"], userdata["img_h"])
+            result_q.put({"frame": userdata["frame"], "frame_idx": userdata["frame_idx"], "xyxy": xyxy, "scores": scores, "class_ids": class_ids})
+        async_queue.set_callback(cb)
+        
+        in_flight = 0
+
         while cap.isOpened():
-            alert_event = None
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
+            
+            raw_frame = frame.copy()
+            if async_queue.is_ready() or in_flight < num_jobs:
+                inp = frame[np.newaxis] if ppp_enabled else _preprocess_frame(frame, 640)
+                async_queue.start_async({in_name: inp}, {"frame_idx": frame_idx, "frame": frame.copy(), "img_w": width, "img_h": height})
+                in_flight += 1
 
-            raw_frame = frame.copy()   # for ring buffer — un-annotated
-
-            # 1. Run inference and tracking
-            try:
-                results = self.model(frame, conf=conf_threshold, verbose=False)[0]
-                detections = sv.Detections.from_ultralytics(results)
-                detections = self.tracker.update(detections)
-            except Exception as e:
-                log.warning("[Guardian] Inference/Tracking error frame %d: %s", frame_idx, e)
-                detections = sv.Detections.empty()
-
-            # Extract current frame tracked boxes
-            tracked_boxes = {}  # dict of track_id -> [x,y,w,h]
-            if detections is not None and len(detections) > 0:
-                for xyxy, mask, confidence, class_id, tracker_id, data in detections:
-                    if tracker_id is not None:
-                        bx = int(xyxy[0])
-                        by = int(xyxy[1])
-                        bw = int(xyxy[2] - xyxy[0])
-                        bh = int(xyxy[3] - xyxy[1])
-                        tracked_boxes[int(tracker_id)] = [bx, by, bw, bh]
-
-            assigned_track_ids = set()
-
-            # ── 2. Object Association & Tracking ──
-            for wo in watched:
-                wo.track_ok = False
-
-                # Case A: We don't have a track_id yet, anchor to the best overlapping box
-                if wo.track_id is None:
-                    best_iou = 0
-                    best_tid = None
-                    for tid, tbox in tracked_boxes.items():
-                        if tid in assigned_track_ids:
-                            continue
-                        iou = _iou(wo.last_bbox, tbox)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_tid = tid
+            while not result_q.empty() or (in_flight >= num_jobs):
+                try:
+                    res = result_q.get(timeout=0.1)
+                    in_flight -= 1
                     
-                    if best_tid is not None and best_iou > ANCHOR_IOU:
-                        wo.track_id = best_tid
-                        wo.last_bbox = tracked_boxes[best_tid]
-                        wo.track_ok = True
-                        assigned_track_ids.add(best_tid)
-                else:
-                    # Case B: We have a track_id, check if it's still alive
-                    if wo.track_id in tracked_boxes:
-                        wo.last_bbox = tracked_boxes[wo.track_id]
-                        wo.track_ok = True
-                        assigned_track_ids.add(wo.track_id)
+                    render_frame = res["frame"]
+                    
+                    if len(res["xyxy"]) > 0:
+                        detections = sv.Detections(xyxy=res["xyxy"], confidence=res["scores"], class_id=res["class_ids"])
                     else:
-                        # Tracker lost this ID.
+                        detections = sv.Detections.empty()
+                        
+                    detections = self.tracker.update(detections)
+                    
+                    tracked_boxes = {}
+                    if len(detections) > 0:
+                        for xyxy, mask, conf, cid, tid, data in detections:
+                            if tid is not None:
+                                tracked_boxes[int(tid)] = [int(xyxy[0]), int(xyxy[1]), int(xyxy[2]-xyxy[0]), int(xyxy[3]-xyxy[1])]
+                    
+                    assigned_ids = set()
+                    for wo in watched:
                         wo.track_ok = False
-
-                if wo.track_ok:
-                    cx = wo.last_bbox[0] + wo.last_bbox[2]/2
-                    cy = wo.last_bbox[1] + wo.last_bbox[3]/2
-                    wo.center_history.append((cx, cy))
-
-                # ── 3. Update missing counters & alert logic ──
-                if wo.track_ok:
-                    was_missing       = wo.missing_frames > 0
-                    wo.missing_frames = 0
-                    if wo.alert_fired and was_missing:
-                        wo.alert_fired = False
-                        log.info("[Guardian] %s re-appeared — alert cleared.", wo.id)
-                else:
-                    wo.missing_frames += 1
-
-                # Alert scheduling
-                if wo.missing_frames >= absence_threshold and not wo.alert_fired:
-                    wo.alert_fired = True
-
-                    # Use robust exit detection
-                    exit_type = _detect_exit(wo.center_history, width, height)
-                    if exit_type == "unknown":
-                        exit_type = "occluded_or_removed"  # fallback
-
-                    disappearance_frame = max(0, frame_idx - absence_threshold)
-                    pending_alerts.append({
-                        "wo":                 wo,
-                        "target_frame":       frame_idx + int(fps * 2),
-                        "disappearance_frame": disappearance_frame,
-                        "exit_type":          exit_type,
-                    })
-                    log.info("[Guardian] Scheduled alert for %s (disappearance ~frame %d, exit_type=%s).",
-                             wo.id, disappearance_frame, exit_type)
-
-                # ── Draw tracking annotation ──
-                x, y, w, h = wo.last_bbox
-                x2, y2 = x + w, y + h
-                if wo.alert_fired:
-                    color = COLOR_ALERT
-                    status_text = f"{wo.label} [MISSING!]"
-                elif wo.missing_frames > 0:
-                    pct = min(100, int(wo.missing_frames / absence_threshold * 100))
-                    color = COLOR_MISSING
-                    status_text = f"{wo.label} [Lost {pct}%]"
-                else:
-                    color = COLOR_PRESENT
-                    status_text = f"{wo.label} [ID:{wo.track_id}]"
-
-                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
-                _draw_label(frame, status_text, x, y, color)
-
-            # ── Ring buffer update ────────────────────────────────────────────
-            ring_buffer.append(raw_frame)
-
-            # ── Process pending alerts ────────────────────────────────────────
-            for pa in pending_alerts[:]:
-                if frame_idx >= pa["target_frame"]:
-                    wo = pa["wo"]
-                    alert_id  = str(uuid.uuid4())
-                    clip_name = f"guardian_{alert_id}.mp4"
-                    clip_path = os.path.join(output_dir, clip_name)
-                    clip_url  = f"/storage/alerts/{clip_name}"
-
-                    frames_needed   = int(fps * 4)
-                    frames_to_write = list(ring_buffer)[-frames_needed:] \
-                                      if len(ring_buffer) > frames_needed else list(ring_buffer)
-
-                    success = _write_clip(frames_to_write, clip_path, fps, (width, height))
-                    if success:
-                        ts_sec = pa["disappearance_frame"] / fps
-                        alert_event = {
-                            "id":                    alert_id,
-                            "object_id":             wo.id,
-                            "object_label":          wo.label,
-                            "timestamp_sec":         ts_sec,
-                            "formatted_time":        f"{int(ts_sec // 60):02d}:{int(ts_sec % 60):02d}",
-                            "clip_url":              clip_url,
-                            "severity":              "MISSING",
-                            "immediate_buzzer_trigger": True,
-                            "exit_type":             pa["exit_type"],
-                        }
-                        log.info("[Guardian] ALERT fired for %s. Clip: %s", wo.label, clip_path)
-
-                    pending_alerts.remove(pa)
-                    break   # one alert per frame
-
-            # ── Guardian HUD ──────────────────────────────────────────────────
-            guarded_count = len(watched)
-            missing_count = sum(1 for wo in watched if wo.missing_frames > 0)
-            alerted_count = sum(1 for wo in watched if wo.alert_fired)
-            hud_color     = (0, 0, 255) if alerted_count > 0 else (0, 255, 100)
-            cv2.putText(
-                frame,
-                f"GUARDIAN v4.0 | YOLOv8+ByteTrack | Watching: {guarded_count} | Missing: {missing_count} | Alerts: {alerted_count}",
-                (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2, cv2.LINE_AA,
-            )
-
-            yield frame, alert_event
+                        if wo.track_id is None:
+                            best_iou, best_tid = 0, None
+                            for tid, tbox in tracked_boxes.items():
+                                if tid in assigned_ids: continue
+                                iou = _iou(wo.last_bbox, tbox)
+                                if iou > best_iou: best_iou, best_tid = iou, tid
+                            if best_tid is not None and best_iou > ANCHOR_IOU:
+                                wo.track_id = best_tid
+                                wo.last_bbox = tracked_boxes[best_tid]
+                                wo.track_ok = True
+                                assigned_ids.add(best_tid)
+                        else:
+                            if wo.track_id in tracked_boxes:
+                                wo.last_bbox = tracked_boxes[wo.track_id]
+                                wo.track_ok = True
+                                assigned_ids.add(wo.track_id)
+                            else:
+                                wo.track_ok = False
+                                
+                        if wo.track_ok:
+                            wo.center_history.append((wo.last_bbox[0]+wo.last_bbox[2]/2, wo.last_bbox[1]+wo.last_bbox[3]/2))
+                            if wo.alert_fired and wo.missing_frames > 0: wo.alert_fired = False
+                            wo.missing_frames = 0
+                        else:
+                            wo.missing_frames += 1
+                            if wo.missing_frames >= absence_threshold and not wo.alert_fired:
+                                wo.alert_fired = True
+                                pending_alerts.append({
+                                    "wo": wo, "target_frame": frame_idx + int(fps*2),
+                                    "disappearance_frame": max(0, frame_idx - absence_threshold),
+                                    "exit_type": _detect_exit(wo.center_history, width, height)
+                                })
+                                
+                        x, y, w, h = wo.last_bbox
+                        color = COLOR_ALERT if wo.alert_fired else (COLOR_MISSING if wo.missing_frames > 0 else COLOR_PRESENT)
+                        status = f"{wo.label} [MISSING!]" if wo.alert_fired else (f"{wo.label} [Lost]" if wo.missing_frames > 0 else f"{wo.label} [{wo.track_id}]")
+                        cv2.rectangle(render_frame, (x, y), (x+w, y+h), color, 2)
+                        _draw_label(render_frame, status, x, y, color)
+                    
+                    ring_buffer.append(raw_frame)
+                    
+                    alert_event = None
+                    for pa in pending_alerts[:]:
+                        if frame_idx >= pa["target_frame"]:
+                            wo = pa["wo"]
+                            alert_id = str(uuid.uuid4())
+                            clip_path = os.path.join(output_dir, f"guardian_{alert_id}.mp4")
+                            _write_clip(list(ring_buffer), clip_path, fps, (width, height))
+                            ts_sec = pa["disappearance_frame"] / fps
+                            alert_event = {
+                                "id": alert_id, "object_id": wo.id, "object_label": wo.label,
+                                "timestamp_sec": ts_sec, "formatted_time": f"{int(ts_sec//60):02d}:{int(ts_sec%60):02d}",
+                                "clip_url": f"/storage/alerts/guardian_{alert_id}.mp4", "severity": "MISSING",
+                                "immediate_buzzer_trigger": True, "exit_type": pa["exit_type"]
+                            }
+                            pending_alerts.remove(pa)
+                            break
+                            
+                    cv2.putText(render_frame, f"YOLO-World + OpenVINO | Device: {device}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,100), 2)
+                    yield render_frame, alert_event
+                    
+                except queue.Empty:
+                    break
+                    
             frame_idx += 1
-
+            
+        async_queue.wait_all()
         cap.release()
-        log.info("[Guardian] Stream ended after %d frames.", frame_idx)

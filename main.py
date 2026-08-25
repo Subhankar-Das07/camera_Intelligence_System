@@ -24,24 +24,26 @@ from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
 
 from ultralytics import FastSAM as _FastSAM
-from ultralytics import YOLO as _YOLO
+from ultralytics import YOLOWorld as _YOLOWorld
 
 from pipelines.gate_analytics_pipeline import GateAnalyticsPipeline
+from pipelines.footfall_analytics_pipeline import FootfallAnalyticsPipeline
 
 
 # Register the vehicle recognition pipeline into the shared singleton registry
 registry.register("vehicle_recognition", VehicleRecognitionPipeline)
 registry.register("gate_analytics", GateAnalyticsPipeline)
+registry.register("footfall_analysis", FootfallAnalyticsPipeline)
 
 # ── Guardian scan models — loaded ONCE at startup, never reloaded per request ──
 # This eliminates the 2-5s cold-load that was happening on every scan click.
-_guardian_yolo: Optional[_YOLO] = None
+_guardian_yolo: Optional[_YOLOWorld] = None
 
 def _get_guardian_models():
     """Lazy-load guardian scan model as singleton."""
     global _guardian_yolo
     if _guardian_yolo is None:
-        _guardian_yolo = _YOLO("yolov8s.pt")
+        _guardian_yolo = _YOLOWorld("yolov8s-worldv2.pt")
     return _guardian_yolo
 
 app = FastAPI(title="Video Analytics Testing Platform")
@@ -72,6 +74,10 @@ async def _on_startup():
         pass
     try:
         registry.get_pipeline("gate_analytics").initialize()
+    except Exception:
+        pass
+    try:
+        registry.get_pipeline("footfall_analysis").initialize()
     except Exception:
         pass
     start_runtime()
@@ -165,6 +171,7 @@ class ProcessRequest(BaseModel):
 class GuardianScanRequest(BaseModel):
     stream_id: Optional[str] = None
     filename: Optional[str] = None
+    vocabulary: Optional[List[str]] = None
 
 class WatchedObject(BaseModel):
     id: str
@@ -178,6 +185,7 @@ class GuardianStartRequest(BaseModel):
     video_id: Optional[str] = None
     filename: Optional[str] = None
     watched_objects: List[WatchedObject]
+    config: Dict[str, Any] = {}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _socket_check(url: str, timeout: float = 3.0) -> Optional[str]:
@@ -228,21 +236,23 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
         roi_normalized=roi_normalized,
         config=config
     )
-    for frame, alert_event in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if alert_event:
-            _append_session_alert(session_id, alert_event)
-            if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
-                if attendance_session["active"]:
-                    attendance_session["present_ids"].add(alert_event["person_id"])
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if not ok:
-                continue
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
-            # Removed time.sleep(0.033) here so processing goes as fast as possible
+    try:
+        for frame, alert_event in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if alert_event:
+                _append_session_alert(session_id, alert_event)
+                if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
+                    if attendance_session["active"]:
+                        attendance_session["present_ids"].add(alert_event["person_id"])
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if not ok:
+                    continue
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -659,19 +669,22 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
         roi_normalized=roi_normalized,
         config=config,
     )
-    for frame, metadata in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if metadata and metadata.get("detections"):
-            for det in metadata["detections"]:
-                plate = det.get("plate")
-                if plate:
-                    _vr_add_detection(session_id, plate, det.get("total_visits", 1))
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if ok:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
+    try:
+        for frame, metadata in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if metadata and metadata.get("detections"):
+                for det in metadata["detections"]:
+                    plate = det.get("plate")
+                    if plate:
+                        _vr_add_detection(session_id, plate, det.get("total_visits", 1))
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if ok:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 
 @app.get("/api/vr_detections/{session_id}")
@@ -725,6 +738,8 @@ async def guardian_scan(request: GuardianScanRequest):
     CONF_GATE = 0.25
 
     def _infer():
+        if request.vocabulary:
+            yolo_model.set_classes(request.vocabulary)
         return yolo_model(frame, conf=CONF_GATE, verbose=False)[0]
 
     yolo_results = await loop.run_in_executor(None, _infer)

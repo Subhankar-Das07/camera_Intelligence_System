@@ -51,6 +51,7 @@
             <section id="guardian-controls" class="control-group hidden">
                 <h3>Object Tracking</h3>
                 <p id="guardian-status" style="font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; line-height: 1.3;">Upload a video or connect RTSP, then click Scan Object.</p>
+                <input type="text" id="guardian-vocab-input" class="text-input" placeholder="e.g. laptop, backpack, keys" style="margin-bottom: 8px;" title="Custom objects to scan for (comma separated)">
                 <button class="btn secondary" id="guardian-scan-btn" type="button" style="width:100%; margin-bottom: 4px;">Scan Object</button>
                 <div id="guardian-selection-list" style="margin-top: 8px; font-size: 0.85em; display:flex; flex-direction:column; gap:4px;"></div>
                 <button class="btn primary" id="guardian-start-btn" type="button" style="width:100%; margin-top: 8px;" disabled>Start Guarding</button>
@@ -71,6 +72,10 @@
             <section class="control-group" id="roi-controls">
                 <h3>4. ROI</h3>
                 <p>Click on the preview to draw a polygon (3+ points).</p>
+                <div id="roi-mode-selector" class="hidden" style="margin-bottom: 8px;">
+                    <label style="display:block;margin-bottom:4px;cursor:pointer;"><input type="radio" name="roi-mode" value="outside" checked> Draw Outside Zone (Blue)</label>
+                    <label style="display:block;cursor:pointer;"><input type="radio" name="roi-mode" value="inside"> Draw Inside Zone (Red)</label>
+                </div>
                 <button class="btn secondary" id="clear-roi-btn" type="button">Clear ROI</button>
             </section>
 
