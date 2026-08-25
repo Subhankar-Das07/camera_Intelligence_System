@@ -86,8 +86,16 @@ document.addEventListener("DOMContentLoaded", () => {
     const modeSelector       = document.getElementById("mode-selector");
     const visitorControls    = document.getElementById("fr-visitor-controls");
     const attendanceControls = document.getElementById("fr-attendance-controls");
-    const rightPanelTitle    = document.getElementById("right-panel-title");
+    const visionWatchControls = document.getElementById("fr-vision-watch-controls");
+    const rightPanelTitle    = document.querySelector(".fr-identity-panel .fr-panel-title");
     
+    // Vision Watch elements
+    const vwWatchmanName = document.getElementById("vw-watchman-name");
+    const vwClearRoiBtn = document.getElementById("vw-clear-roi-btn");
+    const frRoiCanvas = document.getElementById("fr-roi-canvas");
+    const vwCtx = frRoiCanvas.getContext("2d");
+    const buzzerAudio = new Audio("/assets/buzzer.mp3");
+
     // Admin toggling
     const adminSwitchBtn     = document.getElementById("fr-admin-switch-btn");
     const adminBackBtn       = document.getElementById("fr-admin-back-btn");
@@ -140,6 +148,112 @@ document.addEventListener("DOMContentLoaded", () => {
     let currentSessionId = null;   // analysis session
     let pollingInterval  = null;
     let knownEventIds    = new Set();
+
+    // Vision Watch ROI logic — single door zone polygon
+    let vwDoorZones     = [];  // completed door polygons
+    let currentDoorZone = [];  // in-progress door polygon
+    let doorPollInterval = null;
+
+    function alignCanvas() {
+        if (!frRoiCanvas || frRoiCanvas.classList.contains("hidden")) return;
+        const rect = streamImg.getBoundingClientRect();
+        if (rect.width === 0) return;
+        frRoiCanvas.style.left = streamImg.offsetLeft + "px";
+        frRoiCanvas.style.top  = streamImg.offsetTop  + "px";
+        frRoiCanvas.width  = rect.width;
+        frRoiCanvas.height = rect.height;
+        drawVwPolygons();
+    }
+    window.addEventListener("resize", alignCanvas);
+    streamImg.onload = alignCanvas;
+
+    frRoiCanvas.addEventListener("click", (e) => {
+        if (getMode() !== "vision_watch") return;
+        const rect = frRoiCanvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        // Close polygon if clicking near first point
+        if (currentDoorZone.length > 2) {
+            const first = currentDoorZone[0];
+            if (Math.hypot(first.x - x, first.y - y) < 15) {
+                vwDoorZones = [currentDoorZone]; // Only keep ONE door zone
+                currentDoorZone = [];
+                drawVwPolygons();
+                _updateDoorHint("drawing");
+                return;
+            }
+        }
+        currentDoorZone.push({ x, y });
+        drawVwPolygons();
+    });
+
+    vwClearRoiBtn.addEventListener("click", () => {
+        vwDoorZones     = [];
+        currentDoorZone = [];
+        drawVwPolygons();
+        _updateDoorHint("idle");
+    });
+
+    function _updateDoorHint(status, data) {
+        const hint = document.getElementById("vw-door-status-hint");
+        if (!hint) return;
+        if (status === "idle")      hint.innerHTML = "🟡 Draw a zone, then start stream. Auto-detects in ~3 seconds.";
+        else if (status === "drawing") hint.innerHTML = "✅ Door zone set! Start the stream to begin monitoring.";
+        else if (status === "learning") hint.innerHTML = "🟡 Learning background... (~3 seconds remaining)";
+        else if (status === "OPEN")  hint.innerHTML = `🔴 <b>Door: OPEN</b> &nbsp;|&nbsp; Opens: <b>${data.open_count}</b> &nbsp; Closes: <b>${data.close_count}</b> &nbsp; Last: ${data.last_event || '—'}`;
+        else if (status === "CLOSED") hint.innerHTML = `🟢 <b>Door: CLOSED</b> &nbsp;|&nbsp; Opens: <b>${data.open_count}</b> &nbsp; Closes: <b>${data.close_count}</b> &nbsp; Last: ${data.last_event || '—'}`;
+    }
+
+    function _pollDoorState() {
+        if (!currentSessionId || getMode() !== "vision_watch") return;
+        fetch(`/api/vision_watch/door_state/${currentSessionId}`)
+            .then(r => r.json())
+            .then(data => {
+                const state = data.state;
+                if (data.learning) {
+                    _updateDoorHint("learning");
+                } else {
+                    _updateDoorHint(state, data);
+                }
+            })
+            .catch(() => {});
+    }
+
+    function drawVwPolygons() {
+        if (!vwCtx) return;
+        vwCtx.clearRect(0, 0, frRoiCanvas.width, frRoiCanvas.height);
+
+        const drawPoly = (zones, current, color, fill) => {
+            vwCtx.strokeStyle = color;
+            vwCtx.lineWidth   = 2;
+            vwCtx.fillStyle   = fill;
+            zones.forEach(zone => {
+                if (zone.length < 2) return;
+                vwCtx.beginPath();
+                vwCtx.moveTo(zone[0].x, zone[0].y);
+                zone.slice(1).forEach(p => vwCtx.lineTo(p.x, p.y));
+                vwCtx.closePath();
+                vwCtx.fill();
+                vwCtx.stroke();
+            });
+            if (current.length > 0) {
+                vwCtx.beginPath();
+                vwCtx.moveTo(current[0].x, current[0].y);
+                current.slice(1).forEach(p => vwCtx.lineTo(p.x, p.y));
+                vwCtx.stroke();
+                vwCtx.fillStyle = "#fff";
+                current.forEach(p => {
+                    vwCtx.beginPath();
+                    vwCtx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                    vwCtx.fill();
+                });
+            }
+        };
+
+        // Door zone = blue
+        drawPoly(vwDoorZones, currentDoorZone, "#3b82f6", "rgba(59,130,246,0.15)");
+    }
     let identityFilter   = "all";
     let renamingPersonId = null;
     let regPhotoFile     = null;
@@ -156,18 +270,36 @@ document.addEventListener("DOMContentLoaded", () => {
         if (mode === "attendance") {
             visitorControls.classList.add("hidden");
             attendanceControls.classList.remove("hidden");
+            visionWatchControls.classList.add("hidden");
             rightPanelTitle.textContent = "🗂️ Attendance List";
             frStartBtn.textContent = "▶ Start Attendance Tracker";
             if (filterKnownBtn) filterKnownBtn.textContent = "Registered";
+            frRoiCanvas.classList.add("hidden");
+            if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
+        } else if (mode === "vision_watch") {
+            visitorControls.classList.add("hidden");
+            attendanceControls.classList.add("hidden");
+            visionWatchControls.classList.remove("hidden");
+            rightPanelTitle.textContent = "🛡️ Vision Watch";
+            frStartBtn.textContent = "▶ Start Vision Watch";
+            if (filterKnownBtn) filterKnownBtn.textContent = "Known";
+            frRoiCanvas.classList.remove("hidden");
+            alignCanvas();
         } else {
             visitorControls.classList.remove("hidden");
             attendanceControls.classList.add("hidden");
-            rightPanelTitle.textContent = "🗂️ Identity Manager";
+            visionWatchControls.classList.add("hidden");
+            rightPanelTitle.textContent = "👤 Identity Manager";
             frStartBtn.textContent = "▶ Start Recognition";
             if (filterKnownBtn) filterKnownBtn.textContent = "Known";
+            frRoiCanvas.classList.add("hidden");
+            if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
         }
         loadStats();
         loadIdentities();
+        if (!frReportsContent.classList.contains("hidden")) {
+            loadReports();
+        }
         if (currentSessionId) {
             _stopStream(); // Restart stream if mode is changed while active
         }
@@ -319,14 +451,28 @@ document.addEventListener("DOMContentLoaded", () => {
 
         frStartBtn.textContent = "Starting...";
 
-        // Build payload — always uses stream_id when available
+        // Process ROI coordinates
+        const mode = getMode();
+        let doorRoiList = [];
+        if (mode === "vision_watch" && frRoiCanvas.width > 0) {
+            vwDoorZones.forEach(zone => {
+                const normZone = zone.map(p => [p.x / frRoiCanvas.width, p.y / frRoiCanvas.height]);
+                doorRoiList.push(normZone);
+            });
+        }
+        
         const payload = {
             video_id:       currentVideoData.video_id,
             filename:       currentVideoData.filename,
             pipeline_name:  "face_recognition",
             roi_normalized: [[0, 0], [1, 0], [1, 1], [0, 1]],
-            config:         { mode: getMode() },
-            stream_id:      currentStreamId || null,
+            config: {
+                mode: mode,
+                watchman_name: vwWatchmanName ? vwWatchmanName.value.trim() : "",
+                multiple_rois: [],      // watchman zones reserved for future
+                door_rois: doorRoiList
+            },
+            stream_id: currentStreamId || null,
         };
 
         try {
@@ -338,6 +484,14 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!resp.ok) throw new Error("Failed to start analysis");
             const data = await resp.json();
             currentSessionId = data.session_id;
+
+            // Start door state poller for Vision Watch
+            if (mode === "vision_watch") {
+                if (doorPollInterval) clearInterval(doorPollInterval);
+                doorPollInterval = setInterval(_pollDoorState, 2000);
+                _updateDoorHint("learning");
+            }
+
             _startStream();
         } catch (e) {
             alert("Failed to start recognition: " + e.message);
@@ -370,13 +524,21 @@ document.addEventListener("DOMContentLoaded", () => {
         frStopBtn.classList.remove("hidden");
         setStatus("active", "Recognition Active");
 
+        // Start door poller if in vision_watch mode
+        if (getMode() === "vision_watch") {
+            if (doorPollInterval) clearInterval(doorPollInterval);
+            doorPollInterval = setInterval(_pollDoorState, 2000);
+        }
+
         knownEventIds.clear();
         if (eventsPlaceholder) eventsPlaceholder.style.display = "none";
         pollingInterval = setInterval(_pollEvents, 1500);
     }
 
     function _stopStream() {
-        if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+        if (pollingInterval)  { clearInterval(pollingInterval);  pollingInterval  = null; }
+        if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
+        _updateDoorHint("idle");
 
         if (currentSessionId) {
             if (getMode() === "attendance") {
@@ -439,7 +601,54 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function _addEventCard(alert) {
-        const isKnown = alert.status === "known";
+        if (alert.type === "vision_watch_alert") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card unknown";
+            card.style.borderColor = "var(--danger)";
+            card.style.backgroundColor = "rgba(255, 68, 68, 0.1)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🚨</span>
+                <span class="fr-event-label" style="color: var(--danger); font-weight: bold;">${escHtml(alert.message || "Vision Watch Alert")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            buzzerAudio.currentTime = 0;
+            buzzerAudio.play().catch(e => console.warn("Audio play prevented:", e));
+            return;
+        }
+
+        if (alert.type === "door_open") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card";
+            card.style.borderColor = "#ef4444";
+            card.style.backgroundColor = "rgba(239,68,68,0.08)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🔴</span>
+                <span class="fr-event-label" style="color:#ef4444; font-weight:bold;">${escHtml(alert.message || "Door Opened")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            return;
+        }
+
+        if (alert.type === "door_close") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card";
+            card.style.borderColor = "#22c55e";
+            card.style.backgroundColor = "rgba(34,197,94,0.08)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🟢</span>
+                <span class="fr-event-label" style="color:#22c55e; font-weight:bold;">${escHtml(alert.message || "Door Closed")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            return;
+        }
+
+        const isKnown = alert.status === "known" || alert.status === "recognised" || alert.confidence > 0;
         const card = document.createElement("div");
         card.className = `fr-event-card ${isKnown ? "known" : "unknown"}`;
         card.innerHTML = `
@@ -488,16 +697,22 @@ document.addEventListener("DOMContentLoaded", () => {
                     let statsHtml = "";
                     if (mode === "attendance") {
                         statsHtml = `Present: <b>${report.present_count}</b> | Absent: <b>${report.absent_count}</b>`;
+                    } else if (mode === "vision_watch") {
+                        statsHtml = `🔴 Opens: <b>${report.door_open_count ?? 0}</b> &nbsp;|&nbsp; 🟢 Closes: <b>${report.door_close_count ?? 0}</b>`;
                     } else {
                         statsHtml = `Known: <b>${report.known_count}</b> | Unknown: <b>${report.unknown_count}</b>`;
                     }
-                    
+
+                    const displayId = String(report.session_id || "").replace(/[^0-9]/g, "").slice(-3) || report.session_id;
                     card.innerHTML = `
-                        <div class="report-title">Session: ${report.session_id.substring(0, 12)}...</div>
-                        <div class="report-meta">${startStr} (Duration: ${durationStr})</div>
+                        <div class="report-title">
+                            ${mode === "vision_watch" ? "🚪" : mode === "attendance" ? "📚" : "👤"}
+                            Session #${displayId}
+                        </div>
+                        <div class="report-meta">${startStr} &nbsp;·&nbsp; ${durationStr}</div>
                         <div class="report-meta" style="margin-top: 4px; color: #cbd5e1;">${statsHtml}</div>
                     `;
-                    
+
                     card.addEventListener("click", () => showReportDetails(report.session_id, mode));
                     reportsList.appendChild(card);
                 });
@@ -510,7 +725,9 @@ document.addEventListener("DOMContentLoaded", () => {
     function showReportDetails(sessionId, mode) {
         reportModalBody.innerHTML = `<div class="fr-identity-loading">Fetching details...</div>`;
         reportModalMeta.textContent = `Session: ${sessionId}`;
-        reportModalTitle.textContent = mode === "attendance" ? "Attendance Report" : "Visitor Report";
+        reportModalTitle.textContent = mode === "attendance" ? "📚 Attendance Report"
+            : mode === "vision_watch" ? "🚪 Vision Watch Report"
+            : "👤 Visitor Report";
         reportModal.classList.remove("hidden");
         
         fetch(`/api/reports/${sessionId}?mode=${mode}`)
@@ -531,7 +748,22 @@ document.addEventListener("DOMContentLoaded", () => {
                             ${report.absent.length === 0 ? '<div class="report-meta">Everyone was present.</div>' : ''}
                         </div>
                     `;
+                } else if (mode === "vision_watch") {
+                    html += `
+                        <div class="report-section" style="margin-bottom:12px;">
+                            <div class="report-section-title" style="font-size:1rem;">🚪 Door Activity Summary</div>
+                            <div class="report-item" style="background:rgba(239,68,68,0.1); border-radius:6px; padding:10px 14px; margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+                                <span>🔴 Total Opens</span>
+                                <span style="font-weight:bold; font-size:1.4rem; color:#ef4444;">${report.door_open_count ?? 0}</span>
+                            </div>
+                            <div class="report-item" style="background:rgba(34,197,94,0.1); border-radius:6px; padding:10px 14px; margin-top:6px; display:flex; justify-content:space-between; align-items:center;">
+                                <span>🟢 Total Closes</span>
+                                <span style="font-weight:bold; font-size:1.4rem; color:#22c55e;">${report.door_close_count ?? 0}</span>
+                            </div>
+                        </div>
+                    `;
                 } else {
+
                     html += `
                         <div class="report-section">
                             <div class="report-section-title">Known Visitors (${report.known_visitors.length})</div>
@@ -715,7 +947,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 ${thumbHtml}
                 <div class="fr-identity-info">
                     <div class="fr-identity-name" title="${escHtml(identity.label)}">${escHtml(identity.label)}</div>
-                    <div class="fr-identity-meta">${typeBadgeHtml} · ${identity.face_count ?? 1} frames · ${created}</div>
+                    <div class="fr-identity-meta">${typeBadgeHtml} · ${identity.occurrences ?? 0} sessions · ${created}</div>
                 </div>
                 <button class="fr-identity-rename-btn" title="Rename"
                     data-pid="${identity.person_id}"

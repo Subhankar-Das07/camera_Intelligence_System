@@ -248,6 +248,19 @@ class IdentityManager:
         with self._lock:
             return self._identities.get(person_id)
 
+    def increment_occurrences(self, person_ids: List[str]) -> None:
+        """Increment the lifetime session occurrence count for the given persons."""
+        with self._lock:
+            changed = False
+            for pid in person_ids:
+                if pid in self._identities:
+                    current = self._identities[pid].get("occurrences", 0)
+                    self._identities[pid]["occurrences"] = current + 1
+                    changed = True
+            if changed:
+                self._save_identities()
+                log.info("[IdentityManager] Incremented occurrences for %d persons.", len(person_ids))
+
     def get_all_identities(self) -> dict:
         with self._lock:
             return dict(self._identities)

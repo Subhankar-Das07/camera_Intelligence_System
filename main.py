@@ -248,6 +248,7 @@ def _mjpeg_generator_raw(stream_id: str):
 
 def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normalized, config):
     """Yield AI-annotated MJPEG frames and collect alert events."""
+    config["session_id"] = session_id
     stop_ev = stop_events.get(session_id)
     generator = pipeline.run_on_video(
         input_path=input_path,
@@ -381,7 +382,8 @@ async def get_pipelines():
 
 @app.post("/api/start_analysis")
 async def start_analysis(request: ProcessRequest):
-    session_id = str(uuid.uuid4())
+    import random
+    session_id = f"{random.randint(100, 999)}"
     active_sessions[session_id] = request
     visitor_sessions_meta[session_id] = {"start_time": time.time()}
     _clear_session_alerts(session_id)
@@ -425,6 +427,20 @@ def stream_video(session_id: str):
     )
 
 
+@app.get("/api/vision_watch/door_state/{session_id}")
+async def get_door_state(session_id: str):
+    """Return the current live door tracking state for polling by the frontend."""
+    if session_id not in active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        pipeline = _get_fr_pipeline()
+        return pipeline.get_door_state(session_id)
+    except Exception as e:
+        return {"state": "UNKNOWN", "open_count": 0, "close_count": 0, "last_event": None, "learning": True}
+
+
+
+
 @app.post("/api/stop_analysis/{session_id}")
 def stop_analysis(session_id: str):
     """Signal the analysis pipeline to stop, without closing the raw stream."""
@@ -450,7 +466,7 @@ def stop_analysis(session_id: str):
                 ts = alert.get("timestamp")
                 ts_val = time.time() 
                 
-                is_unknown = (pid == label)
+                is_unknown = label.startswith("Person_")
                 
                 if is_unknown:
                     if pid not in unknown_map:
@@ -465,18 +481,54 @@ def stop_analysis(session_id: str):
                         known_map[pid]["last_seen"] = ts_val
                         known_map[pid]["count"] += 1
 
-        report = {
-            "session_id": session_id,
-            "mode": "visitor",
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration": end_time - start_time,
-            "known_visitors": list(known_map.values()),
-            "unknown_visitors": list(unknown_map.values())
-        }
+        mode = req.config.get("mode", "visitor")
         
-        r = get_redis()
-        r.hset("reports:visitor", session_id, json.dumps(report))
+        # Pull latest Vision Watch state to get door counts
+        door_open_count = 0
+        door_close_count = 0
+        if mode == "vision_watch":
+            try:
+                pipeline = _get_fr_pipeline()
+                ds = pipeline.get_door_state(session_id)
+                door_open_count  = ds.get("open_count", 0)
+                door_close_count = ds.get("close_count", 0)
+            except Exception as e:
+                print(f"Error pulling door count: {e}")
+                
+            report = {
+                "session_id":       session_id,
+                "mode":             mode,
+                "start_time":       start_time,
+                "end_time":         end_time,
+                "duration":         end_time - start_time,
+                "door_open_count":  door_open_count,
+                "door_close_count": door_close_count,
+            }
+        else:
+            report = {
+                "session_id":       session_id,
+                "mode":             mode,
+                "start_time":       start_time,
+                "end_time":         end_time,
+                "duration":         end_time - start_time,
+                "known_visitors":   list(known_map.values()),
+                "unknown_visitors": list(unknown_map.values()),
+            }
+        
+        # Increment global occurrences for known visitors
+        known_pids = list(known_map.keys())
+        if known_pids:
+            try:
+                pipeline = _get_fr_pipeline()
+                im = pipeline.get_attendance_manager() if mode == "attendance" else pipeline.get_visitor_manager()
+                im.increment_occurrences(known_pids)
+            except Exception as e:
+                print(f"Failed to increment occurrences: {e}")
+        
+        # Prevent double-posting: Attendance reports are handled by /api/attendance/stop
+        if mode != "attendance":
+            r = get_redis()
+            r.hset(f"reports:{mode}", session_id, json.dumps(report))
         
     return {"status": "stopped"}
 
@@ -735,19 +787,27 @@ async def list_reports(mode: str = "visitor"):
     for sess_id_bytes, meta_bytes in raw_hash.items():
         try:
             report_data = json.loads(redis_str(meta_bytes))
-            # Just return summary data for the list
+            # Only return reports that match the requested mode
+            if report_data.get("mode") != mode:
+                continue
             summary = {
                 "session_id": report_data.get("session_id"),
                 "start_time": report_data.get("start_time"),
-                "end_time": report_data.get("end_time"),
-                "duration": report_data.get("duration"),
+                "end_time":   report_data.get("end_time"),
+                "duration":   report_data.get("duration"),
+                "mode":       mode,
             }
             if mode == "attendance":
-                summary["present_count"] = len(report_data.get("present", []))
-                summary["absent_count"] = len(report_data.get("absent", []))
+                summary["present_count"]     = len(report_data.get("present", []))
+                summary["absent_count"]      = len(report_data.get("absent", []))
+                summary["total_humans_count"]= summary["present_count"]
+            elif mode == "vision_watch":
+                summary["door_open_count"]  = report_data.get("door_open_count", 0)
+                summary["door_close_count"] = report_data.get("door_close_count", 0)
             else:
-                summary["known_count"] = len(report_data.get("known_visitors", []))
-                summary["unknown_count"] = len(report_data.get("unknown_visitors", []))
+                summary["known_count"]       = len(report_data.get("known_visitors", []))
+                summary["unknown_count"]     = len(report_data.get("unknown_visitors", []))
+                summary["total_humans_count"]= summary["known_count"] + summary["unknown_count"]
             reports.append(summary)
         except Exception:
             continue
@@ -790,7 +850,8 @@ def stop_attendance_session():
     start_time = attendance_session.get("start_time", end_time)
     duration = end_time - start_time
     
-    session_id = f"att_sess_{uuid.uuid4().hex[:8]}"
+    import random
+    session_id = f"att_{random.randint(100, 999)}"
     
     # 1. Get present students
     present_ids = list(attendance_session["present_ids"])
@@ -1096,7 +1157,8 @@ async def guardian_start(request: GuardianStartRequest):
     ]
 
     # Build a ProcessRequest-compatible record so the existing /api/stream endpoint works
-    session_id = str(uuid.uuid4())
+    import random
+    session_id = f"{random.randint(100, 999)}"
 
     # Determine source
     filename  = request.filename or ""

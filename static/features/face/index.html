@@ -63,6 +63,7 @@
                         <select id="mode-selector" class="fr-input" style="width: 100%; margin-top: 8px;">
                             <option value="visitor">Visitor Identification</option>
                             <option value="attendance">Attendance Tracker</option>
+                            <option value="vision_watch">Vision Watch</option>
                         </select>
                     </div>
                 </section>
@@ -121,6 +122,26 @@
                         <button class="fr-btn fr-btn-secondary" id="att-reg-snapshot-btn" type="button" disabled style="margin-top:10px;">Snapshot from Live Feed</button>
                         <button class="fr-btn fr-btn-register" id="att-reg-submit-btn" type="button" disabled>Register Student</button>
                     </div>
+
+                    <div id="fr-vision-watch-controls" class="hidden">
+                        <p class="fr-hint">Configure watchman tracking and door monitoring.</p>
+
+                        <div style="margin-bottom: 12px;">
+                            <label class="fr-hint" style="font-weight:600; margin-bottom:4px; display:block;">Watchman Tracking</label>
+                            <input type="text" id="vw-watchman-name" class="fr-input" placeholder="Watchman Name (e.g. John)">
+                        </div>
+
+                        <div>
+                            <label class="fr-hint" style="font-weight:600; margin-bottom:4px; display:block;">🚪 Door Monitor Zone</label>
+                            <p class="fr-hint">Click on the video to draw a polygon over the door. Close the polygon by clicking near the first point.</p>
+                            <div style="display: flex; gap: 8px; margin-top: 8px;">
+                                <button class="fr-btn fr-btn-secondary" id="vw-clear-roi-btn" type="button" style="flex:1;">🗑 Clear Zone</button>
+                            </div>
+                            <div id="vw-door-status-hint" style="margin-top:10px; padding: 8px; background: rgba(255,255,255,0.05); border-radius:6px; font-size:0.78rem; color:#94a3b8;">
+                                🟡 Draw a zone, then start stream. Auto-detects in ~3 seconds.
+                            </div>
+                        </div>
+                    </div>
                     
                     <div class="fr-reg-feedback hidden" id="reg-feedback"></div>
                 </section>
@@ -135,11 +156,12 @@
                         <span class="fr-legend-dot unknown"></span><span>Unknown</span>
                     </div>
                 </div>
-                <div class="fr-video-wrapper" id="fr-video-wrapper">
+                <div class="fr-video-wrapper" id="fr-video-wrapper" style="position: relative;">
                     <div class="fr-video-placeholder" id="fr-placeholder">
                         <p>Start a video source to begin live face recognition</p>
                     </div>
-                    <img id="fr-stream-img" class="fr-stream-img hidden" alt="Recognition Feed">
+                    <img id="fr-stream-img" class="fr-stream-img hidden" alt="Recognition Feed" style="display: block; width: 100%; height: auto;">
+                    <canvas id="fr-roi-canvas" class="hidden" style="position: absolute; top: 0; left: 0; pointer-events: auto; z-index: 10;"></canvas>
                 </div>
                 <div class="fr-events-section">
                     <h3 class="fr-events-title">Recognition Events</h3>

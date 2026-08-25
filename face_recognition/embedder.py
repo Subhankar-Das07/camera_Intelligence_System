@@ -170,7 +170,6 @@ class FaceEmbedder:
 
         return results
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_crop(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
