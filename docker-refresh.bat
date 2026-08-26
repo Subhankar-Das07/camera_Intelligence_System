@@ -3,8 +3,12 @@ setlocal
 cd /d "%~dp0"
 
 echo ========================================
-echo  Docker Refresh - rebuild and redeploy
+echo  Docker Refresh - FULL / SLOW rebuild
 echo ========================================
+echo.
+echo Use only when stuck or you need a fresh base image.
+echo For everyday code changes use docker-quick.bat instead.
+echo See docs\DOCKER_DEV.md for which bat to use.
 echo.
 
 where docker >nul 2>&1

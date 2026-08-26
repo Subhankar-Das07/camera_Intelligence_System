@@ -4,6 +4,9 @@ from pipelines.intrusion_pipeline import IntrusionDetectionPipeline
 from pipelines.danger_zone_pipeline import DangerZonePipeline
 from pipelines.face_recognition_pipeline import FaceRecognitionPipeline
 from pipelines.fall_detection_pipeline import FallDetectionPipeline
+from pipelines.fall_standing_lying_pipeline import FallStandingLyingPipeline
+# Add Room Guardian pipeline to track static objects
+from pipelines.room_guardian_pipeline import RoomGuardianPipeline
 
 class PipelineRegistry:
     def __init__(self):
@@ -41,3 +44,7 @@ registry.register("face_recognition", FaceRecognitionPipeline)
 
 # ── Fall Detection pipeline ──────────────────────────────────────────────────
 registry.register("fall_detection", FallDetectionPipeline)
+registry.register("fall_standing_lying", FallStandingLyingPipeline)
+
+# ── Room Guardian pipeline ───────────────────────────────────────────────────
+registry.register("room_guardian", RoomGuardianPipeline)

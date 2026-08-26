@@ -2,6 +2,7 @@ fastapi
 uvicorn
 opencv-python
 ultralytics
+lap>=0.5.12
 shapely
 python-multipart
 numpy
@@ -25,3 +26,7 @@ rapidocr-onnxruntime
 
 # ── Redis (single application database) ──────────────────────────────────────
 redis
+
+# ── Site Admin (DVR HTTP snapshot cameras) ───────────────────────────────────
+# Hikvision ISAPI /picture fetch with HTTP digest auth
+requests

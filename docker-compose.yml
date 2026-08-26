@@ -3,7 +3,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redis_data:/data
+      - redis_data:/data          # Redis persistence (already correct)
     ports:
       - "6379:6379"
     restart: unless-stopped
@@ -18,10 +18,30 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      YOLO_CONFIG_DIR: /app/.ultralytics
+      SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      USERNAME_EMAIL: ${USERNAME_EMAIL:-}
+      PASSWORD_EMAIL: ${PASSWORD_EMAIL:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
     volumes:
-      - app_storage:/app/storage
+      # ── Persistent Runtime Storage ────────────────────────────────
+      - app_storage:/app/storage              # All alert clips, uploads, previews
+
+      # ── Face Recognition Data (critical — DO NOT remove) ──────────
+      - face_data:/app/face_recognition/data  # Enrolled face embeddings
+
+      # ── Hot Reload (DEVELOPMENT ONLY — remove for production) ─────
+      # Mounts your local code INTO the container so changes apply instantly
+      # without rebuilding the image. Comment this out for production.
+      - ./pipelines:/app/pipelines
+      - ./core:/app/core
+      - ./static:/app/static
+      - ./main.py:/app/main.py
     depends_on:
       redis:
         condition: service_healthy
@@ -30,3 +50,4 @@ services:
 volumes:
   redis_data:
   app_storage:
+  face_data:          # ← NEW: persist trained face embeddings

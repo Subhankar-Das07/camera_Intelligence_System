@@ -65,6 +65,10 @@ document.addEventListener("DOMContentLoaded", () => {
       await CISSource.disconnectStream(currentStreamId);
       currentStreamId = null;
       const data = await CISSource.uploadVideo(file);
+      if (window.__guardianSetSource) window.__guardianSetSource({
+          stream_id: null, filename: data.filename, video_id: data.video_id,
+          width: data.width, height: data.height,
+      });
       currentVideoData = data;
       isRtspMode = false;
       uploadStatus.textContent = file.name;
@@ -91,6 +95,10 @@ document.addEventListener("DOMContentLoaded", () => {
     connectRtspBtn.textContent = "Connecting...";
     try {
       const data = await CISSource.connectStream(url);
+      if (window.__guardianSetSource) window.__guardianSetSource({
+          stream_id: data.stream_id, filename: null, video_id: data.stream_id,
+          width: data.width, height: data.height,
+      });
       currentStreamId = data.stream_id;
       currentVideoData = {
         video_id: data.stream_id,

@@ -18,11 +18,15 @@ from core.registry import registry
 from core.redis_client import get_redis, redis_str
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
+from core.site_admin_api import router as site_admin_router
+from core.site_admin_runtime import start_runtime
 from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
+from pipelines.gate_analytics_pipeline import GateAnalyticsPipeline
 
 # Register the vehicle recognition pipeline into the shared singleton registry
 registry.register("vehicle_recognition", VehicleRecognitionPipeline)
+registry.register("gate_analytics", GateAnalyticsPipeline)
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -39,6 +43,7 @@ for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
 app.include_router(mobile_router)
+app.include_router(site_admin_router)
 
 @app.on_event("startup")
 async def _on_startup():
@@ -46,6 +51,15 @@ async def _on_startup():
     get_redis().ping()
     loop = asyncio.get_running_loop()
     start_mobile_worker(loop)
+    try:
+        registry.get_pipeline("vehicle_recognition").initialize()
+    except Exception:
+        pass
+    try:
+        registry.get_pipeline("gate_analytics").initialize()
+    except Exception:
+        pass
+    start_runtime()
 
 # ── Live stream handles stay in-process; DB/session data is Redis ─────────────
 rtsp_streams: Dict[str, ThreadedCamera] = {}
@@ -124,6 +138,13 @@ def _get_vr_detections(session_id: str) -> List[Dict[str, Any]]:
             continue
     return out
 
+# Attendance Session state
+attendance_session = {
+    "active": False,
+    "start_time": None,
+    "present_ids": set()
+}
+
 # ── Pydantic models ──────────────────────────────────────────────────────────
 class RtspConnectRequest(BaseModel):
     url: str
@@ -135,6 +156,24 @@ class ProcessRequest(BaseModel):
     roi_normalized: List[Tuple[float, float]]
     config: Dict[str, Any] = {}
     stream_id: Optional[str] = None   # set when sourcing from a live RTSP session
+
+# ── Guardian Models ──────────────────────────────────────────────────────────
+class GuardianScanRequest(BaseModel):
+    stream_id: Optional[str] = None
+    filename: Optional[str] = None
+
+class WatchedObject(BaseModel):
+    id: str
+    type: str
+    label: str
+    class_id: Optional[int] = None
+    bbox_normalized: List[float]
+
+class GuardianStartRequest(BaseModel):
+    stream_id: Optional[str] = None
+    video_id: Optional[str] = None
+    filename: Optional[str] = None
+    watched_objects: List[WatchedObject]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _socket_check(url: str, timeout: float = 3.0) -> Optional[str]:
@@ -190,6 +229,9 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
             break
         if alert_event:
             _append_session_alert(session_id, alert_event)
+            if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
+                if attendance_session["active"]:
+                    attendance_session["present_ids"].add(alert_event["person_id"])
         if frame is not None:
             ok, buf = cv2.imencode('.jpg', frame)
             if not ok:
@@ -435,24 +477,29 @@ def _get_fr_pipeline():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Face recognition pipeline unavailable: {e}")
 
+def _get_identity_manager(mode: str = "visitor"):
+    pipeline = _get_fr_pipeline()
+    if mode == "attendance":
+        return pipeline.get_attendance_manager()
+    return pipeline.get_visitor_manager()
+
 
 @app.get("/api/faces/status")
-async def face_status():
+async def face_status(mode: str = "visitor"):
     """Return stats about the face identity database."""
-    pipeline = _get_fr_pipeline()
-    return pipeline.get_identity_manager().get_stats()
+    im = _get_identity_manager(mode)
+    return im.get_stats()
 
 
 @app.get("/api/faces/identities")
-async def list_identities():
+async def list_identities(mode: str = "visitor"):
     """Return all registered identities with metadata and thumbnail URLs."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     identities = im.get_all_identities()
     result = []
     for pid, meta in identities.items():
         entry = {"person_id": pid, **meta}
-        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid)
+        entry["thumbnail_url"] = im.get_face_thumbnail_url(pid, mode)
         result.append(entry)
     result.sort(key=lambda x: x.get("created_at", 0))
     return {"identities": result}
@@ -461,12 +508,13 @@ async def list_identities():
 @app.post("/api/faces/register")
 async def register_face(
     label: Optional[str] = None,
+    mode: str = "visitor",
     file: UploadFile = File(...),
 ):
     """Register a new known person from an uploaded face image."""
     import numpy as np
     pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
     contents = await file.read()
@@ -494,7 +542,7 @@ async def register_face(
 
 
 @app.post("/api/faces/snapshot/{stream_id}")
-async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
+async def snapshot_and_register(stream_id: str, label: Optional[str] = None, mode: str = "visitor"):
     """Grab current frame from live RTSP stream, detect face, register it."""
     import numpy as np
     cam = rtsp_streams.get(stream_id)
@@ -506,7 +554,7 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
         raise HTTPException(status_code=503, detail="Could not read frame from stream.")
 
     pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
     faces = embedder.detect_and_embed(frame)
@@ -525,10 +573,9 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None):
 
 
 @app.patch("/api/faces/identity/{person_id}")
-async def rename_identity(person_id: str, body: FaceRenameRequest):
+async def rename_identity(person_id: str, body: FaceRenameRequest, mode: str = "visitor"):
     """Rename an existing identity."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     success = im.rename_identity(person_id, body.new_label)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
@@ -536,21 +583,40 @@ async def rename_identity(person_id: str, body: FaceRenameRequest):
 
 
 @app.delete("/api/faces/identity/{person_id}")
-async def delete_identity(person_id: str):
+async def delete_identity(person_id: str, mode: str = "visitor"):
     """Delete a person from the database entirely."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     success = im.delete_identity(person_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
     return {"person_id": person_id, "status": "deleted"}
 
+# ── Attendance Session Management ────────────────────────────────────────────
+
+@app.post("/api/attendance/start")
+def start_attendance_session():
+    attendance_session["active"] = True
+    attendance_session["start_time"] = time.time()
+    attendance_session["present_ids"] = set()
+    return {"status": "started"}
+
+@app.post("/api/attendance/stop")
+def stop_attendance_session():
+    attendance_session["active"] = False
+    return {"status": "stopped", "present_ids": list(attendance_session["present_ids"])}
+
+@app.get("/api/attendance/status")
+def get_attendance_status():
+    return {
+        "active": attendance_session["active"],
+        "present_ids": list(attendance_session["present_ids"])
+    }
+
 
 @app.get("/api/faces/image/{person_id}/{index}")
-def face_image(person_id: str, index: int = 1):
+async def face_image(person_id: str, index: int, mode: str = "visitor"):
     """Serve a face crop JPEG stored in Redis."""
-    pipeline = _get_fr_pipeline()
-    im = pipeline.get_identity_manager()
+    im = _get_identity_manager(mode)
     data = im.get_face_bytes(person_id, index)
     if not data:
         raise HTTPException(status_code=404, detail="Face image not found.")
@@ -570,6 +636,11 @@ def vr_image(kind: str, plate: str, visit: int):
         raise HTTPException(status_code=404, detail="Image not found.")
     return Response(content=data, media_type="image/jpeg")
 
+
+_ATT_DATA_DIR = os.path.join("face_recognition", "attendance_data")
+os.makedirs(_ATT_DATA_DIR, exist_ok=True)
+os.makedirs(os.path.join(_ATT_DATA_DIR, "persons"), exist_ok=True)
+app.mount("/attendance_data", StaticFiles(directory=_ATT_DATA_DIR), name="attendance_data")
 
 # Serve face recognition dashboard (separate sub-page)
 _FR_STATIC_DIR = os.path.join("static", "face_recognition")
@@ -669,6 +740,130 @@ def unregister_vehicle(plate: str):
         return {"status": "ok", "plate": plate}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── Guardian endpoints ────────────────────────────────────────────────────────
+# These are fully decoupled from the existing pipeline endpoints.
+# They use the same session/alert infrastructure but are namespaced under /api/guardian/.
+
+@app.post("/api/guardian/scan")
+async def guardian_scan(request: GuardianScanRequest):
+    """
+    Run a one-shot YOLO detection on a single frame and return bounding boxes.
+    The frontend uses these to draw the Phase-1 selection overlay.
+    """
+    import numpy as _np
+    from ultralytics import FastSAM as _FastSAM
+
+    # Resolve the video source
+    if request.stream_id and request.stream_id in rtsp_streams:
+        cam = rtsp_streams[request.stream_id]
+        ret, frame = cam.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=503, detail="Could not read frame from stream.")
+        width, height = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    elif request.filename:
+        file_path = os.path.join(UPLOAD_DIR, request.filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Video file not found.")
+        cap = cv2.VideoCapture(file_path)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise HTTPException(status_code=400, detail="Could not read video frame.")
+        height, width = frame.shape[:2]
+    else:
+        raise HTTPException(status_code=400, detail="Provide stream_id or filename.")
+
+    # Save a preview still for the frontend to display
+    scan_preview_id = str(uuid.uuid4())
+    preview_fn      = f"guardian_scan_{scan_preview_id}.jpg"
+    preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
+    cv2.imwrite(preview_path, frame)
+
+    # Run YOLO inference in a thread pool to avoid blocking the event loop
+    loop = asyncio.get_running_loop()
+    _model = _FastSAM("FastSAM-s.pt")
+
+    def _infer():
+        # FastSAM standard inference
+        return _model(frame, conf=0.25, verbose=False)[0]
+
+    results = await loop.run_in_executor(None, _infer)
+
+    detections = []
+    if results.boxes is not None:
+        for i, box in enumerate(results.boxes):
+            cls_id  = int(box.cls[0])
+            conf    = float(box.conf[0])
+            label   = "Object"
+            xywh    = box.xywh[0].cpu().numpy()
+            cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
+            # Normalise to [0,1] range, xywh format (top-left x,y + w,h)
+            nx = (cx - bw / 2) / width
+            ny = (cy - bh / 2) / height
+            nw = bw / width
+            nh = bh / height
+            detections.append({
+                "id":             f"yolo-{i}-{str(uuid.uuid4())[:8]}",
+                "label":          label,
+                "class_id":       cls_id,
+                "confidence":     round(conf, 2),
+                "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
+            })
+
+    return {
+        "preview_url": f"/storage/previews/{preview_fn}",
+        "width":       width,
+        "height":      height,
+        "detections":  detections,
+    }
+
+
+@app.post("/api/guardian/start")
+async def guardian_start(request: GuardianStartRequest):
+    """
+    Start a guardian analysis session.
+    Returns a session_id compatible with /api/stream/{session_id} and /api/alerts/{session_id}.
+    """
+    if not request.watched_objects:
+        raise HTTPException(status_code=400, detail="No watched_objects provided.")
+
+    # Serialise watched objects for the pipeline config
+    watched_list = [
+        {
+            "id":              wo.id,
+            "type":            wo.type,
+            "label":           wo.label,
+            "class_id":        wo.class_id,
+            "bbox_normalized": wo.bbox_normalized,
+        }
+        for wo in request.watched_objects
+    ]
+
+    # Build a ProcessRequest-compatible record so the existing /api/stream endpoint works
+    session_id = str(uuid.uuid4())
+
+    # Determine source
+    filename  = request.filename or ""
+    stream_id = request.stream_id or None
+
+    # We store a ProcessRequest-like object (dict is fine — stream_video reads .pipeline_name etc.)
+    from types import SimpleNamespace
+    fake_req = SimpleNamespace(
+        video_id      = request.video_id or session_id,
+        filename      = filename,
+        pipeline_name = "room_guardian",
+        roi_normalized= [],
+        config        = {"watched_objects": watched_list},
+        stream_id     = stream_id,
+    )
+
+    active_sessions[session_id] = fake_req
+    session_alerts[session_id]  = []
+    stop_events[session_id]     = threading.Event()
+
+    return {"session_id": session_id}
+
 
 # Mount static root last
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
