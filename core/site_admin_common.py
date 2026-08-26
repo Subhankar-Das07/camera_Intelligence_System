@@ -22,6 +22,7 @@ MONITOR_DEBOUNCE_SEC = float(os.environ.get("SITE_ADMIN_MONITOR_DEBOUNCE_SEC", "
 SCAN_TO_PIPELINE = {
     "intrusion": "intrusion_detection",
     "danger_zone": "danger_zone",
+    "loitering": "loitering",
     "fall": "fall_detection",
     "fall_standing_lying": "fall_standing_lying",
     "face_attendance": "face_recognition",
@@ -70,10 +71,10 @@ SCAN_CATALOG: List[Dict[str, Any]] = [
     {
         "id": "loitering",
         "label": "Loitering",
-        "typical_need": "Person stays in an area too long",
+        "typical_need": "Person stays / wanders in an area too long (trajectory: dwell, pace, tortuosity — WACV’24 style)",
         "fit": "High — shops, alleys, lobbies",
         "category": "People & safety",
-        "status": "coming_soon",
+        "status": "available",
         "kind": "area",
     },
     {
@@ -244,7 +245,7 @@ def input_for_camera(cam: Dict[str, Any]) -> Optional[Any]:
 
 
 def needs_roi(scan_type: str) -> bool:
-    return scan_type in ("intrusion", "danger_zone")
+    return scan_type in ("intrusion", "danger_zone", "loitering")
 
 
 # COCO-17 keypoint groups for YOLOv8-pose (client-selectable rule triggers)

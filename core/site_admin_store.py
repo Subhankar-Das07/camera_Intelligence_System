@@ -686,16 +686,18 @@ def clear_monitored_cameras_redis() -> None:
     get_redis().delete(MONITOR_CAM_SET)
 
 
-def set_runtime_worker_heartbeat(camera_id: str, payload: Dict[str, Any], ttl_sec: int = 10) -> None:
+def set_runtime_worker_heartbeat(camera_id: str, payload: Dict[str, Any], ttl_sec: int = 600) -> None:
     if not camera_id:
         return
     data = dict(payload)
     data["camera_id"] = camera_id
     data["updated_at"] = time.time()
+    if "last_tick_at" not in data:
+        data["last_tick_at"] = data["updated_at"]
     get_redis().setex(f"{RUNTIME_WORKER_PREFIX}{camera_id}", ttl_sec, _dumps(data))
 
 
-def list_runtime_worker_heartbeats(max_age_sec: float = 5.0) -> List[Dict[str, Any]]:
+def list_runtime_worker_heartbeats(max_age_sec: float = 600.0) -> List[Dict[str, Any]]:
     r = get_redis()
     now = time.time()
     out: List[Dict[str, Any]] = []
@@ -705,7 +707,10 @@ def list_runtime_worker_heartbeats(max_age_sec: float = 5.0) -> List[Dict[str, A
         if not item:
             continue
         updated = float(item.get("updated_at") or item.get("last_tick_at") or 0)
-        if now - updated <= max_age_sec:
+        age = now - updated if updated else 1e9
+        if age <= max_age_sec:
+            item = dict(item)
+            item["age_sec"] = round(age, 1)
             out.append(item)
     out.sort(key=lambda x: x.get("camera_id") or "")
     return out

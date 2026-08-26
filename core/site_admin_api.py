@@ -72,6 +72,7 @@ class RuleIn(BaseModel):
     roi_normalized: List[List[float]] = Field(default_factory=list)
     gate_config: Dict[str, Any] = Field(default_factory=dict)
     pose_trigger: Optional[Dict[str, Any]] = None
+    loiter_config: Optional[Dict[str, Any]] = None
     schedule: str = "always"
     severity: str = "high"
     channels: List[str] = Field(default_factory=lambda: ["web"])
@@ -577,6 +578,14 @@ def _rule_payload_from_body(body: RuleIn) -> Dict[str, Any]:
         data["pose_trigger"] = common.normalize_pose_trigger(body.scan_type, body.pose_trigger)
     else:
         data.pop("pose_trigger", None)
+    if body.scan_type == "loitering":
+        from core.loitering_trajectory import normalize_loiter_config
+
+        data["loiter_config"] = normalize_loiter_config(
+            {"loiter_config": body.loiter_config or {}}
+        )
+    else:
+        data.pop("loiter_config", None)
     return data
 
 

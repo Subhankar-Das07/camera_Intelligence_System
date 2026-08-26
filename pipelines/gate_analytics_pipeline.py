@@ -208,6 +208,50 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                 elif prev == "open" and score < close_thresh:
                     st["gate_state"] = "closed"
                     deltas["gate_closes"] += 1
+                # #region agent log
+                try:
+                    import json as _json
+                    import time as _time
+                    import os as _os
+                    _now_ms = int(_time.time() * 1000)
+                    _last = int(st.get("_dbg_last_log_ms") or 0)
+                    _state_changed = prev != st.get("gate_state")
+                    if _state_changed or (_now_ms - _last) >= 2000:
+                        st["_dbg_last_log_ms"] = _now_ms
+                        _payload = _json.dumps({
+                            "sessionId": "46c418",
+                            "hypothesisId": "A,B,C",
+                            "location": "gate_analytics_pipeline.py:process_frame:gate_state",
+                            "message": "gate edge score vs thresholds",
+                            "data": {
+                                "rule_id": rule_id,
+                                "score": round(float(score), 3),
+                                "baseline": round(float(baseline), 3),
+                                "open_thresh": round(float(open_thresh), 3),
+                                "close_thresh": round(float(close_thresh), 3),
+                                "prev": prev,
+                                "gate_state": st.get("gate_state"),
+                                "score_gt_open": bool(score > open_thresh),
+                                "score_lt_close": bool(score < close_thresh),
+                                "ratio_vs_baseline": round(float(score) / float(baseline), 3) if baseline else None,
+                                "state_changed": _state_changed,
+                            },
+                            "timestamp": _now_ms,
+                            "runId": "gate-debug-1",
+                        }) + "\n"
+                        for _p in (
+                            "debug-46c418.log",
+                            _os.path.join("static", "debug-46c418.log"),
+                            _os.path.join(_os.path.dirname(__file__), "..", "core", "debug-46c418.log"),
+                        ):
+                            try:
+                                with open(_p, "a", encoding="utf-8") as _f:
+                                    _f.write(_payload)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                # #endregion
 
         band_counts = {"near": 0, "medium": 0, "far": 0}
         person_tracks: List[Dict[str, Any]] = []
