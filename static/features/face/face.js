@@ -398,6 +398,14 @@ document.addEventListener("DOMContentLoaded", () => {
             regSnapshotBtn.disabled = false;
             attRegSnapshotBtn.disabled = false;
             updateStartBtn();
+
+            // ── Show live preview so user can draw ROI on real video ──
+            placeholder.classList.add("hidden");
+            streamImg.src = `/api/raw_stream/${data.stream_id}`;
+            streamImg.classList.remove("hidden");
+            videoWrapper.classList.add("active");
+            // Re-align the canvas once the first frame loads
+            streamImg.onload = alignCanvas;
         })
         .catch(err => {
             frConnectBtn.textContent = "Connect RTSP";
@@ -414,6 +422,14 @@ document.addEventListener("DOMContentLoaded", () => {
         regSnapshotBtn.disabled = true;
         attRegSnapshotBtn.disabled = true;
         updateStartBtn();
+        // Hide stream preview on explicit disconnect
+        streamImg.src = "";
+        streamImg.classList.add("hidden");
+        placeholder.classList.remove("hidden");
+        videoWrapper.classList.remove("active");
+        vwDoorZones = [];
+        currentDoorZone = [];
+        drawVwPolygons();
     });
 
     // ── Start Analysis ─────────────────────────────────────────────────────────
@@ -559,10 +575,19 @@ document.addEventListener("DOMContentLoaded", () => {
             attRegSnapshotBtn.disabled = true;
         }
 
-        streamImg.src = "";
-        streamImg.classList.add("hidden");
-        placeholder.classList.remove("hidden");
-        videoWrapper.classList.remove("active");
+        // If RTSP is still connected, restore the raw preview for ROI editing
+        if (currentStreamId && !isWebcamStream) {
+            streamImg.src = `/api/raw_stream/${currentStreamId}`;
+            streamImg.classList.remove("hidden");
+            placeholder.classList.add("hidden");
+            videoWrapper.classList.add("active");
+            streamImg.onload = alignCanvas;
+        } else {
+            streamImg.src = "";
+            streamImg.classList.add("hidden");
+            placeholder.classList.remove("hidden");
+            videoWrapper.classList.remove("active");
+        }
 
         frStartBtn.classList.remove("hidden");
         frStopBtn.classList.add("hidden");
