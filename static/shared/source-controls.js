@@ -34,7 +34,10 @@ window.CISSource = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error("Failed to start analysis.");
+    if (!res.ok) {
+      const text = await res.text().catch(() => "No response body");
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
     return res.json();
   },
 

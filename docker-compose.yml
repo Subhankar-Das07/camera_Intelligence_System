@@ -43,6 +43,7 @@ services:
       - ./static:/app/static
       - ./main.py:/app/main.py
       - ./face_recognition:/app/face_recognition
+      - ./best.pt:/app/best.pt
     depends_on:
       redis:
         condition: service_healthy

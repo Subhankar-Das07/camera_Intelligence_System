@@ -52,3 +52,14 @@ registry.register("room_guardian", RoomGuardianPipeline)
 # ── New Intrusion pipeline (OpenVINO hardware-accelerated) ────────────────────
 from pipelines.new_intrusion_pipeline import NewIntrusionPipeline
 registry.register("new_intrusion", NewIntrusionPipeline)
+
+# ── Fall Detection V2 pipeline (enhanced, decoupled, 4-signal AND-gate) ───────
+# This is a drop-in upgrade to "fall_detection". It has the identical API and
+# alert schema. Use "pipeline_type": "fall_detection_v2" in your API request
+# to route to this pipeline. The original "fall_detection" is NOT affected.
+from pipelines.new_fall_detection_pipeline import FallDetectionPipelineV2
+registry.register("fall_detection_v2", FallDetectionPipelineV2)
+
+# ── Loitering Analytics pipeline ─────────────────────────────────────────────
+from pipelines.loitering_analytics_pipeline import LoiteringAnalyticsPipeline
+registry.register("loitering_analytics", LoiteringAnalyticsPipeline)

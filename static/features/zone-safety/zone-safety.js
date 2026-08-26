@@ -4,7 +4,10 @@ document.addEventListener("DOMContentLoaded", () => {
     "new_intrusion",
     "danger_zone",
     "fall_detection",
+    "fall_detection_v2",   // Enhanced V2: 4-signal AND-gate, Kalman filter, stillness check
     "room_guardian",
+    "footfall_analysis",
+    "loitering_analytics",
   ]);
 
   const videoUpload = document.getElementById("video-upload");
@@ -29,6 +32,8 @@ document.addEventListener("DOMContentLoaded", () => {
   let currentSessionId = null;
   let isRtspMode = false;
   let roiPoints = [];
+  let footfallOutsidePoints = [];
+  let footfallInsidePoints = [];
   let imageWidth = 0;
   let imageHeight = 0;
   let pollingInterval = null;
@@ -48,7 +53,10 @@ document.addEventListener("DOMContentLoaded", () => {
           if (p === "new_intrusion") displayName = "Intrusion Detection (OpenVINO)";
           if (p === "danger_zone") displayName = "Danger Zone";
           if (p === "fall_detection") displayName = "Fall Detection";
+          if (p === "fall_detection_v2") displayName = "Fall Detection V2 (Enhanced)";  // New enhanced pipeline
           if (p === "room_guardian") displayName = "Object Tracking";
+          if (p === "footfall_analysis") displayName = "Footfall Analysis";
+          if (p === "loitering_analytics") displayName = "Loitering Analytics";
           opt.textContent = displayName;
           pipelineSelect.appendChild(opt);
         });
@@ -82,6 +90,8 @@ document.addEventListener("DOMContentLoaded", () => {
       uploadStatus.textContent = file.name;
       uploadStatus.style.color = "#10b981";
       roiPoints = [];
+      footfallOutsidePoints = [];
+      footfallInsidePoints = [];
       setupPreview(data.preview_url, data.width, data.height);
     } catch (err) {
       console.error(err);
@@ -121,6 +131,8 @@ document.addEventListener("DOMContentLoaded", () => {
       uploadStatus.style.color = "#10b981";
       disconnectRtspBtn.classList.remove("hidden");
       roiPoints = [];
+      footfallOutsidePoints = [];
+      footfallInsidePoints = [];
       const srcUrl = data.preview_url || `/api/raw_stream/${data.stream_id}`;
       setupPreview(srcUrl, data.width, data.height);
     } catch (err) {
@@ -166,6 +178,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!imageWidth || !imageHeight) return;
     const rect = mainVideoImg.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
+
+    const containerRect = mainVideoImg.parentElement.getBoundingClientRect();
+
     const imgRatio = imageWidth / imageHeight;
     const boxRatio = rect.width / rect.height;
     let renderWidth, renderHeight, offsetX, offsetY;
@@ -180,66 +195,112 @@ document.addEventListener("DOMContentLoaded", () => {
       offsetX = (rect.width - renderWidth) / 2;
       offsetY = 0;
     }
+
+    const finalLeft = (rect.left - containerRect.left) + offsetX;
+    const finalTop  = (rect.top - containerRect.top) + offsetY;
+
     roiCanvas.style.width = renderWidth + "px";
     roiCanvas.style.height = renderHeight + "px";
-    roiCanvas.style.left = offsetX + "px";
-    roiCanvas.style.top = offsetY + "px";
+    roiCanvas.style.left = finalLeft + "px";
+    roiCanvas.style.top = finalTop + "px";
   }
 
   window.addEventListener("resize", alignCanvas);
 
   roiCanvas.addEventListener("click", (e) => {
     const rect = roiCanvas.getBoundingClientRect();
-    roiPoints.push({
+    const pt = {
       x: (e.clientX - rect.left) * (roiCanvas.width / rect.width),
       y: (e.clientY - rect.top) * (roiCanvas.height / rect.height),
-    });
+    };
+    if (pipelineSelect.value === "footfall_analysis") {
+        const mode = document.querySelector('input[name="roi-mode"]:checked').value;
+        if (mode === "outside") footfallOutsidePoints.push(pt);
+        else footfallInsidePoints.push(pt);
+    } else {
+        roiPoints.push(pt);
+    }
     drawPoly();
     checkRunReady();
   });
 
   clearRoiBtn.addEventListener("click", () => {
-    roiPoints = [];
+    if (pipelineSelect.value === "footfall_analysis") {
+        const mode = document.querySelector('input[name="roi-mode"]:checked').value;
+        if (mode === "outside") footfallOutsidePoints = [];
+        else footfallInsidePoints = [];
+    } else {
+        roiPoints = [];
+    }
     drawPoly();
     checkRunReady();
   });
 
-  function drawPoly() {
-    ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
-    if (roiPoints.length === 0) return;
+  function _drawSinglePoly(pts, colorStr, fillStr) {
+    if (pts.length === 0) return;
     ctx.beginPath();
-    ctx.moveTo(roiPoints[0].x, roiPoints[0].y);
-    for (let i = 1; i < roiPoints.length; i++) ctx.lineTo(roiPoints[i].x, roiPoints[i].y);
-    if (roiPoints.length > 2) {
-      ctx.lineTo(roiPoints[0].x, roiPoints[0].y);
-      ctx.fillStyle = "rgba(0, 255, 255, 0.15)";
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    if (pts.length > 2) {
+      ctx.lineTo(pts[0].x, pts[0].y);
+      ctx.fillStyle = fillStr;
       ctx.fill();
     }
-    ctx.strokeStyle = "#00ffff";
+    ctx.strokeStyle = colorStr;
     ctx.lineWidth = 2;
     ctx.stroke();
+  }
+
+  function drawPoly() {
+    ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+    if (pipelineSelect.value === "footfall_analysis") {
+        _drawSinglePoly(footfallOutsidePoints, "#00aaff", "rgba(0, 170, 255, 0.15)");
+        _drawSinglePoly(footfallInsidePoints, "#ff3333", "rgba(255, 51, 51, 0.15)");
+    } else {
+        _drawSinglePoly(roiPoints, "#00ffff", "rgba(0, 255, 255, 0.15)");
+    }
   }
 
   function checkRunReady() {
     const pipeline = pipelineSelect.value;
     const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection" || pipeline === "new_intrusion";
-    const hasRoi = roiPoints.length > 2;
-    runBtn.disabled = !((needsRoi ? hasRoi : true) && pipeline && currentVideoData);
+    
+    let hasRoi = false;
+    if (pipeline === "footfall_analysis") {
+        hasRoi = footfallOutsidePoints.length > 2 && footfallInsidePoints.length > 2;
+    } else {
+        hasRoi = roiPoints.length > 2;
+    }
+    
+    runBtn.disabled = !((needsRoi || pipeline === "footfall_analysis" ? hasRoi : true) && pipeline && currentVideoData);
   }
 
   function updatePipelineUi() {
     const pipeline = pipelineSelect.value;
     const isDangerZone = pipeline === "danger_zone";
-    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection" || pipeline === "new_intrusion";
+    const isFootfall = pipeline === "footfall_analysis";
+    const needsRoi = pipeline === "danger_zone" || pipeline === "intrusion_detection" || pipeline === "new_intrusion" || pipeline === "footfall_analysis";
     const isGuardian = pipeline === "room_guardian";
     
     const machineSettings = document.getElementById("machine-settings");
     const roiControls = document.getElementById("roi-controls");
+    const roiModeSelector = document.getElementById("roi-mode-selector");
     const controlActions = document.querySelector(".control-actions");
     const guardianControls = document.getElementById("guardian-controls");
     
     if (machineSettings) machineSettings.style.display = isDangerZone ? "block" : "none";
     if (roiControls) roiControls.style.display = needsRoi ? "block" : "none";
+    
+    if (roiModeSelector) {
+        if (isFootfall) {
+            roiModeSelector.classList.remove("hidden");
+            roiModeSelector.style.display = "block";
+        } else {
+            roiModeSelector.classList.add("hidden");
+            roiModeSelector.style.display = "none";
+        }
+    }
+
     if (controlActions) controlActions.style.display = isGuardian ? "none" : "block";
     
     if (guardianControls) {
@@ -262,16 +323,32 @@ document.addEventListener("DOMContentLoaded", () => {
   pipelineSelect.addEventListener("change", updatePipelineUi);
 
   runBtn.addEventListener("click", async () => {
-    const roiNormalized = roiPoints.map((p) => [p.x / imageWidth, p.y / imageHeight]);
-    const machineActive = document.getElementById("machine-active-toggle")?.checked || false;
-    const payload = {
-      video_id: currentVideoData.video_id,
-      filename: currentVideoData.filename,
-      pipeline_name: pipelineSelect.value,
-      roi_normalized: roiNormalized,
-      config: { machine_active: machineActive },
-      stream_id: currentStreamId || null,
-    };
+    let payload = null;
+    if (pipelineSelect.value === "footfall_analysis") {
+        payload = {
+          video_id: currentVideoData.video_id,
+          filename: currentVideoData.filename,
+          pipeline_name: pipelineSelect.value,
+          roi_normalized: [],
+          config: {
+              outside_poly: footfallOutsidePoints.map((p) => [p.x / imageWidth, p.y / imageHeight]),
+              inside_poly: footfallInsidePoints.map((p) => [p.x / imageWidth, p.y / imageHeight]),
+          },
+          stream_id: currentStreamId || null,
+        };
+    } else {
+        const roiNormalized = roiPoints.map((p) => [p.x / imageWidth, p.y / imageHeight]);
+        const machineActive = document.getElementById("machine-active-toggle")?.checked || false;
+        payload = {
+          video_id: currentVideoData.video_id,
+          filename: currentVideoData.filename,
+          pipeline_name: pipelineSelect.value,
+          roi_normalized: roiNormalized,
+          config: { machine_active: machineActive },
+          stream_id: currentStreamId || null,
+        };
+    }
+    
     runBtn.disabled = true;
     try {
       const data = await CISSource.startAnalysis(payload);
@@ -279,7 +356,7 @@ document.addEventListener("DOMContentLoaded", () => {
       startAnalysisMode();
     } catch (err) {
       console.error(err);
-      alert("Error starting analysis.");
+      alert("Error starting analysis: " + err.message);
       runBtn.disabled = false;
     }
   });

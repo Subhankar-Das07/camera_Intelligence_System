@@ -38,39 +38,26 @@ from core.site_admin_runtime import start_runtime
 from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
 from ultralytics import FastSAM as _FastSAM
-from ultralytics import YOLO as _YOLO
+from ultralytics import YOLOWorld as _YOLOWorld
+
 from pipelines.gate_analytics_pipeline import GateAnalyticsPipeline
+from pipelines.footfall_analytics_pipeline import FootfallAnalyticsPipeline
 
 # Register the vehicle recognition pipeline into the shared singleton registry
 registry.register("vehicle_recognition", VehicleRecognitionPipeline)
 registry.register("gate_analytics", GateAnalyticsPipeline)
+registry.register("footfall_analysis", FootfallAnalyticsPipeline)
 
 # ── Guardian scan models — loaded ONCE at startup, never reloaded per request ──
 # This eliminates the 2-5s cold-load that was happening on every scan click.
-_guardian_fastsam: Optional[_FastSAM] = None
-_guardian_yolo:    Optional[_YOLO]    = None
+_guardian_yolo: Optional[_YOLOWorld] = None
 
 def _get_guardian_models():
-    """Lazy-load guardian scan models as singletons."""
-    global _guardian_fastsam, _guardian_yolo
-    if _guardian_fastsam is None:
-        _guardian_fastsam = _FastSAM("FastSAM-s.pt")
+    """Lazy-load guardian scan model as singleton."""
+    global _guardian_yolo
     if _guardian_yolo is None:
-        # Use the existing YOLO model already present in the image for class labeling
-        _guardian_yolo = _YOLO("yolov8n-pose.pt")
-    return _guardian_fastsam, _guardian_yolo
-
-
-def _guardian_iou(boxA, boxB) -> float:
-    """IoU between two [x,y,w,h] boxes."""
-    ax1, ay1, ax2, ay2 = boxA[0], boxA[1], boxA[0]+boxA[2], boxA[1]+boxA[3]
-    bx1, by1, bx2, by2 = boxB[0], boxB[1], boxB[0]+boxB[2], boxB[1]+boxB[3]
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-    if inter == 0: return 0.0
-    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
-    return inter / union if union > 0 else 0.0
+        _guardian_yolo = _YOLOWorld("yolov8s-worldv2.pt")
+    return _guardian_yolo
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -102,6 +89,10 @@ async def _on_startup():
         pass
     try:
         registry.get_pipeline("gate_analytics").initialize()
+    except Exception:
+        pass
+    try:
+        registry.get_pipeline("footfall_analysis").initialize()
     except Exception:
         pass
     start_runtime()
@@ -207,6 +198,7 @@ class ProcessRequest(BaseModel):
 class GuardianScanRequest(BaseModel):
     stream_id: Optional[str] = None
     filename: Optional[str] = None
+    vocabulary: Optional[List[str]] = None
 
 class WatchedObject(BaseModel):
     id: str
@@ -220,6 +212,7 @@ class GuardianStartRequest(BaseModel):
     video_id: Optional[str] = None
     filename: Optional[str] = None
     watched_objects: List[WatchedObject]
+    config: Dict[str, Any] = {}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _socket_check(url: str, timeout: float = 3.0) -> Optional[str]:
@@ -271,21 +264,23 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
         roi_normalized=roi_normalized,
         config=config
     )
-    for frame, alert_event in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if alert_event:
-            _append_session_alert(session_id, alert_event)
-            if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
-                if attendance_session["active"]:
-                    attendance_session["present_ids"].add(alert_event["person_id"])
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if not ok:
-                continue
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
-            # Removed time.sleep(0.033) here so processing goes as fast as possible
+    try:
+        for frame, alert_event in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if alert_event:
+                _append_session_alert(session_id, alert_event)
+                if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
+                    if attendance_session["active"]:
+                        attendance_session["present_ids"].add(alert_event["person_id"])
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if not ok:
+                    continue
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -959,40 +954,43 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
         roi_normalized=roi_normalized,
         config=config,
     )
-    for frame, metadata in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if metadata and metadata.get("detections"):
-            for det in metadata["detections"]:
-                plate = det.get("plate")
-                if plate:
+    try:
+        for frame, metadata in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if metadata and metadata.get("detections"):
+                for det in metadata["detections"]:
+                    plate = det.get("plate")
+                    if plate:
 
-                    # Fetch latest status and vehicle_type from DB for this plate
-                    db_status       = "Unknown"
-                    db_vehicle_type = det.get("vehicle_type", "Car")
-                    image_path      = det.get("image_path")
-                    try:
-                        vehicle_row = pipeline.db.get_vehicle_stats(plate)
-                        if vehicle_row:
-                            db_status       = vehicle_row.get("status", "Unknown")
-                            db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
-                    except Exception:
-                        pass
-                    _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
+                        # Fetch latest status and vehicle_type from DB for this plate
+                        db_status       = "Unknown"
+                        db_vehicle_type = det.get("vehicle_type", "Car")
+                        image_path      = det.get("image_path")
+                        try:
+                            vehicle_row = pipeline.db.get_vehicle_stats(plate)
+                            if vehicle_row:
+                                db_status       = vehicle_row.get("status", "Unknown")
+                                db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
+                        except Exception:
+                            pass
+                        _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
 
-        if metadata and metadata.get("alerts"):
-            r = get_redis()
-            for alert in metadata["alerts"]:
-                # Use Redis Sets to avoid duplicate alerts for the same plate
-                added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
-                if added:
-                    r.rpush(_vr_alerts_key(session_id), json.dumps(alert, cls=_NumpyEncoder).encode())
+            if metadata and metadata.get("alerts"):
+                r = get_redis()
+                for alert in metadata["alerts"]:
+                    # Use Redis Sets to avoid duplicate alerts for the same plate
+                    added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
+                    if added:
+                        r.rpush(_vr_alerts_key(session_id), json.dumps(alert, cls=_NumpyEncoder).encode())
 
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if ok:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if ok:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 
 @app.get("/api/vr_detections/{session_id}")
@@ -1081,63 +1079,40 @@ async def guardian_scan(request: GuardianScanRequest):
     preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
     cv2.imwrite(preview_path, frame)
 
-    # Run both models in thread pool (non-blocking) using singletons
+    # Run model in thread pool (non-blocking) using singleton
     loop = asyncio.get_running_loop()
-    fastsam_model, yolo_model = _get_guardian_models()
-    CONF_GATE = 0.60
+    yolo_model = _get_guardian_models()
+    CONF_GATE = 0.25
 
     def _infer():
-        # 1. FastSAM: class-agnostic segments
-        sam_results  = fastsam_model(frame, conf=CONF_GATE, verbose=False)[0]
-        # 2. YOLOv8: class-aware detections for labeling
-        yolo_results = yolo_model(frame, conf=0.35, verbose=False)[0]
-        return sam_results, yolo_results
+        if request.vocabulary:
+            yolo_model.set_classes(request.vocabulary)
+        return yolo_model(frame, conf=CONF_GATE, verbose=False)[0]
 
-    sam_results, yolo_results = await loop.run_in_executor(None, _infer)
-
-    # Build YOLO label lookup: list of (bbox_xywh_abs, class_name)
-    yolo_boxes = []
-    if yolo_results.boxes is not None:
-        names = yolo_results.names or {}
-        for box in yolo_results.boxes:
-            cls_id = int(box.cls[0])
-            xywh   = box.xywh[0].cpu().numpy()
-            cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
-            yolo_boxes.append({
-                "bbox":  [int(cx - bw/2), int(cy - bh/2), int(bw), int(bh)],
-                "label": names.get(cls_id, f"cls_{cls_id}"),
-            })
-
-    def _match_label(sam_bbox_abs):
-        """Find best-matching YOLO class label for a FastSAM box."""
-        best_iou, best_label = 0.0, "Object"
-        for yb in yolo_boxes:
-            iou = _guardian_iou(sam_bbox_abs, yb["bbox"])
-            if iou > best_iou:
-                best_iou  = iou
-                best_label = yb["label"]
-        # Only use label if IoU is convincing (>=0.3)
-        return best_label if best_iou >= 0.30 else "Object"
+    yolo_results = await loop.run_in_executor(None, _infer)
 
     detections = []
-    if sam_results.boxes is not None:
-        for i, box in enumerate(sam_results.boxes):
+    if yolo_results.boxes is not None:
+        names = yolo_results.names or {}
+        for i, box in enumerate(yolo_results.boxes):
             conf = float(box.conf[0])
-            if conf < CONF_GATE:
-                continue   # strict confidence gate
+            cls_id = int(box.cls[0])
+            label = names.get(cls_id, f"cls_{cls_id}")
+            
             xywh = box.xywh[0].cpu().numpy()
             cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
             bx_abs = int(cx - bw/2)
             by_abs = int(cy - bh/2)
-            nx  = bx_abs / width
-            ny  = by_abs / height
-            nw  = bw / width
-            nh  = bh / height
-            label = _match_label([bx_abs, by_abs, int(bw), int(bh)])
+            
+            nx = bx_abs / width
+            ny = by_abs / height
+            nw = bw / width
+            nh = bh / height
+            
             detections.append({
-                "id":              f"sam-{i}-{str(uuid.uuid4())[:8]}",
+                "id":              f"yolo-{i}-{str(uuid.uuid4())[:8]}",
                 "label":           label,
-                "class_id":        None,
+                "class_id":        cls_id,
                 "confidence":      round(conf, 2),
                 "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
             })
