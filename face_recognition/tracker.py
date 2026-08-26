@@ -84,7 +84,7 @@ class FaceTracker:
         Update tracker with detections from the current frame.
 
         Args:
-            face_results: List[FaceResult] from FaceEmbedder.detect_and_embed()
+            face_results: List[FaceResult] from FaceEmbedder.get_faces()
             frame:        current BGR frame (needed for supervision Detections)
 
         Returns:

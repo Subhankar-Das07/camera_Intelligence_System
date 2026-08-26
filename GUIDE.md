@@ -1,70 +1,143 @@
 # 📖 Camera Intelligence System — Setup & Developer Guide
 
-**New teammates:** start here → [`TEAM_ONBOARDING.md`](TEAM_ONBOARDING.md) (Docker install, Hub pull, Git feature branches, merge & conflicts).
+A robust, real-time edge computer vision platform designed to run state-of-the-art AI pipelines on **RTSP IP Cameras (NVRs)**, local **USB Webcams**, and **Android smartphones**. 
 
-**Site operations (clients):** [`docs/CLIENT_ONBOARDING.md`](docs/CLIENT_ONBOARDING.md) — use the **Site Admin** tab only. Existing Zone Safety / Vehicle / Face pages are unchanged demo workspaces.
-
-A robust, real-time computer vision platform designed to run AI pipelines on both **RTSP IP Cameras (NVRs)** and **Android smartphones**. The system uses a FastAPI Python backend to perform YOLO object detection and tracking, serving a responsive Web Dashboard for management and a Flutter Mobile App for edge camera streaming.
+This system leverages a highly concurrent FastAPI Python backend to perform YOLO-based object detection, semantic segmentation, ALPR (License Plate Recognition), and biometric vector-search tracking. It serves a responsive Web Dashboard for management and interfaces with a Flutter Mobile App for remote edge-camera streaming.
 
 ---
 
-## 🏗️ System Architecture
+## 🏗️ 1. High-Level System Architecture
 
-```text
-┌─────────────────┐       ┌────────────────────────────────┐
-│  RTSP NVR /     ├──────►│      FastAPI Server (main.py)  │
-│  IP Cameras     │       │                                │
-└─────────────────┘       │   ┌────────────────────────┐   │      ┌─────────────────┐
-                          │   │      Pipeline Engine   │   ├─────►│ Web Dashboard   │
-┌─────────────────┐       │   │  (ultralytics YOLOv8)  │   │      │ (Admin UI)      │
-│  Android App    ├──────►│   └────────────────────────┘   │      └─────────────────┘
-│  (Camera/Mic)   │       │                                │
-└─────────────────┘       └────────────────────────────────┘
+The architecture is designed to be highly modular, separating the video ingestion, AI inference loop, state management, and user interface into distinct layers.
+
+```mermaid
+graph TD
+    %% Video Sources
+    subgraph Video Ingestion Layer
+        RTSP[RTSP NVR / IP Cameras]
+        USB[Local USB Webcams]
+        App[Flutter Android App via WebSocket]
+        File[Uploaded Video Files]
+    end
+
+    %% Backend Server
+    subgraph FastAPI Backend Server
+        VS[Video Source Manager]
+        Reg[Pipeline Registry]
+        
+        %% Pipelines
+        subgraph AI Pipeline Engine
+            YOLO[Ultralytics YOLOv8]
+            Byte[Supervision ByteTrack]
+            Face[InsightFace SCRFD + ArcFace]
+            FastSAM[FastSAM Segmentation]
+            OCR[EasyOCR / ALPR]
+        end
+        
+        API[RESTful API Endpoints]
+        WS[WebSocket Manager]
+    end
+
+    %% State Management
+    subgraph Database Layer
+        Redis[(Redis Database)]
+        FAISS[(FAISS In-Memory Vector Index)]
+    end
+
+    %% User Interface
+    subgraph Presentation Layer
+        Dashboard[Web Dashboard HTML/JS]
+    end
+
+    %% Connections
+    RTSP --> VS
+    USB --> VS
+    File --> VS
+    App -->|ws://| WS
+    WS --> VS
+
+    VS --> Reg
+    Reg --> AI Pipeline Engine
+    AI Pipeline Engine --> API
+    
+    Face <--> FAISS
+    AI Pipeline Engine <--> Redis
+    API <--> Redis
+
+    API -->|HTTP/MJPEG| Dashboard
 ```
 
 ---
 
-## 📁 Project Structure (For Developers)
+## 🛠️ 2. Technology Stack
 
-The codebase is highly modularized so different teams (AI, Web, Mobile) can work independently without stepping on each other's toes.
+### Backend & Core Engine
+- **Core Framework**: [FastAPI](https://fastapi.tiangolo.com/) with Uvicorn (ASGI) for highly concurrent, asynchronous HTTP and WebSocket serving.
+- **Computer Vision**: [OpenCV](https://opencv.org/) (`cv2`) for video buffer manipulation, threading, and MJPEG stream encoding.
+- **State & Caching**: **Redis** (`redis-py`) is the sole persistence layer for alerts, detections, and identities.
 
-### 1. AI & Backend Developers (`core/`, `pipelines/`, `face_recognition/`)
-- **`main.py`**: The entry point. Runs the FastAPI server, manages RTSP connections, and exposes APIs for the web dashboard (including Face Recognition endpoints).
-- **`core/`**: Contains the engine logic.
-  - `base_pipeline.py`: The abstract class all AI models must inherit from.
-  - `registry.py`: Auto-discovers and registers pipelines.
-  - `mobile_ws.py`: Handles WebSocket connections from the Flutter app.
-  - `video_source.py`: Background thread manager for lag-free RTSP streaming.
-- **`pipelines/`**:
-  - `face_recognition_pipeline.py`: Integrates the dedicated face recognition module into the pipeline architecture. Yields frames with Known/Unknown bounding boxes.
-  - *To add a new AI capability (e.g., Fire Detection):* Inherit from `BaseVideoPipeline`, implement `initialize()` and `run_on_video()`.
-- **`face_recognition/` (Ayush Module)**: 
-  - A highly accurate module using InsightFace (SCRFD + ArcFace) and FAISS for vector search.
-  - Features a unified database (`data/persons/`) where all unique faces are auto-saved on their first visit.
-  - Uses `supervision.ByteTrack` for stable identity tracking and temporal consensus for high-confidence matching.
+### AI & Machine Learning Models
+- **General Object Detection**: [Ultralytics](https://ultralytics.com/) YOLOv8 (nano/small variants for edge efficiency).
+- **Human Pose & Fall Detection**: YOLOv8-Pose for 17-keypoint human skeleton extraction.
+- **Semantic Segmentation**: FastSAM (Fast Segment Anything) for zero-shot object bounding and pixel masking.
+- **Face Recognition**: [InsightFace](https://github.com/deepinsight/insightface) (SCRFD for bounding box detection + ArcFace for 512-dim embedding extraction).
+- **Tracking**: [Supervision](https://supervision.roboflow.com/) (`ByteTrack`) combined with internal Kalman Filters to prevent ID switching during occlusion.
+- **Vector Search**: **FAISS** (`faiss-cpu`) for \( L_2 \) distance cosine similarity matching of face vectors in micro-seconds.
+- **License Plate OCR**: Built-in edge Optical Character Recognition routines (ALPR).
 
-### 2. UI / UX Web Developers (`static/`)
-Unified product shell with per-feature folders (branch-friendly):
-- **`static/shell/`** — shared top nav and design tokens
-- **`static/features/zone-safety/`** — intrusion / danger zone / fall UI
-- **`static/features/vehicle/`** — vehicle recognition UI
-- **`static/features/face/`** — face recognition UI
-- **`static/shared/`** — shared upload/RTSP helpers
-
-### 3. Android / Flutter Developers (`edge_vision_app/`)
-This folder contains the mobile application that turns an Android phone into an edge-streaming camera.
-- It connects to the server via WebSockets (`ws://<SERVER_IP>:8000/ws/capture`).
-- It streams JPEG frames and receives JSON detection data back to display on the screen.
-- **To develop:** Open `edge_vision_app/` in Android Studio or VS Code and run `flutter pub get`.
+### Frontend & Mobile
+- **Web Dashboard**: Vanilla JavaScript (ES6 Modules), HTML5, and pure CSS. Zero-build-step design for maximum stability and hot-reloading speed.
+- **Mobile Edge App**: **Flutter** (Dart). Broadcasts raw phone camera frames via WebSockets and renders returned AI JSON telemetry natively over the feed.
 
 ---
 
-## ⚙️ Getting Started (Server Setup)
+## 📁 3. Codebase Structure & Developer Workflow
+
+The repository is organized by feature domains so independent teams (AI, Security, Web, Mobile) can work concurrently.
+
+### 🧠 Core Engine (`core/`)
+The foundational backend mechanics that keep the system running.
+- `base_pipeline.py`: The abstract base class (`ABC`). **All** AI models must inherit from this and implement `initialize()` and `run_on_video()`.
+- `registry.py`: Singleton registry that auto-discovers and registers enabled AI pipelines.
+- `video_source.py`: Background thread manager designed to proactively clear OpenCV buffers, preventing lag in RTSP streams.
+- `redis_client.py`: The global connection pool and helper methods for Redis integration.
+- `mobile_ws.py`: Manages high-throughput WebSocket ingestion from the Flutter app.
+
+### 🏭 Vision Pipelines (`pipelines/`)
+The specific computer vision use-cases. Each pipeline is a distinct module.
+- **`intrusion_pipeline.py`**: Detects humans crossing forbidden boundary lines (virtual tripwires).
+- **`danger_zone_pipeline.py`**: Detects unauthorized human entry into dynamically drawn polygon areas.
+- **`fall_detection_pipeline.py`**: Uses YOLO-Pose to map human skeletons, calculating fall angles based on bounding box aspect ratios and spine orientation vectors.
+- **`room_guardian_pipeline.py`**: Tracks static objects (e.g., backpacks, laptops) using FastSAM and ByteTrack. Emits alerts if an object is moved, removed, or occluded.
+- **`face_recognition/pipeline.py`**: Interacts with the `face_recognition/` package to translate raw frames into Known/Unknown identities, driving the Attendance and Visitor tracking systems.
+- **`vehicle_recognition/`**: A specialized sub-package dedicated to ALPR (reading license plates), tracking unique vehicle visits, and identifying vehicle color and type.
+
+### 👤 Face Recognition Engine (`face_recognition/`)
+A dedicated, highly-accurate biometric sub-module.
+- `embedder.py`: Handles raw facial extraction and embedding generation.
+- `tracker.py`: Wraps ByteTrack to maintain temporal continuity of a face across frames.
+- `recognizer.py`: Manages the sliding-window temporal consensus algorithm (requiring N/M votes to prevent false positives).
+- `identity_manager.py`: Interfaces with Redis to persist JSON metadata, base64 image crops, and float32 arrays.
+
+### 🌐 Web Presentation (`static/`)
+Unified product shell with per-feature isolated folders.
+- `static/shell/`: Shared top navigation, sidebar, and CSS design tokens.
+- `static/features/zone-safety/`: UI control panels for Intrusion, Danger Zone, Fall Detection, and Room Guardian.
+- `static/features/face/`: UI for Identity Management, Attendance logs, and Registration.
+- `static/features/vehicle/`: UI for Vehicle monitoring and ALPR logs.
+
+### 📱 Mobile Presentation (`edge_vision_app/`)
+The Flutter application codebase.
+- **To develop:** Open this folder in Android Studio or VS Code, run `flutter pub get`, and deploy to a physical Android device.
+
+---
+
+## ⚙️ 4. Local Setup & Execution Guide
 
 ### Prerequisites
-- Windows 10/11 or Linux with **Python 3.10+**
-- Docker Desktop (recommended for team deploy)
-- (Optional) NVIDIA GPU for faster YOLO inference.
+- Windows 10/11 or Linux.
+- **Python 3.10+**
+- **Docker Desktop** (For Redis and Linux containerization).
 
 ### Team main repository (endevs)
 **Source of truth:** https://github.com/endevs/camera_Intelligence  
@@ -99,8 +172,7 @@ docker compose -f docker-compose.yml -f docker-compose.hub.yml up -d --no-build
 ```
 Open http://localhost:8000
 
-**Local Docker (developers):** see [`docs/DOCKER_DEV.md`](docs/DOCKER_DEV.md) for the bat-file cheat sheet.  
-Everyday code changes → `docker-quick.bat`. Deps/`Dockerfile` → `docker-rebuild.bat`. Rare full rebuild → `docker-refresh.bat`.  
+Local rebuild from source: run `docker-refresh.bat`  
 Publish new Hub tags (maintainers): run `docker-publish.bat`
 
 ### 1. Install Dependencies (local Python)
@@ -108,14 +180,64 @@ Publish new Hub tags (maintainers): run `docker-publish.bat`
 pip install -r requirements.txt
 ```
 
-### 2. Run the Server (local Python)
-```bash
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-- The server will start and automatically download the YOLO weights on the first run.
-- Open your browser to `http://localhost:8000` to view the **Admin Web Dashboard**.
+### 🚀 Running the Application
 
-### 3. Connecting the Mobile App
-1. Find your PC's IP address (e.g., `192.168.1.50`).
-2. Build and install the Flutter APK from `edge_vision_app/` onto your Android device.
-3. Open the app, enter the PC's IP address, and hit connect. The app will immediately begin streaming to the `core/mobile_ws.py` engine.
+There are **two distinct ways** to run the system depending on your hardware requirements.
+
+#### Method A: Native Windows Execution (Required for USB Webcams)
+**Use this method if you need to test with your laptop's built-in webcam or a USB camera.** Docker for Windows runs inside a Linux VM and physically cannot access Windows USB webcams.
+1. Run the native startup script:
+   ```powershell
+   .\start-windows-app.bat
+   ```
+   *Note: This script automatically spins up a native Redis instance in the background and boots the FastAPI server.*
+2. Open your browser to `http://127.0.0.1:8000`.
+
+#### Method B: Docker Compose (For Linux Deployments & RTSP)
+**Use this method if deploying to a Linux server, or if you are only testing via RTSP streams / uploaded MP4 files.**
+1. Execute the Docker refresh script:
+   ```powershell
+   .\docker-refresh.bat
+   ```
+   *Note: This rebuilds the `camera-intelligence:develop` image and starts both the App and Redis containers via Docker Compose.*
+2. Open your browser to `http://localhost:8000`.
+
+---
+
+## 📡 5. Mobile App Connectivity
+
+To use an Android phone as a wireless edge camera:
+1. Ensure your PC and the Android phone are on the **same Wi-Fi network**.
+2. Find your PC's local IPv4 address (e.g., `192.168.1.50`) by running `ipconfig` in your terminal.
+3. Build and install the Flutter APK from the `edge_vision_app/` folder onto your phone.
+4. Open the app, enter your PC's IP address (`192.168.1.50`), and tap **Connect**. 
+5. The video feed will instantly appear on the Web Dashboard under the "Mobile Stream" input source.
+
+---
+
+## 🗄️ 6. Redis Database Architecture
+
+This project uses **Redis** as the sole, centralized persistence layer for the *entire* system. Local SQLite databases and JSON flat-files have been entirely deprecated. 
+
+Data is logically separated using key prefixes to prevent collisions between modules:
+
+### 🚨 Generic System Alerts (`alerts:`)
+Generated by the Zone Safety pipelines (Intrusion, Fall Detection, Danger Zone, Room Guardian).
+- `alerts:{session_id}` → Redis List (`RPUSH` / `LRANGE`) storing chronologically ordered JSON objects containing alert metadata, timestamps, and paths to saved `.webm` video clips.
+
+### 🚗 Vehicle Recognition (`vr:`)
+Generated by the ALPR and Vehicle Tracking module.
+- `vr:det:{session_id}` → Redis List containing raw chronological vehicle detection events (License plate string, color, vehicle type).
+- `vr:plates:{session_id}` → Redis Hash map storing aggregated statistics. Keys are license plate strings, values are total visit counts and last-seen timestamps.
+
+### 👤 Face Recognition & Identity (`fr:`)
+Generated by the InsightFace biometric engine.
+- `fr:identities` → Hash map of `{person_id: json_metadata}` (Name, first seen, last seen, confidence scores).
+- `fr:emb:{person_id}` → Raw `float32` numpy bytes containing the 512-dim ArcFace mathematical embedding.
+- `fr:embmeta:{person_id}` → Metadata for numpy reconstruction (shape, dtype).
+- `fr:face:{person_id}:{n}` → Raw JPEG bytes of cropped face images, retrieved by the UI for preview avatars.
+
+### 🎓 Attendance Tracking (`attendance:`)
+Generated by the specialized Classroom/Attendance operational mode.
+- `attendance:sessions` → Hash map tracking currently active classroom sessions, mode states, and start/stop timestamps.
+- `attendance:present:{session_id}` → Redis Set (`SADD`) containing the unique `person_id`s of students who have been biometrically verified in front of the camera during a given session window.

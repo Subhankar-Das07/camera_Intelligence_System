@@ -2,7 +2,7 @@ from typing import Dict, Type
 from core.base_pipeline import BaseVideoPipeline
 from pipelines.intrusion_pipeline import IntrusionDetectionPipeline
 from pipelines.danger_zone_pipeline import DangerZonePipeline
-from pipelines.face_recognition_pipeline import FaceRecognitionPipeline
+from face_recognition.pipeline import FaceRecognitionPipeline
 from pipelines.fall_detection_pipeline import FallDetectionPipeline
 from pipelines.fall_standing_lying_pipeline import FallStandingLyingPipeline
 # Add Room Guardian pipeline to track static objects
@@ -48,3 +48,7 @@ registry.register("fall_standing_lying", FallStandingLyingPipeline)
 
 # ── Room Guardian pipeline ───────────────────────────────────────────────────
 registry.register("room_guardian", RoomGuardianPipeline)
+
+# ── New Intrusion pipeline (OpenVINO hardware-accelerated) ────────────────────
+from pipelines.new_intrusion_pipeline import NewIntrusionPipeline
+registry.register("new_intrusion", NewIntrusionPipeline)

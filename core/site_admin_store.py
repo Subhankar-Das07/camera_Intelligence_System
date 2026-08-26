@@ -7,6 +7,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from core.redis_client import get_redis, redis_str
 
 SITE_KEY = "site:profile"
@@ -22,8 +24,17 @@ KNOWN_FACES_LIST = "site:known_faces"
 KNOWN_VEHICLES_LIST = "site:known_vehicles"
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        if isinstance(obj, np.bool_): return bool(obj)
+        return super().default(obj)
+
+
 def _dumps(obj: Any) -> bytes:
-    return json.dumps(obj, separators=(",", ":")).encode()
+    return json.dumps(obj, separators=(",", ":"), cls=_NumpyEncoder).encode()
 
 
 def _loads(raw: Any) -> Optional[Dict[str, Any]]:

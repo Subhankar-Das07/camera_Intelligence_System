@@ -29,19 +29,20 @@ services:
       PASSWORD_EMAIL: ${PASSWORD_EMAIL:-}
       EMAIL_FROM: ${EMAIL_FROM:-}
     volumes:
-      # ── Persistent Runtime Storage ────────────────────────────────
+      # 📂 Persistent Runtime Storage ───────────────────────────────────────
       - app_storage:/app/storage              # All alert clips, uploads, previews
 
-      # ── Face Recognition Data (critical — DO NOT remove) ──────────
+      # 🧠 Face Recognition Data (critical — DO NOT remove) ───────────────
       - face_data:/app/face_recognition/data  # Enrolled face embeddings
 
-      # ── Hot Reload (DEVELOPMENT ONLY — remove for production) ─────
+      # ⚡ Hot Reload (DEVELOPMENT ONLY — remove for production) ─────────
       # Mounts your local code INTO the container so changes apply instantly
       # without rebuilding the image. Comment this out for production.
       - ./pipelines:/app/pipelines
       - ./core:/app/core
       - ./static:/app/static
       - ./main.py:/app/main.py
+      - ./face_recognition:/app/face_recognition
     depends_on:
       redis:
         condition: service_healthy
@@ -50,4 +51,4 @@ services:
 volumes:
   redis_data:
   app_storage:
-  face_data:          # ← NEW: persist trained face embeddings
+  face_data:          # 🛠 NEW: persist trained face embeddings

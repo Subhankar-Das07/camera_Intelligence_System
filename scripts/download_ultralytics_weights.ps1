@@ -79,7 +79,7 @@ foreach ($Name in $WeightSources.Keys) {
     }
     if (-not $Ok) {
         if ($OptionalWeights -contains $Name) {
-            Write-Host "Optional weight missing (OK): $Name — OpenCV Re-ID fallback will be used"
+            Write-Host "Optional weight missing (OK): $Name - OpenCV Re-ID fallback will be used"
             continue
         }
         Write-Host ""

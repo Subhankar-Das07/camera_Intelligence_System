@@ -54,9 +54,28 @@ document.addEventListener("DOMContentLoaded", () => {
     const regFeedback    = document.getElementById("reg-feedback");
 
     const identityList   = document.getElementById("identity-list");
+    const pendingList    = document.getElementById("pending-list");
     const refreshBtn     = document.getElementById("refresh-identities-btn");
     const filterTabs     = document.querySelectorAll(".fr-filter-tab");
     const filterKnownBtn = document.getElementById("filter-known-btn");
+    const filterPendingBtn = document.getElementById("filter-pending-btn");
+
+    const frAdminSwitchBtn = document.getElementById("fr-admin-switch-btn");
+    const frReportsSwitchBtn = document.getElementById("fr-reports-switch-btn");
+    const frAdminBackBtn   = document.getElementById("fr-admin-back-btn");
+    const frReportsBackBtn = document.getElementById("fr-reports-back-btn");
+    const frAdminEntryHeader = document.getElementById("fr-admin-entry-header");
+    const frAdminContent   = document.getElementById("fr-admin-content");
+    const frReportsContent = document.getElementById("fr-reports-content");
+    
+    const reportsList      = document.getElementById("reports-list");
+    const refreshReportsBtn= document.getElementById("refresh-reports-btn");
+    
+    const reportModal      = document.getElementById("report-modal");
+    const closeReportModal = document.getElementById("close-report-modal");
+    const reportModalTitle = document.getElementById("report-modal-title");
+    const reportModalMeta  = document.getElementById("report-modal-meta");
+    const reportModalBody  = document.getElementById("report-modal-body");
 
     const renameModal    = document.getElementById("rename-modal");
     const renameInput    = document.getElementById("rename-input");
@@ -67,7 +86,55 @@ document.addEventListener("DOMContentLoaded", () => {
     const modeSelector       = document.getElementById("mode-selector");
     const visitorControls    = document.getElementById("fr-visitor-controls");
     const attendanceControls = document.getElementById("fr-attendance-controls");
-    const rightPanelTitle    = document.getElementById("right-panel-title");
+    const visionWatchControls = document.getElementById("fr-vision-watch-controls");
+    const rightPanelTitle    = document.querySelector(".fr-identity-panel .fr-panel-title");
+    
+    // Vision Watch elements
+    const vwWatchmanName = document.getElementById("vw-watchman-name");
+    const vwClearRoiBtn = document.getElementById("vw-clear-roi-btn");
+    const frRoiCanvas = document.getElementById("fr-roi-canvas");
+    const vwCtx = frRoiCanvas.getContext("2d");
+    const buzzerAudio = new Audio("/assets/buzzer.mp3");
+
+    // Admin toggling
+    const adminSwitchBtn     = document.getElementById("fr-admin-switch-btn");
+    const adminBackBtn       = document.getElementById("fr-admin-back-btn");
+    const adminEntryHeader   = document.getElementById("fr-admin-entry-header");
+    const adminContent       = document.getElementById("fr-admin-content");
+
+    if (adminSwitchBtn && adminBackBtn && adminEntryHeader && adminContent) {
+        frAdminSwitchBtn.addEventListener("click", () => {
+            frAdminEntryHeader.classList.add("hidden");
+            frAdminContent.classList.remove("hidden");
+            frReportsContent.classList.add("hidden");
+            loadIdentities();
+        });
+        
+        frReportsSwitchBtn.addEventListener("click", () => {
+            frAdminEntryHeader.classList.add("hidden");
+            frAdminContent.classList.add("hidden");
+            frReportsContent.classList.remove("hidden");
+            loadReports();
+        });
+
+        frAdminBackBtn.addEventListener("click", () => {
+            frAdminContent.classList.add("hidden");
+            frAdminEntryHeader.classList.remove("hidden");
+        });
+        
+        frReportsBackBtn.addEventListener("click", () => {
+            frReportsContent.classList.add("hidden");
+            frAdminEntryHeader.classList.remove("hidden");
+        });
+        
+        refreshReportsBtn.addEventListener("click", () => {
+            loadReports();
+        });
+        
+        closeReportModal.addEventListener("click", () => {
+            reportModal.classList.add("hidden");
+        });
+    }
 
     const attRegName        = document.getElementById("att-reg-name");
     const attRegSnapshotBtn = document.getElementById("att-reg-snapshot-btn");
@@ -81,6 +148,112 @@ document.addEventListener("DOMContentLoaded", () => {
     let currentSessionId = null;   // analysis session
     let pollingInterval  = null;
     let knownEventIds    = new Set();
+
+    // Vision Watch ROI logic — single door zone polygon
+    let vwDoorZones     = [];  // completed door polygons
+    let currentDoorZone = [];  // in-progress door polygon
+    let doorPollInterval = null;
+
+    function alignCanvas() {
+        if (!frRoiCanvas || frRoiCanvas.classList.contains("hidden")) return;
+        const rect = streamImg.getBoundingClientRect();
+        if (rect.width === 0) return;
+        frRoiCanvas.style.left = streamImg.offsetLeft + "px";
+        frRoiCanvas.style.top  = streamImg.offsetTop  + "px";
+        frRoiCanvas.width  = rect.width;
+        frRoiCanvas.height = rect.height;
+        drawVwPolygons();
+    }
+    window.addEventListener("resize", alignCanvas);
+    streamImg.onload = alignCanvas;
+
+    frRoiCanvas.addEventListener("click", (e) => {
+        if (getMode() !== "vision_watch") return;
+        const rect = frRoiCanvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        // Close polygon if clicking near first point
+        if (currentDoorZone.length > 2) {
+            const first = currentDoorZone[0];
+            if (Math.hypot(first.x - x, first.y - y) < 15) {
+                vwDoorZones = [currentDoorZone]; // Only keep ONE door zone
+                currentDoorZone = [];
+                drawVwPolygons();
+                _updateDoorHint("drawing");
+                return;
+            }
+        }
+        currentDoorZone.push({ x, y });
+        drawVwPolygons();
+    });
+
+    vwClearRoiBtn.addEventListener("click", () => {
+        vwDoorZones     = [];
+        currentDoorZone = [];
+        drawVwPolygons();
+        _updateDoorHint("idle");
+    });
+
+    function _updateDoorHint(status, data) {
+        const hint = document.getElementById("vw-door-status-hint");
+        if (!hint) return;
+        if (status === "idle")      hint.innerHTML = "🟡 Draw a zone, then start stream. Auto-detects in ~3 seconds.";
+        else if (status === "drawing") hint.innerHTML = "✅ Door zone set! Start the stream to begin monitoring.";
+        else if (status === "learning") hint.innerHTML = "🟡 Learning background... (~3 seconds remaining)";
+        else if (status === "OPEN")  hint.innerHTML = `🔴 <b>Door: OPEN</b> &nbsp;|&nbsp; Opens: <b>${data.open_count}</b> &nbsp; Closes: <b>${data.close_count}</b> &nbsp; Last: ${data.last_event || '—'}`;
+        else if (status === "CLOSED") hint.innerHTML = `🟢 <b>Door: CLOSED</b> &nbsp;|&nbsp; Opens: <b>${data.open_count}</b> &nbsp; Closes: <b>${data.close_count}</b> &nbsp; Last: ${data.last_event || '—'}`;
+    }
+
+    function _pollDoorState() {
+        if (!currentSessionId || getMode() !== "vision_watch") return;
+        fetch(`/api/vision_watch/door_state/${currentSessionId}`)
+            .then(r => r.json())
+            .then(data => {
+                const state = data.state;
+                if (data.learning) {
+                    _updateDoorHint("learning");
+                } else {
+                    _updateDoorHint(state, data);
+                }
+            })
+            .catch(() => {});
+    }
+
+    function drawVwPolygons() {
+        if (!vwCtx) return;
+        vwCtx.clearRect(0, 0, frRoiCanvas.width, frRoiCanvas.height);
+
+        const drawPoly = (zones, current, color, fill) => {
+            vwCtx.strokeStyle = color;
+            vwCtx.lineWidth   = 2;
+            vwCtx.fillStyle   = fill;
+            zones.forEach(zone => {
+                if (zone.length < 2) return;
+                vwCtx.beginPath();
+                vwCtx.moveTo(zone[0].x, zone[0].y);
+                zone.slice(1).forEach(p => vwCtx.lineTo(p.x, p.y));
+                vwCtx.closePath();
+                vwCtx.fill();
+                vwCtx.stroke();
+            });
+            if (current.length > 0) {
+                vwCtx.beginPath();
+                vwCtx.moveTo(current[0].x, current[0].y);
+                current.slice(1).forEach(p => vwCtx.lineTo(p.x, p.y));
+                vwCtx.stroke();
+                vwCtx.fillStyle = "#fff";
+                current.forEach(p => {
+                    vwCtx.beginPath();
+                    vwCtx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                    vwCtx.fill();
+                });
+            }
+        };
+
+        // Door zone = blue
+        drawPoly(vwDoorZones, currentDoorZone, "#3b82f6", "rgba(59,130,246,0.15)");
+    }
     let identityFilter   = "all";
     let renamingPersonId = null;
     let regPhotoFile     = null;
@@ -97,18 +270,36 @@ document.addEventListener("DOMContentLoaded", () => {
         if (mode === "attendance") {
             visitorControls.classList.add("hidden");
             attendanceControls.classList.remove("hidden");
+            visionWatchControls.classList.add("hidden");
             rightPanelTitle.textContent = "🗂️ Attendance List";
             frStartBtn.textContent = "▶ Start Attendance Tracker";
             if (filterKnownBtn) filterKnownBtn.textContent = "Registered";
+            frRoiCanvas.classList.add("hidden");
+            if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
+        } else if (mode === "vision_watch") {
+            visitorControls.classList.add("hidden");
+            attendanceControls.classList.add("hidden");
+            visionWatchControls.classList.remove("hidden");
+            rightPanelTitle.textContent = "🛡️ Vision Watch";
+            frStartBtn.textContent = "▶ Start Vision Watch";
+            if (filterKnownBtn) filterKnownBtn.textContent = "Known";
+            frRoiCanvas.classList.remove("hidden");
+            alignCanvas();
         } else {
             visitorControls.classList.remove("hidden");
             attendanceControls.classList.add("hidden");
-            rightPanelTitle.textContent = "🗂️ Identity Manager";
+            visionWatchControls.classList.add("hidden");
+            rightPanelTitle.textContent = "👤 Identity Manager";
             frStartBtn.textContent = "▶ Start Recognition";
             if (filterKnownBtn) filterKnownBtn.textContent = "Known";
+            frRoiCanvas.classList.add("hidden");
+            if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
         }
         loadStats();
         loadIdentities();
+        if (!frReportsContent.classList.contains("hidden")) {
+            loadReports();
+        }
         if (currentSessionId) {
             _stopStream(); // Restart stream if mode is changed while active
         }
@@ -207,6 +398,14 @@ document.addEventListener("DOMContentLoaded", () => {
             regSnapshotBtn.disabled = false;
             attRegSnapshotBtn.disabled = false;
             updateStartBtn();
+
+            // ── Show live preview so user can draw ROI on real video ──
+            placeholder.classList.add("hidden");
+            streamImg.src = `/api/raw_stream/${data.stream_id}`;
+            streamImg.classList.remove("hidden");
+            videoWrapper.classList.add("active");
+            // Re-align the canvas once the first frame loads
+            streamImg.onload = alignCanvas;
         })
         .catch(err => {
             frConnectBtn.textContent = "Connect RTSP";
@@ -223,6 +422,14 @@ document.addEventListener("DOMContentLoaded", () => {
         regSnapshotBtn.disabled = true;
         attRegSnapshotBtn.disabled = true;
         updateStartBtn();
+        // Hide stream preview on explicit disconnect
+        streamImg.src = "";
+        streamImg.classList.add("hidden");
+        placeholder.classList.remove("hidden");
+        videoWrapper.classList.remove("active");
+        vwDoorZones = [];
+        currentDoorZone = [];
+        drawVwPolygons();
     });
 
     // ── Start Analysis ─────────────────────────────────────────────────────────
@@ -260,14 +467,28 @@ document.addEventListener("DOMContentLoaded", () => {
 
         frStartBtn.textContent = "Starting...";
 
-        // Build payload — always uses stream_id when available
+        // Process ROI coordinates
+        const mode = getMode();
+        let doorRoiList = [];
+        if (mode === "vision_watch" && frRoiCanvas.width > 0) {
+            vwDoorZones.forEach(zone => {
+                const normZone = zone.map(p => [p.x / frRoiCanvas.width, p.y / frRoiCanvas.height]);
+                doorRoiList.push(normZone);
+            });
+        }
+        
         const payload = {
             video_id:       currentVideoData.video_id,
             filename:       currentVideoData.filename,
             pipeline_name:  "face_recognition",
             roi_normalized: [[0, 0], [1, 0], [1, 1], [0, 1]],
-            config:         { mode: getMode() },
-            stream_id:      currentStreamId || null,
+            config: {
+                mode: mode,
+                watchman_name: vwWatchmanName ? vwWatchmanName.value.trim() : "",
+                multiple_rois: [],      // watchman zones reserved for future
+                door_rois: doorRoiList
+            },
+            stream_id: currentStreamId || null,
         };
 
         try {
@@ -279,6 +500,14 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!resp.ok) throw new Error("Failed to start analysis");
             const data = await resp.json();
             currentSessionId = data.session_id;
+
+            // Start door state poller for Vision Watch
+            if (mode === "vision_watch") {
+                if (doorPollInterval) clearInterval(doorPollInterval);
+                doorPollInterval = setInterval(_pollDoorState, 2000);
+                _updateDoorHint("learning");
+            }
+
             _startStream();
         } catch (e) {
             alert("Failed to start recognition: " + e.message);
@@ -311,13 +540,21 @@ document.addEventListener("DOMContentLoaded", () => {
         frStopBtn.classList.remove("hidden");
         setStatus("active", "Recognition Active");
 
+        // Start door poller if in vision_watch mode
+        if (getMode() === "vision_watch") {
+            if (doorPollInterval) clearInterval(doorPollInterval);
+            doorPollInterval = setInterval(_pollDoorState, 2000);
+        }
+
         knownEventIds.clear();
         if (eventsPlaceholder) eventsPlaceholder.style.display = "none";
         pollingInterval = setInterval(_pollEvents, 1500);
     }
 
     function _stopStream() {
-        if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+        if (pollingInterval)  { clearInterval(pollingInterval);  pollingInterval  = null; }
+        if (doorPollInterval) { clearInterval(doorPollInterval); doorPollInterval = null; }
+        _updateDoorHint("idle");
 
         if (currentSessionId) {
             if (getMode() === "attendance") {
@@ -338,10 +575,19 @@ document.addEventListener("DOMContentLoaded", () => {
             attRegSnapshotBtn.disabled = true;
         }
 
-        streamImg.src = "";
-        streamImg.classList.add("hidden");
-        placeholder.classList.remove("hidden");
-        videoWrapper.classList.remove("active");
+        // If RTSP is still connected, restore the raw preview for ROI editing
+        if (currentStreamId && !isWebcamStream) {
+            streamImg.src = `/api/raw_stream/${currentStreamId}`;
+            streamImg.classList.remove("hidden");
+            placeholder.classList.add("hidden");
+            videoWrapper.classList.add("active");
+            streamImg.onload = alignCanvas;
+        } else {
+            streamImg.src = "";
+            streamImg.classList.add("hidden");
+            placeholder.classList.remove("hidden");
+            videoWrapper.classList.remove("active");
+        }
 
         frStartBtn.classList.remove("hidden");
         frStopBtn.classList.add("hidden");
@@ -380,7 +626,54 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function _addEventCard(alert) {
-        const isKnown = alert.status === "known";
+        if (alert.type === "vision_watch_alert") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card unknown";
+            card.style.borderColor = "var(--danger)";
+            card.style.backgroundColor = "rgba(255, 68, 68, 0.1)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🚨</span>
+                <span class="fr-event-label" style="color: var(--danger); font-weight: bold;">${escHtml(alert.message || "Vision Watch Alert")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            buzzerAudio.currentTime = 0;
+            buzzerAudio.play().catch(e => console.warn("Audio play prevented:", e));
+            return;
+        }
+
+        if (alert.type === "door_open") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card";
+            card.style.borderColor = "#ef4444";
+            card.style.backgroundColor = "rgba(239,68,68,0.08)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🔴</span>
+                <span class="fr-event-label" style="color:#ef4444; font-weight:bold;">${escHtml(alert.message || "Door Opened")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            return;
+        }
+
+        if (alert.type === "door_close") {
+            const card = document.createElement("div");
+            card.className = "fr-event-card";
+            card.style.borderColor = "#22c55e";
+            card.style.backgroundColor = "rgba(34,197,94,0.08)";
+            card.innerHTML = `
+                <span class="fr-event-icon">🟢</span>
+                <span class="fr-event-label" style="color:#22c55e; font-weight:bold;">${escHtml(alert.message || "Door Closed")}</span>
+                <span class="fr-event-conf"></span>
+                <span class="fr-event-time">${alert.timestamp || ""}</span>
+            `;
+            eventsList.prepend(card);
+            return;
+        }
+
+        const isKnown = alert.status === "known" || alert.status === "recognised" || alert.confidence > 0;
         const card = document.createElement("div");
         card.className = `fr-event-card ${isKnown ? "known" : "unknown"}`;
         card.innerHTML = `
@@ -393,6 +686,136 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // ── Stats ──────────────────────────────────────────────────────────────────
+    function deleteIdentity(pid) {
+        if (!confirm(`Are you sure you want to completely delete person ${pid}?`)) return;
+        const mode = getMode();
+        fetch(`/api/faces/identity/${pid}?mode=${mode}`, { method: "DELETE" })
+            .then(r => r.json())
+            .then(() => {
+                loadStats();
+                loadIdentities();
+            });
+    }
+
+    // ── Reports Manager ────────────────────────────────────────────────────────
+    
+    function loadReports() {
+        const mode = getMode();
+        reportsList.innerHTML = `<div class="fr-identity-loading">Loading reports...</div>`;
+        fetch(`/api/reports?mode=${mode}`)
+            .then(r => r.json())
+            .then(data => {
+                const list = data.reports || [];
+                if (list.length === 0) {
+                    reportsList.innerHTML = `<div class="fr-identity-empty">No reports found.</div>`;
+                    return;
+                }
+                
+                reportsList.innerHTML = "";
+                list.forEach(report => {
+                    const card = document.createElement("div");
+                    card.className = "report-card";
+                    
+                    const startStr = new Date(report.start_time * 1000).toLocaleString();
+                    const durationStr = Math.round(report.duration) + "s";
+                    
+                    let statsHtml = "";
+                    if (mode === "attendance") {
+                        statsHtml = `Present: <b>${report.present_count}</b> | Absent: <b>${report.absent_count}</b>`;
+                    } else if (mode === "vision_watch") {
+                        statsHtml = `🔴 Opens: <b>${report.door_open_count ?? 0}</b> &nbsp;|&nbsp; 🟢 Closes: <b>${report.door_close_count ?? 0}</b>`;
+                    } else {
+                        statsHtml = `Known: <b>${report.known_count}</b> | Unknown: <b>${report.unknown_count}</b>`;
+                    }
+
+                    const displayId = String(report.session_id || "").replace(/[^0-9]/g, "").slice(-3) || report.session_id;
+                    card.innerHTML = `
+                        <div class="report-title">
+                            ${mode === "vision_watch" ? "🚪" : mode === "attendance" ? "📚" : "👤"}
+                            Session #${displayId}
+                        </div>
+                        <div class="report-meta">${startStr} &nbsp;·&nbsp; ${durationStr}</div>
+                        <div class="report-meta" style="margin-top: 4px; color: #cbd5e1;">${statsHtml}</div>
+                    `;
+
+                    card.addEventListener("click", () => showReportDetails(report.session_id, mode));
+                    reportsList.appendChild(card);
+                });
+            })
+            .catch(() => {
+                reportsList.innerHTML = `<div class="fr-identity-empty">Error loading reports.</div>`;
+            });
+    }
+    
+    function showReportDetails(sessionId, mode) {
+        reportModalBody.innerHTML = `<div class="fr-identity-loading">Fetching details...</div>`;
+        reportModalMeta.textContent = `Session: ${sessionId}`;
+        reportModalTitle.textContent = mode === "attendance" ? "📚 Attendance Report"
+            : mode === "vision_watch" ? "🚪 Vision Watch Report"
+            : "👤 Visitor Report";
+        reportModal.classList.remove("hidden");
+        
+        fetch(`/api/reports/${sessionId}?mode=${mode}`)
+            .then(r => r.json())
+            .then(report => {
+                let html = "";
+                
+                if (mode === "attendance") {
+                    html += `
+                        <div class="report-section">
+                            <div class="report-section-title">Present (${report.present.length})</div>
+                            ${report.present.map(p => `<div class="report-item"><span>${escHtml(p.label)}</span><span style="color:#4ade80;">✓ Present</span></div>`).join("")}
+                            ${report.present.length === 0 ? '<div class="report-meta">No one was present.</div>' : ''}
+                        </div>
+                        <div class="report-section">
+                            <div class="report-section-title">Absent (${report.absent.length})</div>
+                            ${report.absent.map(p => `<div class="report-item"><span>${escHtml(p.label)}</span><span style="color:#f87171;">✗ Absent</span></div>`).join("")}
+                            ${report.absent.length === 0 ? '<div class="report-meta">Everyone was present.</div>' : ''}
+                        </div>
+                    `;
+                } else if (mode === "vision_watch") {
+                    html += `
+                        <div class="report-section" style="margin-bottom:12px;">
+                            <div class="report-section-title" style="font-size:1rem;">🚪 Door Activity Summary</div>
+                            <div class="report-item" style="background:rgba(239,68,68,0.1); border-radius:6px; padding:10px 14px; margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+                                <span>🔴 Total Opens</span>
+                                <span style="font-weight:bold; font-size:1.4rem; color:#ef4444;">${report.door_open_count ?? 0}</span>
+                            </div>
+                            <div class="report-item" style="background:rgba(34,197,94,0.1); border-radius:6px; padding:10px 14px; margin-top:6px; display:flex; justify-content:space-between; align-items:center;">
+                                <span>🟢 Total Closes</span>
+                                <span style="font-weight:bold; font-size:1.4rem; color:#22c55e;">${report.door_close_count ?? 0}</span>
+                            </div>
+                        </div>
+                    `;
+                } else {
+
+                    html += `
+                        <div class="report-section">
+                            <div class="report-section-title">Known Visitors (${report.known_visitors.length})</div>
+                            ${report.known_visitors.map(p => {
+                                const seen = new Date(p.first_seen * 1000).toLocaleTimeString();
+                                return `<div class="report-item"><span>${escHtml(p.label)}</span><span>Seen at ${seen} (${p.count}x)</span></div>`;
+                            }).join("")}
+                            ${report.known_visitors.length === 0 ? '<div class="report-meta">No known visitors seen.</div>' : ''}
+                        </div>
+                        <div class="report-section">
+                            <div class="report-section-title">Unknown Visitors (${report.unknown_visitors.length})</div>
+                            ${report.unknown_visitors.map(p => {
+                                const seen = new Date(p.first_seen * 1000).toLocaleTimeString();
+                                return `<div class="report-item"><span>Track ID ${p.id}</span><span>Seen at ${seen} (${p.count}x)</span></div>`;
+                            }).join("")}
+                            ${report.unknown_visitors.length === 0 ? '<div class="report-meta">No unknown visitors seen.</div>' : ''}
+                        </div>
+                    `;
+                }
+                
+                reportModalBody.innerHTML = html;
+            })
+            .catch(() => {
+                reportModalBody.innerHTML = `<div class="fr-identity-empty">Failed to load details.</div>`;
+            });
+    }
+
     function loadStats() {
         const mode = getMode();
         fetch(`/api/faces/status?mode=${mode}`)
@@ -419,10 +842,79 @@ document.addEventListener("DOMContentLoaded", () => {
             .then(([idData, attData]) => {
                 identitiesCache = idData.identities || [];
                 if (attData) attendanceStatus = attData;
-                renderIdentities();
+                if (identityFilter !== "pending") renderIdentities();
             })
             .catch(() => {
                 identityList.innerHTML = `<div class="fr-identity-empty">Error loading identities.</div>`;
+            });
+    }
+
+    function loadPending() {
+        const mode = getMode();
+        pendingList.innerHTML = `<div class="fr-identity-loading">Loading pending requests...</div>`;
+        fetch(`/api/faces/pending?mode=${mode}`)
+            .then(r => r.json())
+            .then(data => {
+                const list = data.pending || [];
+                if (list.length === 0) {
+                    pendingList.innerHTML = `<div class="fr-identity-empty">No pending approval requests.</div>`;
+                    return;
+                }
+                
+                pendingList.innerHTML = "";
+                list.forEach(pending => {
+                    const card = document.createElement("div");
+                    card.className = "fr-identity-card pending-card";
+                    
+                    const thumbHtml = pending.thumbnail_url
+                        ? `<img src="${pending.thumbnail_url}" alt="face" class="fr-identity-thumb unknown">`
+                        : `<div class="fr-identity-thumb-placeholder">?</div>`;
+                        
+                    const created = new Date(pending.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+                    
+                    card.innerHTML = `
+                        ${thumbHtml}
+                        <div class="fr-identity-info" style="gap: 4px;">
+                            <div class="fr-identity-meta" style="margin-bottom: 4px;">Req: ${pending.req_id} • ${created}</div>
+                            <input type="text" class="fr-input fr-pending-name" placeholder="Enter Name/Roll No..." style="padding: 4px; font-size: 0.85rem;">
+                        </div>
+                        <button class="fr-btn fr-btn-icon approve-btn" title="Approve" style="color: #4ade80;" data-req="${pending.req_id}">✓</button>
+                        <button class="fr-btn fr-btn-icon reject-btn" title="Reject" style="color: #f87171;" data-req="${pending.req_id}">✗</button>
+                    `;
+                    
+                    const inputField = card.querySelector(".fr-pending-name");
+                    const approveBtn = card.querySelector(".approve-btn");
+                    const rejectBtn = card.querySelector(".reject-btn");
+                    
+                    approveBtn.addEventListener("click", () => {
+                        const label = inputField.value.trim() || `Unknown_${pending.req_id.slice(-4)}`;
+                        approveBtn.disabled = true;
+                        rejectBtn.disabled = true;
+                        fetch(`/api/faces/pending/${pending.req_id}/approve?mode=${mode}`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ label })
+                        }).then(r => r.json()).then(() => {
+                            loadPending();
+                            loadIdentities();
+                        });
+                    });
+                    
+                    rejectBtn.addEventListener("click", () => {
+                        approveBtn.disabled = true;
+                        rejectBtn.disabled = true;
+                        fetch(`/api/faces/pending/${pending.req_id}/reject?mode=${mode}`, {
+                            method: "POST"
+                        }).then(r => r.json()).then(() => {
+                            loadPending();
+                        });
+                    });
+                    
+                    pendingList.appendChild(card);
+                });
+            })
+            .catch(() => {
+                pendingList.innerHTML = `<div class="fr-identity-empty">Error loading pending requests.</div>`;
             });
     }
 
@@ -480,7 +972,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 ${thumbHtml}
                 <div class="fr-identity-info">
                     <div class="fr-identity-name" title="${escHtml(identity.label)}">${escHtml(identity.label)}</div>
-                    <div class="fr-identity-meta">${typeBadgeHtml} · ${identity.face_count ?? 1} frames · ${created}</div>
+                    <div class="fr-identity-meta">${typeBadgeHtml} · ${identity.occurrences ?? 0} sessions · ${created}</div>
                 </div>
                 <button class="fr-identity-rename-btn" title="Rename"
                     data-pid="${identity.person_id}"
@@ -494,11 +986,7 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             card.querySelector(".fr-identity-delete-btn").addEventListener("click", () => {
-                if (!confirm(`Delete ${identity.label}? This cannot be undone.`)) return;
-                fetch(`/api/faces/identity/${identity.person_id}?mode=${getMode()}`, { method: "DELETE" })
-                    .then(r => r.json())
-                    .then(() => { loadStats(); loadIdentities(); })
-                    .catch(err => alert("Delete failed: " + err.message));
+                deleteIdentity(identity.person_id);
             });
 
             identityList.appendChild(card);
@@ -515,8 +1003,25 @@ document.addEventListener("DOMContentLoaded", () => {
             filterTabs.forEach(t => t.classList.remove("active"));
             tab.classList.add("active");
             identityFilter = tab.dataset.filter;
-            renderIdentities();
+            if (identityFilter === "pending") {
+                identityList.classList.add("hidden");
+                pendingList.classList.remove("hidden");
+                loadPending();
+            } else {
+                identityList.classList.remove("hidden");
+                pendingList.classList.add("hidden");
+                renderIdentities();
+            }
         });
+    });
+
+    refreshBtn.addEventListener("click", () => {
+        if (identityFilter === "pending") {
+            loadPending();
+        } else {
+            loadStats();
+            loadIdentities();
+        }
     });
 
     // ── Rename Modal ───────────────────────────────────────────────────────────

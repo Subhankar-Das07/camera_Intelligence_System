@@ -1,0 +1,1363 @@
+# Room Guardian Feature Migration Guide
+
+> [!NOTE]
+> This document contains all the necessary code, file by file, to manually migrate the Room Guardian pipeline from the `preReleasedV1` branch into your `main` branch safely and without Git merge conflicts. You can provide this artifact document to your AI agents on the `main` branch to integrate it piece-by-piece.
+
+## 1. FastSAM Dependency
+Ensure the environment has `ultralytics` installed.
+```bash
+pip install ultralytics
+```
+
+## 2. The Core Pipeline
+Create a new file `pipelines/room_guardian_pipeline.py` and paste the following:
+
+```python
+"""
+Room Guardian Pipeline
+======================
+Tracks a static camera's view and alerts when user-selected objects
+disappear or go missing for more than 5 seconds.
+
+Workflow
+--------
+Phase 1 (frontend): User scans the room via /api/guardian/scan → selects
+  YOLO-detected objects (click) or draws custom ROI rectangles (drag).
+
+Phase 2 (this file): /api/guardian/start passes the enrolled watched_objects
+  list into config. run_on_video() tracks only those objects and yields
+  (annotated_frame, alert_event_or_None) matching the BaseVideoPipeline contract.
+
+Tracking strategy
+-----------------
+- YOLO-enrolled objects : IoU-matching against the correct class detections each frame.
+- Custom-ROI objects    : OpenCV CSRT tracker (appearance-based, CPU-only, ~1ms/tracker/frame).
+
+Alert logic
+-----------
+- A 2-second rolling ring buffer of raw frames is maintained at all times.
+- If an object is not found for >= fps * 5 consecutive frames (5 seconds):
+    → ring buffer is flushed to a .webm clip (the last 2 s before disappearance).
+    → alert_event is yielded to the MJPEG pipeline and collected by the session.
+- If the object re-appears BEFORE the 5-second threshold: missing_frames resets silently.
+- After an alert fires: alert_fired flag prevents duplicate alerts for the same
+  continuous absence. If the object later re-appears, the flag clears so a future
+  disappearance can trigger a new alert.
+"""
+
+import cv2
+import numpy as np
+import uuid
+import os
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
+from collections import deque
+
+from ultralytics import FastSAM
+
+from core.base_pipeline import BaseVideoPipeline
+from core.video_source import get_video_source
+
+log = logging.getLogger(__name__)
+
+# ── Colours for annotation ────────────────────────────────────────────────────
+COLOR_PRESENT   = (0, 255, 100)    # green  — object currently visible
+COLOR_MISSING   = (0, 165, 255)    # orange — counting down
+COLOR_ALERT     = (0, 0, 255)      # red    — alert fired, still absent
+COLOR_LABEL_BG  = (20, 20, 20)
+
+
+# ── WatchedObject ─────────────────────────────────────────────────────────────
+
+@dataclass
+class WatchedObject:
+    """All state needed to track one user-selected object."""
+    id: str                             # "yolo-<uuid>" | "Unknown-1", ...
+    obj_type: str                       # "yolo" | "custom"
+    label: str                          # class name or "Unknown-N"
+    yolo_class_id: Optional[int]        # None for custom objects
+    last_bbox: List[int]                # [x, y, w, h] pixels (absolute)
+    template_bank: deque = field(default_factory=lambda: deque(maxlen=5), repr=False)
+    frames_since_bank_update: int = 0
+    missing_frames: int = 0
+    alert_fired: bool = False
+    track_id: Optional[int] = None      # YOLO BoT-SORT track ID
+    center_history: deque = field(default_factory=lambda: deque(maxlen=30), repr=False)
+
+
+def _iou(boxA: List[int], boxB: List[int]) -> float:
+    """Compute IoU between two [x, y, w, h] boxes (absolute pixels)."""
+    ax1, ay1 = boxA[0], boxA[1]
+    ax2, ay2 = ax1 + boxA[2], ay1 + boxA[3]
+    bx1, by1 = boxB[0], boxB[1]
+    bx2, by2 = bx1 + boxB[2], by1 + boxB[3]
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    union = boxA[2] * boxA[3] + boxB[2] * boxB[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _draw_label(frame: np.ndarray, text: str, x: int, y: int, color: tuple) -> None:
+    """Draw a filled background label above a bounding box."""
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    scale     = 0.55
+    thickness = 1
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    pad = 4
+    rx1, ry1 = x, y - th - pad * 2
+    rx2, ry2 = x + tw + pad * 2, y
+    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), COLOR_LABEL_BG, -1)
+    cv2.putText(frame, text, (x + pad, y - pad), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _write_clip(frames: deque, output_path: str, fps: float, size: tuple) -> bool:
+    """Write a deque of frames to a .webm file. Returns True on success."""
+    if not frames:
+        return False
+    fourcc = cv2.VideoWriter_fourcc(*"vp80")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, size)
+    if not writer.isOpened():
+        log.error("[Guardian] Could not open VideoWriter for %s", output_path)
+        return False
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    return True
+
+
+def _color_hist_match(frame, box, template_bank, threshold=0.45):
+    """Compare HSV histogram of a bounding box patch against the template bank."""
+    bx, by, bw, bh = box
+    fh, fw = frame.shape[:2]
+    
+    # Safe extract patch
+    bx = max(0, min(bx, fw - 1))
+    by = max(0, min(by, fh - 1))
+    bw = max(1, min(bw, fw - bx))
+    bh = max(1, min(bh, fh - by))
+    patch = frame[by:by+bh, bx:bx+bw]
+    if patch.size == 0:
+        return False
+        
+    try:
+        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        hist_patch = cv2.calcHist([hsv_patch], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        cv2.normalize(hist_patch, hist_patch, 0, 1, cv2.NORM_MINMAX)
+        
+        for template in reversed(template_bank):
+            hsv_tmpl = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+            hist_tmpl = cv2.calcHist([hsv_tmpl], [0, 1], None, [50, 60], [0, 180, 0, 256])
+            cv2.normalize(hist_tmpl, hist_tmpl, 0, 1, cv2.NORM_MINMAX)
+            
+            dist = cv2.compareHist(hist_tmpl, hist_patch, cv2.HISTCMP_BHATTACHARYYA)
+            if dist < threshold:
+                return True
+    except Exception as e:
+        log.debug(f"[Guardian] Hist match err: {e}")
+            
+    return False
+
+
+# Environment Profiles configuration
+ENV_PROFILES = {
+    "home": {
+        "absence_seconds": 5,
+        "conf_threshold": 0.25,
+        "yolo_tracker": "botsort.yaml",
+        "custom_tracker": "csrt"
+    },
+    "shop": {
+        "absence_seconds": 3,
+        "conf_threshold": 0.20,
+        "yolo_tracker": "botsort.yaml",
+        "custom_tracker": "csrt"
+    },
+    "factory": {
+        "absence_seconds": 8,
+        "conf_threshold": 0.25,
+        "yolo_tracker": "botsort.yaml",
+        "custom_tracker": "csrt"
+    }
+}
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+class RoomGuardianPipeline(BaseVideoPipeline):
+    """
+    Room Object Guardian pipeline.
+    Inherits BaseVideoPipeline; tracked via the standard registry + session system.
+    """
+
+    def initialize(self, model_weight: str = "FastSAM-s.pt", **kwargs) -> None:
+        """Load the FastSAM detection model."""
+        self.model = FastSAM(model_weight)
+        self.model_name = model_weight
+        log.info("[Guardian] Initialized with model: %s", model_weight)
+
+    # process_frame is not used — all logic is in run_on_video
+    def process_frame(self, frame, frame_idx, roi_polygon, config):
+        return frame, {}
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def run_on_video(self, input_path, output_dir, roi_normalized, config):
+        """
+        Generator: yields (annotated_frame, alert_event_or_None).
+
+        config["watched_objects"] must be a list of dicts:
+        [
+          {
+            "id":           str,          # "yolo-<uuid>" | "Unknown-N"
+            "type":         "yolo"|"custom",
+            "label":        str,
+            "class_id":     int|null,     # for yolo type only
+            "bbox_normalized": [x, y, w, h]  # 0-1 range, relative to frame
+          },
+          ...
+        ]
+        """
+        cap = get_video_source(input_path)
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        # Parse environment profile
+        env_profile_name = config.get("environment_profile", "home")
+        profile = ENV_PROFILES.get(env_profile_name, ENV_PROFILES["home"])
+        absence_threshold = 20  # Hardcoded to 20 frames per user request
+        ring_buf_size     = max(1, int(fps * 2))  # 2 second ring buffer
+        yolo_tracker_cfg  = config.get("tracker", profile["yolo_tracker"])
+        custom_tracker_cfg= config.get("custom_tracker", profile["custom_tracker"])
+        conf_threshold    = profile["conf_threshold"]
+
+        # FastSAM is class-agnostic, always use FastSAM-s.pt
+        req_model_weight = config.get("model_weight", "FastSAM-s.pt")
+        if not hasattr(self, "model_name") or self.model_name != req_model_weight:
+            self.model = FastSAM(req_model_weight)
+            self.model_name = req_model_weight
+            log.info("[Guardian] Loaded model specific to session: %s", req_model_weight)
+
+        # Parse enrolled objects from config
+        raw_objects: List[Dict] = config.get("watched_objects", [])
+        if not raw_objects:
+            log.warning("[Guardian] No watched_objects in config — nothing to guard.")
+
+        # Denormalise bboxes to pixel space
+        watched: List[WatchedObject] = []
+        for obj in raw_objects:
+            bn = obj.get("bbox_normalized", [0, 0, 0.1, 0.1])
+            px = [
+                int(bn[0] * width),
+                int(bn[1] * height),
+                int(bn[2] * width),
+                int(bn[3] * height),
+            ]
+            wo = WatchedObject(
+                id            = obj.get("id", str(uuid.uuid4())),
+                obj_type      = obj.get("type", "custom"),
+                label         = obj.get("label", "Unknown"),
+                yolo_class_id = obj.get("class_id", None),
+                last_bbox     = px,
+            )
+            watched.append(wo)
+
+        # Rolling ring buffer of raw (un-annotated) frames
+        ring_buffer: deque = deque(maxlen=ring_buf_size)
+
+        frame_idx = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            raw_frame = frame.copy()   # un-annotated copy for ring buffer
+
+            # Extract initial templates on Frame 0
+            if frame_idx == 0:
+                for wo in watched:
+                    x, y, w, h = wo.last_bbox
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    w = max(1, min(w, width - x))
+                    h = max(1, min(h, height - y))
+                    wo.last_bbox = [x, y, w, h]
+                    patch = frame[y:y + h, x:x + w]
+                    if patch.size > 0:
+                        wo.template_bank.append(patch.copy())
+
+            # ── FastSAM inference (tracked) ──────────────────────────────────────
+            # FastSAM tracks all distinct objects it segments
+            yolo_results = self.model.track(frame, persist=True, tracker=yolo_tracker_cfg, conf=conf_threshold, verbose=False)[0]
+
+            # Collect all tracked bounding boxes
+            tracked_boxes = []
+            if yolo_results.boxes is not None:
+                for box in yolo_results.boxes:
+                    if box.id is None:
+                        continue
+                    xywh    = box.xywh[0].cpu().numpy()
+                    cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
+                    bx = int(cx - bw / 2)
+                    by = int(cy - bh / 2)
+                    track_id = int(box.id[0])
+                    det_box = [bx, by, int(bw), int(bh)]
+                    tracked_boxes.append({
+                        "bbox": det_box,
+                        "track_id": track_id
+                    })
+
+            # Track which IDs have been assigned to watched objects in this frame
+            claimed_track_ids = set()
+
+            # ── 1. Update watched objects by their existing track_id ────────
+            for wo in watched:
+                wo._found_this_frame = False
+                if wo.track_id is not None:
+                    for det in tracked_boxes:
+                        if det["track_id"] == wo.track_id:
+                            wo.last_bbox = det["bbox"]
+                            wo._found_this_frame = True
+                            claimed_track_ids.add(wo.track_id)
+                            break
+
+            # ── 2. Spatial Re-association & Frame 0 Enrollment ──────────────
+            for wo in watched:
+                if wo._found_this_frame:
+                    continue
+                
+                # If the object lost its track ID (occlusion) OR it's Frame 0 (needs initial assignment),
+                # we do a spatial association: find the unassigned box with the highest IoU to last_bbox.
+                best_iou = 0.0
+                best_match = None
+                
+                for det in tracked_boxes:
+                    # Allow multiple watched objects to claim the same track_id if they merge
+                    iou = _iou(wo.last_bbox, det["bbox"])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match = det
+                
+                # For initial assignment (Frame 0), threshold is permissive (0.10).
+                # For occlusion recovery (Frame N), threshold is strict (0.65) to avoid swapping IDs with walking people.
+                req_iou = 0.10 if wo.track_id is None else 0.65
+                
+                if best_iou >= req_iou and best_match is not None:
+                    wo.track_id = best_match["track_id"]
+                    wo.last_bbox = best_match["bbox"]
+                    wo._found_this_frame = True
+                    claimed_track_ids.add(wo.track_id)
+                    log.debug(f"[Guardian] Re-associated {wo.id} to track_id {wo.track_id} (IoU {best_iou:.2f})")
+
+                # 2. Appearance Re-association (for moving objects)
+                if not wo._found_this_frame and len(wo.template_bank) > 0:
+                    best_match_tmpl = None
+                    for det in tracked_boxes:
+                        # We specifically do NOT check claimed_track_ids here.
+                        # If two objects are moved together (e.g. on a tray), FastSAM might merge them 
+                        # into a single track_id. Both WatchedObjects should be allowed to attach to it!
+                        
+                        # Compare color histograms to see if this FastSAM box is our object
+                        if _color_hist_match(frame, det["bbox"], wo.template_bank):
+                            best_match_tmpl = det
+                            break
+                            
+                    if best_match_tmpl is not None:
+                        wo.track_id = best_match_tmpl["track_id"]
+                        wo.last_bbox = best_match_tmpl["bbox"]
+                        wo._found_this_frame = True
+                        claimed_track_ids.add(wo.track_id)
+                        log.debug(f"[Guardian] Appearance re-associated {wo.id} to track_id {wo.track_id}")
+
+            # ── Countdown logic ───────────────────────────────────────────
+            alert_event = None
+
+            for wo in watched:
+                found = wo._found_this_frame
+                
+                if found:
+                    x, y, w, h = wo.last_bbox
+                    wo.center_history.append((x + w/2, y + h/2))
+                    
+                    wo.frames_since_bank_update += 1
+                    if wo.frames_since_bank_update >= int(fps * 1.5):  # refresh ~every 1.5s
+                        patch = frame[y:y+h, x:x+w]
+                        if patch.size > 0:
+                            wo.template_bank.append(patch.copy())
+                        wo.frames_since_bank_update = 0
+                    
+                    was_missing = wo.missing_frames > 0
+                    wo.missing_frames = 0
+                    # If object re-appears after a previous alert, allow re-alert
+                    if wo.alert_fired and was_missing:
+                        wo.alert_fired = False
+                        log.info("[Guardian] %s re-appeared — alert cleared.", wo.id)
+                else:
+                    wo.missing_frames += 1
+
+                # ── Alert firing ──────────────────────────────────────────────
+                if wo.missing_frames >= absence_threshold and not wo.alert_fired:
+                    wo.alert_fired = True
+                    alert_id  = str(uuid.uuid4())
+                    clip_name = f"guardian_{alert_id}.webm"
+                    clip_path = os.path.join(output_dir, clip_name)
+                    clip_url  = f"/storage/guardian_alerts/{clip_name}"
+
+                    # Dump ring buffer (last 2 seconds before disappearance)
+                    success = _write_clip(ring_buffer, clip_path, fps, (width, height))
+                    if success:
+                        ts_sec = frame_idx / fps
+                        
+                        exit_type = "occluded_or_removed"
+                        if len(wo.center_history) > 0:
+                            last_cx, last_cy = wo.center_history[-1]
+                            margin_x = width * 0.05
+                            margin_y = height * 0.05
+                            if last_cx <= margin_x or last_cx >= width - margin_x or \
+                               last_cy <= margin_y or last_cy >= height - margin_y:
+                                exit_type = "left_frame"
+
+                        alert_event = {
+                            "id":                    alert_id,
+                            "object_id":             wo.id,
+                            "object_label":          wo.label,
+                            "timestamp_sec":         ts_sec,
+                            "formatted_time":        f"{int(ts_sec // 60):02d}:{int(ts_sec % 60):02d}",
+                            "clip_url":              clip_url,
+                            "severity":              "MISSING",
+                            "immediate_buzzer_trigger": True,
+                            "exit_type":             exit_type
+                        }
+                        log.info("[Guardian] ALERT — %s (%s) missing > 5s. Clip: %s",
+                                 wo.label, wo.id, clip_path)
+
+                # ── Draw tracking box on frame ────────────────────────────────
+                x, y, w, h = wo.last_bbox
+                x2, y2     = x + w, y + h
+
+                if wo.alert_fired:
+                    color       = COLOR_ALERT
+                    status_text = f"{wo.label} [MISSING!]"
+                elif wo.missing_frames > 0:
+                    pct         = min(100, int(wo.missing_frames / absence_threshold * 100))
+                    color       = COLOR_MISSING
+                    status_text = f"{wo.label} [Lost {pct}%]"
+                else:
+                    color       = COLOR_PRESENT
+                    status_text = f"{wo.label} [OK]"
+
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
+                _draw_label(frame, status_text, x, y, color)
+
+            # ── Guardian HUD ─────────────────────────────────────────────────
+            guarded_count  = len(watched)
+                
+            missing_count  = sum(1 for wo in watched if wo.missing_frames > 0)
+            alerted_count  = sum(1 for wo in watched if wo.alert_fired)
+            hud_color      = (0, 0, 255) if alerted_count > 0 else (0, 255, 100)
+            cv2.putText(frame,
+                        f"GUARDIAN | Watching: {guarded_count} | Missing: {missing_count} | Alerts: {alerted_count}",
+                        (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2, cv2.LINE_AA)
+
+            # Update ring buffer with the un-annotated raw frame
+            ring_buffer.append(raw_frame)
+
+            yield frame, alert_event
+            frame_idx += 1
+
+        cap.release()
+        log.info("[Guardian] Stream ended after %d frames.", frame_idx)
+
+```
+
+## 3. Register the Pipeline
+In `core/registry.py`, add the import and register it in the `_available_pipelines` dictionary:
+
+```python
+# Add this import
+from pipelines.room_guardian_pipeline import RoomGuardianPipeline
+
+# Add to dictionary:
+_available_pipelines = {
+    "base": BaseVideoPipeline,
+    "fall_detection": FallDetectionPipeline,
+    "room_guardian": RoomGuardianPipeline,
+}
+```
+
+## 4. API Endpoints
+In `main.py`, you need to:
+1. Update `_mjpeg_generator_analysis` to accept `output_dir` (so guardian clips save to a separate folder).
+2. Add the `/api/guardian/scan` and `/api/guardian/start` endpoints.
+
+## 5. Frontend Scripts
+Create a new file `static/guardian.js` and paste the following:
+
+```javascript
+/**
+ * guardian.js — Room Object Guardian frontend module
+ * ====================================================
+ * Fully self-contained. Owns all DOM elements under id="guardian-*".
+ * Never modifies or imports from app.js.
+ *
+ * Activation: Becomes active when the user selects "room_guardian"
+ * from the existing #pipeline-select dropdown.
+ *
+ * Two-phase workflow:
+ *   Phase 1 — Scan & Select:
+ *     - "Scan Room" button calls POST /api/guardian/scan
+ *     - YOLO boxes drawn on canvas (orange). Click to select (green).
+ *     - "Draw Custom Object" toggle: clean canvas, rect-draw mode.
+ *       Each rectangle auto-labeled Unknown-1, Unknown-2, etc.
+ *     - Toggle back to YOLO mode: both YOLO boxes and custom rects visible.
+ *     - Selection list panel shows all enrolled objects.
+ *   Phase 2 — Guardian mode:
+ *     - "Start Guarding" calls POST /api/guardian/start
+ *     - Live annotated stream loaded via /api/stream/{session_id}
+ *     - Alerts polled from /api/alerts/{session_id}
+ *     - Stop button returns to Phase 1.
+ */
+
+(function () {
+    "use strict";
+
+    // ── Wait for DOM ──────────────────────────────────────────────────────────
+    document.addEventListener("DOMContentLoaded", initGuardian);
+
+    function initGuardian() {
+
+        // ── DOM refs (guardian-namespaced elements) ───────────────────────────
+        const guardianPanel     = document.getElementById("guardian-controls");
+        const scanBtn           = document.getElementById("guardian-scan-btn");
+        const modeToggleBtn     = document.getElementById("guardian-mode-toggle");
+        const clearCustomBtn    = document.getElementById("guardian-clear-custom-btn");
+        const startGuardBtn     = document.getElementById("guardian-start-btn");
+        const stopGuardBtn      = document.getElementById("guardian-stop-btn");
+        const selectionList     = document.getElementById("guardian-selection-list");
+        const guardianStatus    = document.getElementById("guardian-status");
+
+        // Shared canvas & image already in the DOM (owned by app.js visually, but we draw on top)
+        const mainVideoImg  = document.getElementById("main-video-img");
+        const roiCanvas     = document.getElementById("roi-canvas");
+        const ctx           = roiCanvas.getContext("2d");
+
+        // Pipeline select (owned by app.js, we only listen)
+        const pipelineSelect = document.getElementById("pipeline-select");
+
+        // ── Guardian-local state ──────────────────────────────────────────────
+        const state = {
+            active:          false,          // true when guardian mode is showing
+            phase:           "idle",         // "idle" | "scan" | "guarding"
+            drawMode:        "yolo",         // "yolo" | "custom"
+
+            // Scan data from /api/guardian/scan
+            scanPreviewUrl:  null,
+            scanDetections:  [],             // [{id, label, class_id, confidence, bbox_normalized}]
+            imageWidth:      0,
+            imageHeight:     0,
+
+            // Enrollment
+            selectedYoloIds: new Set(),      // ids of clicked YOLO boxes
+            customRects:     [],             // [{id, label, bbox_normalized}]
+            customCounter:   0,
+
+            // Custom rect drawing
+            isDrawing:       false,
+            drawStart:       null,           // {x, y} in canvas pixel space
+            drawCurrent:     null,
+
+            // Guardian session
+            sessionId:       null,
+            pollingInterval: null,
+            knownAlerts:     new Set(),
+
+            // Stream / video source (read from window — set by app.js when user uploads/connects)
+            // We access these via getter functions to avoid coupling
+        };
+
+        // ── Helper: read current source from app.js window state ─────────────
+        // app.js sets currentVideoData and currentStreamId on window implicitly
+        // via its own closure — we can't access them directly.
+        // Instead we read from the DOM: the img src tells us what's loaded,
+        // and we grab stream/filename info from the guardian-start request
+        // by calling /api/guardian/scan which accepts stream_id OR filename.
+        //
+        // We piggyback on app.js's exposed data by reading the hidden data attrs
+        // we'll write onto the img element when a source loads (see hookSourceChange).
+
+        function getSourcePayload() {
+            const streamId = mainVideoImg.dataset.guardianStreamId || null;
+            const filename  = mainVideoImg.dataset.guardianFilename  || null;
+            const videoId   = mainVideoImg.dataset.guardianVideoId   || null;
+            return { stream_id: streamId, filename, video_id: videoId };
+        }
+
+        // ── Hook into app.js source events via MutationObserver ──────────────
+        // app.js sets mainVideoImg.src when a source loads. We watch for this
+        // and update our data attrs from the upload/connect response.
+        // We also hook the pipeline-select change to show/hide our panel.
+
+        pipelineSelect.addEventListener("change", onPipelineChange);
+        onPipelineChange(); // run once on load in case room_guardian is pre-selected
+
+        function onPipelineChange() {
+            const isGuardian = pipelineSelect.value === "room_guardian";
+            if (guardianPanel) {
+                guardianPanel.classList.toggle("hidden", !isGuardian);
+            }
+            state.active = isGuardian;
+
+            if (!isGuardian) {
+                // Reset our canvas state so we don't interfere with other pipelines
+                resetPhase1(false);
+            }
+        }
+
+        // ── Intercept app.js upload/connect responses ─────────────────────────
+        // We monkey-patch the img's src setter to detect source changes.
+        // This is the safest zero-coupling approach: no app.js modification needed.
+        const _origSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+        const guardianSelf = { state, mainVideoImg };
+
+        // Instead of monkey-patching (fragile), we use a MutationObserver on data attrs.
+        // app.js sets currentVideoData in its closure. We expose a tiny bridge:
+        // guardian.js reads window.__guardianBridge which app.js populates via
+        // the data-guardian-* attributes we ask the HTML to set.
+        // The cleanest zero-coupling: watch the img src change and re-parse what we know.
+
+        // Actually the simplest approach: listen to our own scan button which fires
+        // the scan request. The user always clicks "Scan Room" after connecting a source.
+        // At that point we read the data attributes we instructed index.html to set.
+        // (See index.html guardian-source-bridge hidden inputs.)
+
+        // ── Scan button ───────────────────────────────────────────────────────
+        if (scanBtn) {
+            scanBtn.addEventListener("click", handleScan);
+        }
+
+        async function handleScan() {
+            const src = getSourcePayload();
+            if (!src.stream_id && !src.filename) {
+                setStatus("⚠️ No video source loaded. Upload a file or connect RTSP first.", "warn");
+                return;
+            }
+
+            setStatus("Scanning room...", "info");
+            scanBtn.disabled = true;
+
+            try {
+                const res = await fetch("/api/guardian/scan", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(src),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || "Scan failed.");
+                }
+                const data = await res.json();
+
+                state.scanPreviewUrl = data.preview_url;
+                // Sort detections by area (smallest first) so overlapping nested boxes can be clicked
+                state.scanDetections  = (data.detections || []).sort((a, b) => {
+                    const areaA = a.bbox_normalized[2] * a.bbox_normalized[3];
+                    const areaB = b.bbox_normalized[2] * b.bbox_normalized[3];
+                    return areaA - areaB;
+                });
+                state.imageWidth      = data.width;
+                state.imageHeight     = data.height;
+                state.phase           = "scan";
+
+                // Show the scan preview still on the main image
+                mainVideoImg.src = data.preview_url + "?t=" + Date.now();
+
+                // Sync canvas internal resolution to match actual video pixels
+                roiCanvas.width  = data.width;
+                roiCanvas.height = data.height;
+
+                // Force canvas visible — use inline style to beat any competing display:none
+                roiCanvas.style.display = "block";
+                roiCanvas.classList.remove("hidden");
+                roiCanvas.style.cursor = "pointer";  // YOLO mode: click to select
+
+                // Re-draw after the preview image renders. Use onload + staggered timeouts
+                // because browsers may not re-fire onload for cached images.
+                const doAlignAndDraw = () => { alignCanvas(); redrawCanvas(); };
+                mainVideoImg.onload = doAlignAndDraw;
+                setTimeout(doAlignAndDraw, 50);
+                setTimeout(doAlignAndDraw, 250);
+                setTimeout(doAlignAndDraw, 700);
+
+                setStatus(`Found ${data.detections.length} object(s). Click a box to select, or toggle "Draw Custom Object".`, "ok");
+
+                if (modeToggleBtn) modeToggleBtn.disabled = false;
+            } catch (err) {
+                setStatus("❌ " + err.message, "error");
+            } finally {
+                scanBtn.disabled = false;
+            }
+        }
+
+        // ── Mode toggle (YOLO ↔ Custom draw) ─────────────────────────────────
+        if (modeToggleBtn) {
+            modeToggleBtn.addEventListener("click", toggleDrawMode);
+        }
+
+        function toggleDrawMode() {
+            if (state.phase !== "scan") return;
+            state.drawMode = state.drawMode === "yolo" ? "custom" : "yolo";
+            modeToggleBtn.textContent =
+                state.drawMode === "yolo" ? "✏️ Drag Box over Object" : "🔲 Back to YOLO Selection";
+            modeToggleBtn.style.background =
+                state.drawMode === "custom" ? "rgba(139,92,246,0.25)" : "";
+            // Explicitly enable pointer-events and set correct cursor so mouse events fire
+            roiCanvas.style.pointerEvents = "auto";
+            roiCanvas.style.cursor = state.drawMode === "custom" ? "crosshair" : "pointer";
+            if (clearCustomBtn) {
+                clearCustomBtn.style.display = state.drawMode === "custom" ? "block" : "none";
+            }
+            redrawCanvas();
+        }
+
+        // ── Clear custom ROIs ────────────────────────────────────────────────
+        if (clearCustomBtn) {
+            clearCustomBtn.addEventListener("click", () => {
+                state.customRects  = [];
+                state.customCounter = 0;
+                redrawCanvas();
+                updateSelectionList();
+                checkStartReady();
+                setStatus("Custom ROIs cleared. Draw new ones or click YOLO boxes.", "info");
+            });
+        }
+
+        // ── Canvas interaction ────────────────────────────────────────────────
+        roiCanvas.addEventListener("mousedown",  onCanvasMouseDown);
+        roiCanvas.addEventListener("mousemove",  onCanvasMouseMove);
+        roiCanvas.addEventListener("mouseup",    onCanvasMouseUp);
+        roiCanvas.addEventListener("click",      onCanvasClick);
+
+        function canvasXY(e) {
+            const rect = roiCanvas.getBoundingClientRect();
+            return {
+                x: (e.clientX - rect.left) * (roiCanvas.width  / rect.width),
+                y: (e.clientY - rect.top)  * (roiCanvas.height / rect.height),
+            };
+        }
+
+        // --- Click (YOLO box selection) ---
+        function onCanvasClick(e) {
+            if (!state.active || state.phase !== "scan" || state.drawMode !== "yolo") return;
+            if (state.isDrawing) return; // suppress click at end of rect draw
+
+            const { x, y } = canvasXY(e);
+            const W = roiCanvas.width, H = roiCanvas.height;
+
+            for (const det of state.scanDetections) {
+                const [nx, ny, nw, nh] = det.bbox_normalized;
+                const bx = nx * W, by = ny * H, bw = nw * W, bh = nh * H;
+
+                if (x >= bx && x <= bx + bw && y >= by && y <= by + bh) {
+                    if (state.selectedYoloIds.has(det.id)) {
+                        state.selectedYoloIds.delete(det.id);
+                    } else {
+                        state.selectedYoloIds.add(det.id);
+                    }
+                    redrawCanvas();
+                    updateSelectionList();
+                    checkStartReady();
+                    return;
+                }
+            }
+        }
+
+        // --- Rect drawing (custom mode) ---
+        function onCanvasMouseDown(e) {
+            if (!state.active || state.phase !== "scan" || state.drawMode !== "custom") return;
+            state.isDrawing = true;
+            state.drawStart   = canvasXY(e);
+            state.drawCurrent = canvasXY(e);
+        }
+
+        function onCanvasMouseMove(e) {
+            if (!state.isDrawing) return;
+            state.drawCurrent = canvasXY(e);
+            redrawCanvas();
+        }
+
+        function onCanvasMouseUp(e) {
+            if (!state.isDrawing) return;
+            state.isDrawing = false;
+            const end = canvasXY(e);
+
+            const W = roiCanvas.width, H = roiCanvas.height;
+            const x1 = Math.min(state.drawStart.x, end.x);
+            const y1 = Math.min(state.drawStart.y, end.y);
+            const x2 = Math.max(state.drawStart.x, end.x);
+            const y2 = Math.max(state.drawStart.y, end.y);
+            const rw = x2 - x1, rh = y2 - y1;
+
+            if (rw < 10 || rh < 10) {
+                state.drawStart = null; state.drawCurrent = null;
+                redrawCanvas();
+                setStatus("⚠️ Please click and drag to draw a box. Single clicks are ignored.", "warn");
+                return;
+            }
+
+            state.customCounter++;
+            const label = `Unknown-${state.customCounter}`;
+            state.customRects.push({
+                id:   `custom-${state.customCounter}`,
+                label,
+                bbox_normalized: [
+                    parseFloat((x1 / W).toFixed(4)),
+                    parseFloat((y1 / H).toFixed(4)),
+                    parseFloat((rw / W).toFixed(4)),
+                    parseFloat((rh / H).toFixed(4)),
+                ],
+            });
+
+            state.drawStart = null; state.drawCurrent = null;
+            redrawCanvas();
+            updateSelectionList();
+            checkStartReady();
+        }
+
+        // ── Canvas drawing ────────────────────────────────────────────────────
+        function redrawCanvas() {
+            ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+            if (state.phase !== "scan") return;
+
+            const W = roiCanvas.width, H = roiCanvas.height;
+
+            // Draw YOLO detection boxes
+            for (const det of state.scanDetections) {
+                const [nx, ny, nw, nh] = det.bbox_normalized;
+                const bx = nx * W, by = ny * H, bw = nw * W, bh = nh * H;
+                const selected = state.selectedYoloIds.has(det.id);
+
+                // In custom mode, show YOLO boxes dimmed so user knows what's there
+                const alpha = state.drawMode === "custom" ? 0.3 : 1.0;
+                ctx.globalAlpha = alpha;
+
+                ctx.strokeStyle = selected ? "#22c55e" : "#f97316";
+                ctx.lineWidth   = selected ? 2.5 : 1.5;
+                ctx.setLineDash(selected ? [] : [5, 3]);
+                ctx.strokeRect(bx, by, bw, bh);
+
+                if (selected) {
+                    ctx.fillStyle = "rgba(34,197,94,0.15)";
+                    ctx.fillRect(bx, by, bw, bh);
+                }
+
+                // Label
+                ctx.setLineDash([]);
+                const labelText = `${det.label} (${Math.round(det.confidence * 100)}%)`;
+                ctx.font        = "bold 12px Inter, sans-serif";
+                const tw        = ctx.measureText(labelText).width;
+                ctx.fillStyle   = selected ? "#22c55e" : "#f97316";
+                ctx.fillRect(bx, by - 18, tw + 8, 18);
+                ctx.fillStyle   = "#000";
+                ctx.fillText(labelText, bx + 4, by - 4);
+
+                ctx.globalAlpha = 1.0;
+            }
+
+            // Draw custom ROI rects
+            for (const rect of state.customRects) {
+                const [nx, ny, nw, nh] = rect.bbox_normalized;
+                const bx = nx * W, by = ny * H, bw = nw * W, bh = nh * H;
+
+                ctx.strokeStyle = "#a855f7";
+                ctx.lineWidth   = 2;
+                ctx.setLineDash([]);
+                ctx.strokeRect(bx, by, bw, bh);
+                ctx.fillStyle = "rgba(168,85,247,0.12)";
+                ctx.fillRect(bx, by, bw, bh);
+
+                // Label
+                ctx.font      = "bold 12px Inter, sans-serif";
+                const tw      = ctx.measureText(rect.label).width;
+                ctx.fillStyle = "#a855f7";
+                ctx.fillRect(bx, by - 18, tw + 8, 18);
+                ctx.fillStyle = "#fff";
+                ctx.fillText(rect.label, bx + 4, by - 4);
+            }
+
+            // Live drawing preview rect
+            if (state.isDrawing && state.drawStart && state.drawCurrent) {
+                const x1 = Math.min(state.drawStart.x, state.drawCurrent.x);
+                const y1 = Math.min(state.drawStart.y, state.drawCurrent.y);
+                const rw = Math.abs(state.drawCurrent.x - state.drawStart.x);
+                const rh = Math.abs(state.drawCurrent.y - state.drawStart.y);
+                ctx.strokeStyle = "#c084fc";
+                ctx.lineWidth   = 1.5;
+                ctx.setLineDash([4, 3]);
+                ctx.strokeRect(x1, y1, rw, rh);
+                ctx.fillStyle   = "rgba(192,132,252,0.1)";
+                ctx.fillRect(x1, y1, rw, rh);
+                ctx.setLineDash([]);
+            }
+        }
+
+        // ── Canvas alignment (mirrors app.js alignCanvas logic) ───────────────
+        function alignCanvas() {
+            if (!state.imageWidth || !state.imageHeight) return;
+            const rect = mainVideoImg.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return;
+
+            const imgRatio = state.imageWidth / state.imageHeight;
+            const boxRatio = rect.width / rect.height;
+            let renderW, renderH, offsetX, offsetY;
+
+            if (imgRatio > boxRatio) {
+                renderW = rect.width; renderH = rect.width / imgRatio;
+                offsetX = 0; offsetY = (rect.height - renderH) / 2;
+            } else {
+                renderH = rect.height; renderW = rect.height * imgRatio;
+                offsetX = (rect.width - renderW) / 2; offsetY = 0;
+            }
+
+            roiCanvas.style.width  = renderW + "px";
+            roiCanvas.style.height = renderH + "px";
+            roiCanvas.style.left   = offsetX + "px";
+            roiCanvas.style.top    = offsetY + "px";
+        }
+
+        window.addEventListener("resize", () => { if (state.active) alignCanvas(); });
+
+        // ── Selection list ────────────────────────────────────────────────────
+        function updateSelectionList() {
+            if (!selectionList) return;
+            selectionList.innerHTML = "";
+
+            const allSelected = getEnrolledObjects();
+            if (allSelected.length === 0) {
+                selectionList.innerHTML = '<p class="guardian-empty-list">No objects selected yet.</p>';
+                return;
+            }
+
+            for (const obj of allSelected) {
+                const item = document.createElement("div");
+                item.className = "guardian-selection-item";
+
+                const dot = document.createElement("span");
+                dot.className = "guardian-dot";
+                dot.style.background = obj.type === "yolo" ? "#22c55e" : "#a855f7";
+
+                const lbl = document.createElement("span");
+                lbl.textContent = obj.label;
+                lbl.style.flex = "1";
+
+                const rmBtn = document.createElement("button");
+                rmBtn.textContent = "✕";
+                rmBtn.className   = "guardian-remove-btn";
+                rmBtn.addEventListener("click", () => {
+                    if (obj.type === "yolo") {
+                        state.selectedYoloIds.delete(obj.id);
+                    } else {
+                        state.customRects = state.customRects.filter(r => r.id !== obj.id);
+                    }
+                    redrawCanvas();
+                    updateSelectionList();
+                    checkStartReady();
+                });
+
+                item.append(dot, lbl, rmBtn);
+                selectionList.appendChild(item);
+            }
+        }
+
+        function getEnrolledObjects() {
+            const result = [];
+
+            for (const det of state.scanDetections) {
+                if (state.selectedYoloIds.has(det.id)) {
+                    result.push({
+                        id:              det.id,
+                        type:            "yolo",
+                        label:           det.label,
+                        class_id:        det.class_id,
+                        bbox_normalized: det.bbox_normalized,
+                    });
+                }
+            }
+
+            for (const rect of state.customRects) {
+                result.push({
+                    id:              rect.id,
+                    type:            "custom",
+                    label:           rect.label,
+                    class_id:        null,
+                    bbox_normalized: rect.bbox_normalized,
+                });
+            }
+
+            return result;
+        }
+
+        function checkStartReady() {
+            if (!startGuardBtn) return;
+            const hasObjects = state.selectedYoloIds.size > 0 || state.customRects.length > 0;
+            startGuardBtn.disabled = !(hasObjects && state.phase === "scan");
+        }
+
+        // ── Start Guarding ────────────────────────────────────────────────────
+        if (startGuardBtn) {
+            startGuardBtn.addEventListener("click", handleStartGuarding);
+        }
+
+        async function handleStartGuarding() {
+            const enrolled = getEnrolledObjects();
+            if (enrolled.length === 0) {
+                setStatus("Select at least one object first.", "warn");
+                return;
+            }
+
+            const src = getSourcePayload();
+
+            setStatus("Starting guardian session...", "info");
+            startGuardBtn.disabled = true;
+
+            try {
+                const res = await fetch("/api/guardian/start", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        stream_id:       src.stream_id,
+                        video_id:        src.video_id,
+                        filename:        src.filename,
+                        watched_objects: enrolled,
+                    }),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || "Failed to start guardian.");
+                }
+                const data = await res.json();
+                state.sessionId = data.session_id;
+                enterGuardingPhase();
+            } catch (err) {
+                setStatus("❌ " + err.message, "error");
+                startGuardBtn.disabled = false;
+            }
+        }
+
+        function enterGuardingPhase() {
+            state.phase = "guarding";
+            state.knownAlerts.clear();
+
+            // Hide canvas (AI draws boxes on the annotated stream directly)
+            roiCanvas.classList.add("hidden");
+
+            // Switch image to the live annotated guardian stream
+            mainVideoImg.src = `/api/stream/${state.sessionId}`;
+
+            // Show stop button
+            if (stopGuardBtn)  stopGuardBtn.classList.remove("hidden");
+            if (startGuardBtn) startGuardBtn.classList.add("hidden");
+            if (modeToggleBtn) modeToggleBtn.disabled = true;
+            if (scanBtn)       scanBtn.disabled = true;
+
+            // Clear alert area
+            const alertsContainer = document.getElementById("alerts-container");
+            if (alertsContainer) {
+                alertsContainer.innerHTML = '<p class="placeholder">Guardian active — no alerts yet.</p>';
+            }
+
+            setStatus(`🛡️ Guarding ${getEnrolledObjects().length} object(s)...`, "ok");
+
+            // Start polling
+            state.pollingInterval = setInterval(pollGuardianAlerts, 1500);
+        }
+
+        // ── Stop Guarding ─────────────────────────────────────────────────────
+        if (stopGuardBtn) {
+            stopGuardBtn.addEventListener("click", handleStopGuarding);
+        }
+
+        function handleStopGuarding() {
+            if (state.sessionId) {
+                fetch(`/api/stop_analysis/${state.sessionId}`, { method: "POST" }).catch(() => {});
+            }
+            resetPhase1(true);
+        }
+
+        function resetPhase1(keepScan) {
+            if (state.pollingInterval) { clearInterval(state.pollingInterval); state.pollingInterval = null; }
+
+            state.phase     = keepScan && state.scanPreviewUrl ? "scan" : "idle";
+            state.sessionId = null;
+
+            if (stopGuardBtn)  stopGuardBtn.classList.add("hidden");
+            if (startGuardBtn) { startGuardBtn.classList.remove("hidden"); startGuardBtn.disabled = true; }
+            if (modeToggleBtn) modeToggleBtn.disabled = state.phase !== "scan";
+            if (scanBtn)       scanBtn.disabled = false;
+
+            roiCanvas.classList.remove("hidden");
+
+            if (keepScan && state.scanPreviewUrl) {
+                mainVideoImg.src = state.scanPreviewUrl + "?t=" + Date.now();
+                redrawCanvas();
+                setStatus("Guardian stopped. Re-scan or adjust selection.", "info");
+            } else {
+                // Full reset
+                state.scanDetections  = [];
+                state.selectedYoloIds = new Set();
+                state.customRects     = [];
+                state.customCounter   = 0;
+                state.drawMode        = "yolo";
+                ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+                if (modeToggleBtn) {
+                    modeToggleBtn.textContent = "✏️ Drag Box over Object";
+                    modeToggleBtn.style.background = "";
+                }
+                setStatus("Upload a video or connect RTSP, then click Scan Room.", "info");
+            }
+            updateSelectionList();
+        }
+
+        // ── Alert polling ─────────────────────────────────────────────────────
+        function pollGuardianAlerts() {
+            if (!state.sessionId) return;
+            fetch(`/api/alerts/${state.sessionId}`)
+                .then(r => r.json())
+                .then(data => {
+                    const alerts = data.alerts || [];
+                    if (alerts.length === 0) return;
+
+                    const container = document.getElementById("alerts-container");
+                    if (!container) return;
+
+                    const placeholder = container.querySelector(".placeholder");
+                    if (placeholder) placeholder.remove();
+
+                    for (const alert of alerts) {
+                        if (state.knownAlerts.has(alert.id)) continue;
+                        state.knownAlerts.add(alert.id);
+                        createGuardianAlertCard(alert, container);
+                        playBuzzer(2);
+                    }
+                })
+                .catch(() => {});
+        }
+
+        function createGuardianAlertCard(alert, container) {
+            const card = document.createElement("div");
+            card.className = "alert-card";
+            card.innerHTML = `
+                <div class="alert-time" style="color:#ff4444;font-weight:600;">
+                    🚨 OBJECT MISSING: <strong>${alert.object_label || "Unknown"}</strong> @ ${alert.formatted_time}
+                </div>
+                <video class="alert-inline-video" src="${alert.clip_url}" controls autoplay loop muted></video>
+            `;
+            container.prepend(card);
+        }
+
+        function playBuzzer(times) {
+            if (times <= 0) return;
+            const audio = new Audio("/assets/buzzer.mp3");
+            audio.play().catch(() => {});
+            audio.onended = () => playBuzzer(times - 1);
+        }
+
+        // ── Status display ────────────────────────────────────────────────────
+        function setStatus(msg, level = "info") {
+            if (!guardianStatus) return;
+            const colors = { info: "#94a3b8", ok: "#22c55e", warn: "#f97316", error: "#ef4444" };
+            guardianStatus.textContent = msg;
+            guardianStatus.style.color = colors[level] || "#94a3b8";
+        }
+
+        // ── Source bridge: expose data-attrs for guardian.js to read ──────────
+        // app.js calls these by setting data-guardian-* on mainVideoImg.
+        // We expose a global function that app.js can call without coupling:
+        window.__guardianSetSource = function({ stream_id, filename, video_id, width, height }) {
+            mainVideoImg.dataset.guardianStreamId = stream_id  || "";
+            mainVideoImg.dataset.guardianFilename  = filename   || "";
+            mainVideoImg.dataset.guardianVideoId   = video_id   || "";
+            if (width)  state.imageWidth  = width;
+            if (height) state.imageHeight = height;
+
+            // Auto-reset scan state when source changes
+            if (state.phase !== "guarding") {
+                state.scanDetections   = [];
+                state.selectedYoloIds  = new Set();
+                state.customRects      = [];
+                state.customCounter    = 0;
+                state.drawMode         = "yolo";
+                state.phase            = "idle";
+                ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+                updateSelectionList();
+                checkStartReady();
+                if (modeToggleBtn) modeToggleBtn.disabled = true;
+                if (state.active) setStatus("Source loaded. Click Scan Room to begin.", "ok");
+            }
+        };
+
+        // ── Init ──────────────────────────────────────────────────────────────
+        setStatus("Upload a video or connect RTSP, then click Scan Room.", "info");
+        updateSelectionList();
+
+        // Trigger pipeline change check in case room_guardian is already selected
+        onPipelineChange();
+    }
+
+})();
+
+```
+
+## 6. Frontend App.js Integration
+In your existing `static/app.js`, trigger the guardian when a source is loaded:
+
+```javascript
+// 1. Inside the /api/upload success handler:
+if (window.__guardianSetSource) window.__guardianSetSource({
+    stream_id: null, filename: data.filename, video_id: data.video_id,
+    width: data.width, height: data.height,
+});
+
+// 2. Inside the /api/connect_stream success handler:
+if (window.__guardianSetSource) window.__guardianSetSource({
+    stream_id: data.stream_id, filename: null, video_id: data.stream_id,
+    width: data.width, height: data.height,
+});
+```
+
+## 7. Include in HTML
+In `static/index.html`, add `<script src="/guardian.js"></script>` at the bottom of the body.
+
+### `main.py` specific code blocks to copy:
+```python
+# ── Guardian endpoints ────────────────────────────────────────────────────────
+# These are fully decoupled from the existing pipeline endpoints.
+# They use the same session/alert infrastructure but are namespaced under /api/guardian/.
+
+@app.post("/api/guardian/scan")
+async def guardian_scan(request: GuardianScanRequest):
+    """
+    Run a one-shot YOLO detection on a single frame and return bounding boxes.
+    The frontend uses these to draw the Phase-1 selection overlay.
+    """
+    import numpy as _np
+    from ultralytics import FastSAM as _FastSAM
+
+    # Resolve the video source
+    if request.stream_id and request.stream_id in rtsp_streams:
+        cam = rtsp_streams[request.stream_id]
+        ret, frame = cam.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=503, detail="Could not read frame from stream.")
+        width, height = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    elif request.filename:
+        file_path = os.path.join(UPLOAD_DIR, request.filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Video file not found.")
+        cap = cv2.VideoCapture(file_path)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise HTTPException(status_code=400, detail="Could not read video frame.")
+        height, width = frame.shape[:2]
+    else:
+        raise HTTPException(status_code=400, detail="Provide stream_id or filename.")
+
+    # Save a preview still for the frontend to display
+    scan_preview_id = str(uuid.uuid4())
+    preview_fn      = f"guardian_scan_{scan_preview_id}.jpg"
+    preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
+    cv2.imwrite(preview_path, frame)
+
+    # Run YOLO inference in a thread pool to avoid blocking the event loop
+    loop = asyncio.get_running_loop()
+    _model = _FastSAM("FastSAM-s.pt")
+
+    def _infer():
+        # FastSAM standard inference
+        return _model(frame, conf=0.25, verbose=False)[0]
+
+    results = await loop.run_in_executor(None, _infer)
+
+    detections = []
+    if results.boxes is not None:
+        for i, box in enumerate(results.boxes):
+            cls_id  = int(box.cls[0])
+            conf    = float(box.conf[0])
+            label   = "Object"
+            xywh    = box.xywh[0].cpu().numpy()
+            cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
+            # Normalise to [0,1] range, xywh format (top-left x,y + w,h)
+            nx = (cx - bw / 2) / width
+            ny = (cy - bh / 2) / height
+            nw = bw / width
+            nh = bh / height
+            detections.append({
+                "id":             f"yolo-{i}-{str(uuid.uuid4())[:8]}",
+                "label":          label,
+                "class_id":       cls_id,
+                "confidence":     round(conf, 2),
+                "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
+            })
+
+    return {
+        "preview_url": f"/storage/previews/{preview_fn}",
+        "width":       width,
+        "height":      height,
+        "detections":  detections,
+    }
+
+
+@app.post("/api/guardian/start")
+async def guardian_start(request: GuardianStartRequest):
+    """
+    Start a guardian analysis session.
+    Returns a session_id compatible with /api/stream/{session_id} and /api/alerts/{session_id}.
+    """
+    if not request.watched_objects:
+        raise HTTPException(status_code=400, detail="No watched_objects provided.")
+
+    # Serialise watched objects for the pipeline config
+    watched_list = [
+        {
+            "id":              wo.id,
+            "type":            wo.type,
+            "label":           wo.label,
+            "class_id":        wo.class_id,
+            "bbox_normalized": wo.bbox_normalized,
+        }
+        for wo in request.watched_objects
+    ]
+
+    # Build a ProcessRequest-compatible record so the existing /api/stream endpoint works
+    session_id = str(uuid.uuid4())
+
+    # Determine source
+    filename  = request.filename or ""
+    stream_id = request.stream_id or None
+
+    # We store a ProcessRequest-like object (dict is fine — stream_video reads .pipeline_name etc.)
+    from types import SimpleNamespace
+    fake_req = SimpleNamespace(
+        video_id      = request.video_id or session_id,
+        filename      = filename,
+        pipeline_name = "room_guardian",
+        roi_normalized= [],
+        config        = {"watched_objects": watched_list},
+        stream_id     = stream_id,
+    )
+
+    active_sessions[session_id] = fake_req
+    session_alerts[session_id]  = []
+    stop_events[session_id]     = threading.Event()
+
+    return {"session_id": session_id}
+
+
+```
+

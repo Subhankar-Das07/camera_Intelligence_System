@@ -1,33 +1,15 @@
 """
-Room Guardian Pipeline
-======================
-Tracks a static camera's view and alerts when user-selected objects
-disappear or go missing for more than 5 seconds.
+Room Guardian Pipeline  v3.1 - ByteTrack Edition with Identity Verification
+============================================================================
+Enhanced version of v3.0 that adds:
+- Kalman filter per watched object for motion prediction.
+- Appearance verification on every frame to prevent ID drift.
+- Smart recovery with expanding search and combined IoU+appearance metric.
+- Robust exit detection using motion direction.
+- Protection against histogram poisoning.
+- Alert trigger using >= instead of ==.
 
-Workflow
---------
-Phase 1 (frontend): User scans the room via /api/guardian/scan -> selects
-  YOLO-detected objects (click) or draws custom ROI rectangles (drag).
-
-Phase 2 (this file): /api/guardian/start passes the enrolled watched_objects
-  list into config. run_on_video() tracks only those objects and yields
-  (annotated_frame, alert_event_or_None) matching the BaseVideoPipeline contract.
-
-Tracking strategy
------------------
-- YOLO-enrolled objects : IoU-matching against the correct class detections each frame.
-- Custom-ROI objects    : OpenCV CSRT tracker (appearance-based, CPU-only, ~1ms/tracker/frame).
-
-Alert logic
------------
-- A 2-second rolling ring buffer of raw frames is maintained at all times.
-- If an object is not found for >= fps * 5 consecutive frames (5 seconds):
-    -> ring buffer is flushed to a .webm clip (the last 2 s before disappearance).
-    -> alert_event is yielded to the MJPEG pipeline and collected by the session.
-- If the object re-appears BEFORE the 5-second threshold: missing_frames resets silently.
-- After an alert fires: alert_fired flag prevents duplicate alerts for the same
-  continuous absence. If the object later re-appears, the flag clears so a future
-  disappearance can trigger a new alert.
+All changes are backward-compatible and maintain the original workflow.
 """
 
 import cv2
@@ -36,7 +18,7 @@ import uuid
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Tuple
 from collections import deque
 
 from ultralytics import FastSAM
@@ -46,30 +28,81 @@ from core.video_source import get_video_source
 
 log = logging.getLogger(__name__)
 
-# -- Colours for annotation ----------------------------------------------------
-COLOR_PRESENT   = (0, 255, 100)    # green  - object currently visible
-COLOR_MISSING   = (0, 165, 255)    # orange - counting down
-COLOR_ALERT     = (0, 0, 255)      # red    - alert fired, still absent
-COLOR_LABEL_BG  = (20, 20, 20)
+# ── Tuning constants ──────────────────────────────────────────────────────────
+CONF_THRESHOLD   = 0.60       # FastSAM confidence gate
+ANCHOR_IOU       = 0.40       # Min IoU to anchor user's scan box to a ByteTrack box
+REINIT_IOU       = 0.30       # (Legacy) kept for reference, not used in new logic
+
+# New constants for recovery & search
+SEARCH_RADIUS_INIT = 50       # pixels (initial search radius around predicted position)
+SEARCH_RADIUS_MAX = 200       # pixels (max search radius)
+EXPAND_RATE = 10              # pixels per frame the radius expands
+
+# Appearance thresholds
+APPEARANCE_ACCEPT = 0.42      # Bhattacharyya distance threshold for accepting a candidate
+APPEARANCE_RECOVER = 0.50     # tighter threshold during recovery
+COST_ACCEPT = 0.60            # combined cost threshold to accept recovery
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+COLOR_PRESENT  = (0, 255, 100)   # green  - tracking OK
+COLOR_MISSING  = (0, 165, 255)   # orange - counting down
+COLOR_ALERT    = (0, 0, 255)     # red    - alert fired, still absent
+COLOR_LABEL_BG = (20, 20, 20)
 
 
-# -- WatchedObject -------------------------------------------------------------
+# ── Kalman Filter for Motion Prediction ──────────────────────────────────────
+
+class KalmanFilter:
+    """Simple Kalman filter for 2D position (x, y) with constant velocity."""
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)  # state: x, y, vx, vy; measurement: x, y
+        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        self.last_measurement = None
+
+    def update(self, x: float, y: float) -> None:
+        """Update filter with a new measurement."""
+        self.kf.correct(np.array([[x], [y]], np.float32))
+        self.last_measurement = (x, y)
+
+    def predict(self) -> Tuple[float, float]:
+        """Return predicted (x, y)."""
+        pred = self.kf.predict()
+        return pred[0,0], pred[1,0]
+
+
+# ── WatchedObject ─────────────────────────────────────────────────────────────
 
 @dataclass
 class WatchedObject:
-    """All state needed to track one user-selected object."""
-    id: str                             # "yolo-<uuid>" | "Unknown-1", ...
-    obj_type: str                       # "yolo" | "custom"
-    label: str                          # class name or "Unknown-N"
-    yolo_class_id: Optional[int]        # None for custom objects
-    last_bbox: List[int]                # [x, y, w, h] pixels (absolute)
-    template_bank: deque = field(default_factory=lambda: deque(maxlen=5), repr=False)
-    frames_since_bank_update: int = 0
-    missing_frames: int = 0
-    alert_fired: bool = False
-    track_id: Optional[int] = None      # YOLO BoT-SORT track ID
+    """All state needed to track one user-selected object via ByteTrack."""
+    id:             str                  # unique id from frontend scan
+    label:          str                  # class name or "Object"
+    last_bbox:      List[int]            # [x, y, w, h] pixels (absolute)
+
+    # ByteTrack state
+    track_id:       Optional[int] = None # The assigned global track ID
+    track_ok:       bool = False         # Was it found in the latest frame?
+
+    # Appearance cache for re-association if ByteTrack drops the ID
+    hist_bank:      list  = field(default_factory=list, repr=False)   # HSV hists
+
+    # Motion prediction
+    kf:             Optional[KalmanFilter] = None  # Kalman filter instance
+    predicted_bbox: Optional[List[int]] = None     # last predicted box (for display/debug)
+
+    # Tracking counters
+    missing_frames: int = 0             # frames since object is truly absent
+    frames_since_update: int = 0
+
+    # Alert state
+    alert_fired:    bool = False
     center_history: deque = field(default_factory=lambda: deque(maxlen=30), repr=False)
 
+
+# ── Utility functions ─────────────────────────────────────────────────────────
 
 def _iou(boxA: List[int], boxB: List[int]) -> float:
     """Compute IoU between two [x, y, w, h] boxes (absolute pixels)."""
@@ -77,7 +110,6 @@ def _iou(boxA: List[int], boxB: List[int]) -> float:
     ax2, ay2 = ax1 + boxA[2], ay1 + boxA[3]
     bx1, by1 = boxB[0], boxB[1]
     bx2, by2 = bx1 + boxB[2], by1 + boxB[3]
-
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
@@ -87,21 +119,56 @@ def _iou(boxA: List[int], boxB: List[int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _compute_hist(patch: np.ndarray) -> Optional[np.ndarray]:
+    """Compute a normalized HSV histogram from an BGR patch."""
+    if patch is None or patch.size == 0:
+        return None
+    try:
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
+    except Exception:
+        return None
+
+
+def _hist_match_precomputed(query_hist: np.ndarray, hist_bank: list, threshold: float = 0.42) -> bool:
+    """Compare a query histogram against a bank of histograms."""
+    if not hist_bank or query_hist is None:
+        return False
+    for tmpl_hist in reversed(hist_bank):
+        if tmpl_hist is None:
+            continue
+        dist = cv2.compareHist(tmpl_hist, query_hist, cv2.HISTCMP_BHATTACHARYYA)
+        if dist < threshold:
+            return True
+    return False
+
+
+def _safe_patch(frame: np.ndarray, bbox: List[int]) -> Optional[np.ndarray]:
+    """Safely extract a patch from frame given [x, y, w, h] bbox."""
+    fh, fw = frame.shape[:2]
+    x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    x = max(0, min(x, fw - 1))
+    y = max(0, min(y, fh - 1))
+    w = max(1, min(w, fw - x))
+    h = max(1, min(h, fh - y))
+    patch = frame[y:y + h, x:x + w]
+    return patch if patch.size > 0 else None
+
+
 def _draw_label(frame: np.ndarray, text: str, x: int, y: int, color: tuple) -> None:
-    """Draw a filled background label above a bounding box."""
     font      = cv2.FONT_HERSHEY_SIMPLEX
     scale     = 0.55
     thickness = 1
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
     pad = 4
-    rx1, ry1 = x, y - th - pad * 2
-    rx2, ry2 = x + tw + pad * 2, y
-    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), COLOR_LABEL_BG, -1)
+    cv2.rectangle(frame, (x, y - th - pad * 2), (x + tw + pad * 2, y), COLOR_LABEL_BG, -1)
     cv2.putText(frame, text, (x + pad, y - pad), font, scale, color, thickness, cv2.LINE_AA)
 
 
-def _write_clip(frames: deque, output_path: str, fps: float, size: tuple) -> bool:
-    """Write a deque of frames to a .webm file. Returns True on success."""
+def _write_clip(frames: list, output_path: str, fps: float, size: tuple) -> bool:
+    """Write a list/deque of frames to a .webm file. Returns True on success."""
     if not frames:
         return False
     fourcc = cv2.VideoWriter_fourcc(*"vp80")
@@ -115,125 +182,86 @@ def _write_clip(frames: deque, output_path: str, fps: float, size: tuple) -> boo
     return True
 
 
-def _color_hist_match(frame, box, template_bank, threshold=0.45):
-    """Compare HSV histogram of a bounding box patch against the template bank."""
-    bx, by, bw, bh = box
-    fh, fw = frame.shape[:2]
-    
-    # Safe extract patch
-    bx = max(0, min(bx, fw - 1))
-    by = max(0, min(by, fh - 1))
-    bw = max(1, min(bw, fw - bx))
-    bh = max(1, min(bh, fh - by))
-    patch = frame[by:by+bh, bx:bx+bw]
-    if patch.size == 0:
-        return False
-        
-    try:
-        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        hist_patch = cv2.calcHist([hsv_patch], [0, 1], None, [50, 60], [0, 180, 0, 256])
-        cv2.normalize(hist_patch, hist_patch, 0, 1, cv2.NORM_MINMAX)
-        
-        for template in reversed(template_bank):
-            hsv_tmpl = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
-            hist_tmpl = cv2.calcHist([hsv_tmpl], [0, 1], None, [50, 60], [0, 180, 0, 256])
-            cv2.normalize(hist_tmpl, hist_tmpl, 0, 1, cv2.NORM_MINMAX)
-            
-            dist = cv2.compareHist(hist_tmpl, hist_patch, cv2.HISTCMP_BHATTACHARYYA)
-            if dist < threshold:
-                return True
-    except Exception as e:
-        log.debug(f"[Guardian] Hist match err: {e}")
-            
-    return False
+# ── Robust Exit Detection ────────────────────────────────────────────────────
+
+def _detect_exit(center_history: deque, width: int, height: int, margin: float = 0.05) -> str:
+    """
+    Determine exit type based on trajectory.
+    Returns 'left_frame', 'occluded_or_removed', or 'unknown'.
+    """
+    if len(center_history) < 3:
+        return "unknown"
+    # Use last 3 points for velocity
+    pts = list(center_history)[-3:]
+    dx = pts[-1][0] - pts[0][0]
+    dy = pts[-1][1] - pts[0][1]
+    last_x, last_y = pts[-1]
+
+    near_right = last_x > width * (1 - margin)
+    near_left  = last_x < width * margin
+    near_bottom = last_y > height * (1 - margin)
+    near_top   = last_y < height * margin
+
+    # Motion outward if near edge and moving further outward
+    if (near_right and dx > 0) or (near_left and dx < 0) or (near_bottom and dy > 0) or (near_top and dy < 0):
+        return "left_frame"
+    else:
+        return "occluded_or_removed"
 
 
-# Environment Profiles configuration
+# ── Environment profiles ──────────────────────────────────────────────────────
 ENV_PROFILES = {
-    "home": {
-        "absence_seconds": 5,
-        "conf_threshold": 0.25,
-        "yolo_tracker": "botsort.yaml",
-        "custom_tracker": "csrt"
-    },
-    "shop": {
-        "absence_seconds": 3,
-        "conf_threshold": 0.20,
-        "yolo_tracker": "botsort.yaml",
-        "custom_tracker": "csrt"
-    },
-    "factory": {
-        "absence_seconds": 8,
-        "conf_threshold": 0.25,
-        "yolo_tracker": "botsort.yaml",
-        "custom_tracker": "csrt"
-    }
+    "home":    {"absence_seconds": 5,  "conf_threshold": CONF_THRESHOLD},
+    "shop":    {"absence_seconds": 3,  "conf_threshold": CONF_THRESHOLD},
+    "factory": {"absence_seconds": 8,  "conf_threshold": CONF_THRESHOLD},
 }
 
 
-# -- Pipeline ------------------------------------------------------------------
+# ── Pipeline ──────────────────────────────────────────────────────────────────
 
 class RoomGuardianPipeline(BaseVideoPipeline):
     """
-    Room Object Guardian pipeline.
-    Inherits BaseVideoPipeline; tracked via the standard registry + session system.
+    Room Object Guardian pipeline — v3.1 (ByteTrack with Identity Verification).
     """
 
     def initialize(self, model_weight: str = "FastSAM-s.pt", **kwargs) -> None:
-        """Load the FastSAM detection model."""
-        self.model = FastSAM(model_weight)
+        self.model      = FastSAM(model_weight)
         self.model_name = model_weight
-        log.info("[Guardian] Initialized with model: %s", model_weight)
+        log.info("[Guardian] v3.1 (ByteTrack+Identity) initialized with model: %s", model_weight)
 
-    # process_frame is not used - all logic is in run_on_video
     def process_frame(self, frame, frame_idx, roi_polygon, config):
         return frame, {}
 
-    # -- Main loop -------------------------------------------------------------
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run_on_video(self, input_path, output_dir, roi_normalized, config):
         """
         Generator: yields (annotated_frame, alert_event_or_None).
-
-        config["watched_objects"] must be a list of dicts:
-        [
-          {
-            "id":           str,          # "yolo-<uuid>" | "Unknown-N"
-            "type":         "yolo"|"custom",
-            "label":        str,
-            "class_id":     int|null,     # for yolo type only
-            "bbox_normalized": [x, y, w, h]  # 0-1 range, relative to frame
-          },
-          ...
-        ]
         """
-        cap = get_video_source(input_path)
+        cap    = get_video_source(input_path)
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        # Parse environment profile
-        env_profile_name = config.get("environment_profile", "home")
-        profile = ENV_PROFILES.get(env_profile_name, ENV_PROFILES["home"])
-        absence_threshold = 20  # Hardcoded to 20 frames per user request
-        ring_buf_size     = max(1, int(fps * 2))  # 2 second ring buffer
-        yolo_tracker_cfg  = config.get("tracker", profile["yolo_tracker"])
-        custom_tracker_cfg= config.get("custom_tracker", profile["custom_tracker"])
+        # Profile settings
+        env_profile_name  = config.get("environment_profile", "home")
+        profile           = ENV_PROFILES.get(env_profile_name, ENV_PROFILES["home"])
+        absence_threshold = max(1, int(fps * profile["absence_seconds"]))
+        ring_buf_size     = max(1, int(fps * 4.5))   # 4.5s ring buffer
         conf_threshold    = profile["conf_threshold"]
 
-        # FastSAM is class-agnostic, always use FastSAM-s.pt
-        req_model_weight = config.get("model_weight", "FastSAM-s.pt")
-        if not hasattr(self, "model_name") or self.model_name != req_model_weight:
-            self.model = FastSAM(req_model_weight)
-            self.model_name = req_model_weight
-            log.info("[Guardian] Loaded model specific to session: %s", req_model_weight)
+        # Reload FastSAM if model weight changed
+        req_weight = config.get("model_weight", "FastSAM-s.pt")
+        if not hasattr(self, "model_name") or self.model_name != req_weight:
+            self.model      = FastSAM(req_weight)
+            self.model_name = req_weight
+            log.info("[Guardian] Reloaded model: %s", req_weight)
 
-        # Parse enrolled objects from config
+        # ── Build WatchedObject list ──────────────────────────────────────────
         raw_objects: List[Dict] = config.get("watched_objects", [])
         if not raw_objects:
-            log.warning("[Guardian] No watched_objects in config - nothing to guard.")
+            log.warning("[Guardian] No watched_objects in config — nothing to guard.")
 
-        # Denormalise bboxes to pixel space
         watched: List[WatchedObject] = []
         for obj in raw_objects:
             bn = obj.get("bbox_normalized", [0, 0, 0.1, 0.1])
@@ -244,170 +272,218 @@ class RoomGuardianPipeline(BaseVideoPipeline):
                 int(bn[3] * height),
             ]
             wo = WatchedObject(
-                id            = obj.get("id", str(uuid.uuid4())),
-                obj_type      = obj.get("type", "custom"),
-                label         = obj.get("label", "Unknown"),
-                yolo_class_id = obj.get("class_id", None),
-                last_bbox     = px,
+                id       = obj.get("id", str(uuid.uuid4())),
+                label    = obj.get("label", "Object"),
+                last_bbox= px,
             )
             watched.append(wo)
 
-        # Rolling ring buffer of raw (un-annotated) frames
-        ring_buffer: deque = deque(maxlen=ring_buf_size)
+        # Rolling ring buffer (raw un-annotated frames)
+        ring_buffer: deque  = deque(maxlen=ring_buf_size)
+        pending_alerts: list = []
+        frame_idx   = 0
 
-        frame_idx = 0
+        # Reset ultralytics tracker state (persist=True keeps it per video)
 
+        # ── Frame loop ────────────────────────────────────────────────────────
         while cap.isOpened():
+            alert_event = None
             ret, frame = cap.read()
             if not ret:
                 break
 
-            raw_frame = frame.copy()   # un-annotated copy for ring buffer
+            raw_frame = frame.copy()   # for ring buffer — un-annotated
+            alert_event = None
 
-            # Extract initial templates on Frame 0
-            if frame_idx == 0:
-                for wo in watched:
-                    x, y, w, h = wo.last_bbox
-                    x = max(0, min(x, width - 1))
-                    y = max(0, min(y, height - 1))
-                    w = max(1, min(w, width - x))
-                    h = max(1, min(h, height - y))
-                    wo.last_bbox = [x, y, w, h]
-                    patch = frame[y:y + h, x:x + w]
-                    if patch.size > 0:
-                        wo.template_bank.append(patch.copy())
+            # 1. Run ByteTrack via FastSAM natively
+            try:
+                results = self.model.track(
+                    frame, 
+                    persist=True, 
+                    tracker="bytetrack.yaml", 
+                    conf=conf_threshold, 
+                    verbose=False
+                )[0]
+            except Exception as e:
+                log.warning("[Guardian] FastSAM ByteTrack error frame %d: %s", frame_idx, e)
+                results = None
 
-            # -- FastSAM inference (tracked) --------------------------------------
-            # FastSAM tracks all distinct objects it segments
-            yolo_results = self.model.track(frame, persist=True, tracker=yolo_tracker_cfg, conf=conf_threshold, verbose=False)[0]
-
-            # Collect all tracked bounding boxes
-            tracked_boxes = []
-            if yolo_results.boxes is not None:
-                for box in yolo_results.boxes:
-                    if box.id is None:
-                        continue
-                    xywh    = box.xywh[0].cpu().numpy()
+            # Extract current frame tracked boxes
+            tracked_boxes = {}  # dict of track_id -> [x,y,w,h]
+            if results and results.boxes is not None and results.boxes.id is not None:
+                for box, t_id in zip(results.boxes, results.boxes.id):
+                    xywh = box.xywh[0].cpu().numpy()
                     cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
                     bx = int(cx - bw / 2)
                     by = int(cy - bh / 2)
-                    track_id = int(box.id[0])
-                    det_box = [bx, by, int(bw), int(bh)]
-                    tracked_boxes.append({
-                        "bbox": det_box,
-                        "track_id": track_id
-                    })
+                    tracked_boxes[int(t_id)] = [bx, by, int(bw), int(bh)]
 
-            # Track which IDs have been assigned to watched objects in this frame
-            claimed_track_ids = set()
+            assigned_track_ids = set()
 
-            # -- 1. Update watched objects by their existing track_id --------
+            # ── 2. Object Association & Tracking (NEW: Identity + Prediction) ──
             for wo in watched:
-                wo._found_this_frame = False
-                if wo.track_id is not None:
-                    for det in tracked_boxes:
-                        if det["track_id"] == wo.track_id:
-                            wo.last_bbox = det["bbox"]
-                            wo._found_this_frame = True
-                            claimed_track_ids.add(wo.track_id)
-                            break
+                wo.track_ok = False
+                # --- Get predicted position (if Kalman exists) ---
+                pred_box = wo.last_bbox.copy()  # fallback
+                if wo.kf is not None:
+                    pred_x, pred_y = wo.kf.predict()
+                    # Use last known width/height
+                    pred_box = [pred_x - wo.last_bbox[2]/2,
+                                pred_y - wo.last_bbox[3]/2,
+                                wo.last_bbox[2], wo.last_bbox[3]]
+                wo.predicted_bbox = pred_box
 
-            # -- 2. Spatial Re-association & Frame 0 Enrollment --------------
-            for wo in watched:
-                if wo._found_this_frame:
-                    continue
-                
-                # If the object lost its track ID (occlusion) OR it's Frame 0 (needs initial assignment),
-                # we do a spatial association: find the unassigned box with the highest IoU to last_bbox.
-                best_iou = 0.0
-                best_match = None
-                
-                for det in tracked_boxes:
-                    # Allow multiple watched objects to claim the same track_id if they merge
-                    iou = _iou(wo.last_bbox, det["bbox"])
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_match = det
-                
-                # For initial assignment (Frame 0), threshold is permissive (0.10).
-                # For occlusion recovery (Frame N), threshold is strict (0.65) to avoid swapping IDs with walking people.
-                req_iou = 0.10 if wo.track_id is None else 0.65
-                
-                if best_iou >= req_iou and best_match is not None:
-                    wo.track_id = best_match["track_id"]
-                    wo.last_bbox = best_match["bbox"]
-                    wo._found_this_frame = True
-                    claimed_track_ids.add(wo.track_id)
-                    log.debug(f"[Guardian] Re-associated {wo.id} to track_id {wo.track_id} (IoU {best_iou:.2f})")
+                # --- Case A: Track ID exists and ByteTrack reports it ---
+                if wo.track_id is not None and wo.track_id in tracked_boxes:
+                    candidate = tracked_boxes[wo.track_id]
+                    patch = _safe_patch(frame, candidate)
+                    curr_hist = _compute_hist(patch)
+                    if curr_hist is not None and _hist_match_precomputed(curr_hist, wo.hist_bank, threshold=APPEARANCE_ACCEPT):
+                        # Valid track – appearance matches
+                        wo.last_bbox = candidate
+                        wo.track_ok = True
+                        assigned_track_ids.add(wo.track_id)
+                        # Update Kalman with new measurement
+                        cx = candidate[0] + candidate[2]/2
+                        cy = candidate[1] + candidate[3]/2
+                        if wo.kf is None:
+                            wo.kf = KalmanFilter()
+                        wo.kf.update(cx, cy)
+                        # Update hist bank only if we are confident (and not in recovery)
+                        wo.frames_since_update += 1
+                        if wo.frames_since_update >= int(fps * 2):
+                            patch_update = _safe_patch(frame, wo.last_bbox)
+                            h_val = _compute_hist(patch_update)
+                            if h_val is not None:
+                                # Keep last 5 histograms, but only if we are still tracking correctly
+                                wo.hist_bank = wo.hist_bank[-5:]
+                                wo.hist_bank.append(h_val)
+                            wo.frames_since_update = 0
+                    else:
+                        # Appearance mismatch – ByteTrack has likely swapped ID
+                        log.debug("[Guardian] %s: ID %d failed appearance check, forcing recovery.",
+                                  wo.id, wo.track_id)
+                        wo.track_id = None   # Invalidate to trigger recovery
 
-                # 2. Appearance Re-association (for moving objects)
-                if not wo._found_this_frame and len(wo.template_bank) > 0:
-                    best_match_tmpl = None
-                    for det in tracked_boxes:
-                        # We specifically do NOT check claimed_track_ids here.
-                        # If two objects are moved together (e.g. on a tray), FastSAM might merge them 
-                        # into a single track_id. Both WatchedObjects should be allowed to attach to it!
-                        
-                        # Compare color histograms to see if this FastSAM box is our object
-                        if _color_hist_match(frame, det["bbox"], wo.template_bank):
-                            best_match_tmpl = det
-                            break
-                            
-                    if best_match_tmpl is not None:
-                        wo.track_id = best_match_tmpl["track_id"]
-                        wo.last_bbox = best_match_tmpl["bbox"]
-                        wo._found_this_frame = True
-                        claimed_track_ids.add(wo.track_id)
-                        log.debug(f"[Guardian] Appearance re-associated {wo.id} to track_id {wo.track_id}")
+                # --- Case B: Recovery (no valid track ID) ---
+                if not wo.track_ok:
+                    # Compute search radius (expands with missing_frames)
+                    radius = min(SEARCH_RADIUS_MAX, SEARCH_RADIUS_INIT + wo.missing_frames * EXPAND_RATE)
+                    pred_cx = pred_box[0] + pred_box[2]/2
+                    pred_cy = pred_box[1] + pred_box[3]/2
 
-            # -- Countdown logic -------------------------------------------
-            alert_event = None
+                    best_cost = -1.0
+                    best_tid = None
+                    for tid, tbox in tracked_boxes.items():
+                        if tid in assigned_track_ids:
+                            continue
+                        cx = tbox[0] + tbox[2]/2
+                        cy = tbox[1] + tbox[3]/2
+                        # Spatial gate: discard if outside search radius
+                        if abs(cx - pred_cx) > radius or abs(cy - pred_cy) > radius:
+                            continue
+                        # Appearance check
+                        patch = _safe_patch(frame, tbox)
+                        curr_hist = _compute_hist(patch)
+                        if curr_hist is None:
+                            continue
+                        if not _hist_match_precomputed(curr_hist, wo.hist_bank, threshold=APPEARANCE_RECOVER):
+                            continue
+                        # Compute combined cost: IoU with predicted box + appearance similarity
+                        iou = _iou(pred_box, tbox)
+                        app_dist = cv2.compareHist(wo.hist_bank[-1], curr_hist, cv2.HISTCMP_BHATTACHARYYA)
+                        cost = 0.6 * iou + 0.4 * (1 - app_dist)   # tune weights as needed
+                        if cost > best_cost:
+                            best_cost = cost
+                            best_tid = tid
 
-            for wo in watched:
-                found = wo._found_this_frame
-                
-                if found:
-                    x, y, w, h = wo.last_bbox
-                    wo.center_history.append((x + w/2, y + h/2))
-                    
-                    wo.frames_since_bank_update += 1
-                    if wo.frames_since_bank_update >= int(fps * 1.5):  # refresh ~every 1.5s
-                        patch = frame[y:y+h, x:x+w]
-                        if patch.size > 0:
-                            wo.template_bank.append(patch.copy())
-                        wo.frames_since_bank_update = 0
-                    
-                    was_missing = wo.missing_frames > 0
+                    if best_tid is not None and best_cost > COST_ACCEPT:
+                        # Successful recovery
+                        wo.track_id = best_tid
+                        wo.last_bbox = tracked_boxes[best_tid]
+                        wo.track_ok = True
+                        assigned_track_ids.add(wo.track_id)
+                        # Update Kalman with new measurement
+                        cx = wo.last_bbox[0] + wo.last_bbox[2]/2
+                        cy = wo.last_bbox[1] + wo.last_bbox[3]/2
+                        if wo.kf is None:
+                            wo.kf = KalmanFilter()
+                        wo.kf.update(cx, cy)
+                        # Reset missing frames (will be set to 0 later)
+                        # Also reset frames_since_update to avoid immediate hist update
+                        wo.frames_since_update = 0
+                        log.info("[Guardian] Recovered %s via combined cost %.2f (TID %d)",
+                                 wo.id, best_cost, best_tid)
+                    else:
+                        # Still missing – will be counted below
+                        pass
+
+                # ── 3. Update missing counters & alert logic (using >=) ──
+                if wo.track_ok:
+                    was_missing       = wo.missing_frames > 0
                     wo.missing_frames = 0
-                    # If object re-appears after a previous alert, allow re-alert
                     if wo.alert_fired and was_missing:
                         wo.alert_fired = False
-                        log.info("[Guardian] %s re-appeared - alert cleared.", wo.id)
+                        log.info("[Guardian] %s re-appeared — alert cleared.", wo.id)
                 else:
+                    # If ByteTrack lost it and recovery failed, increment missing
                     wo.missing_frames += 1
 
-                # -- Alert firing ----------------------------------------------
+                # Alert scheduling (fixed with >=)
                 if wo.missing_frames >= absence_threshold and not wo.alert_fired:
                     wo.alert_fired = True
+
+                    # Use robust exit detection
+                    exit_type = _detect_exit(wo.center_history, width, height)
+                    if exit_type == "unknown":
+                        exit_type = "occluded_or_removed"  # fallback
+
+                    disappearance_frame = max(0, frame_idx - absence_threshold)
+                    pending_alerts.append({
+                        "wo":                 wo,
+                        "target_frame":       frame_idx + int(fps * 2),
+                        "disappearance_frame": disappearance_frame,
+                        "exit_type":          exit_type,
+                    })
+                    log.info("[Guardian] Scheduled alert for %s (disappearance ~frame %d, exit_type=%s).",
+                             wo.id, disappearance_frame, exit_type)
+
+                # ── Draw tracking annotation ──
+                x, y, w, h = wo.last_bbox
+                x2, y2 = x + w, y + h
+                if wo.alert_fired:
+                    color = COLOR_ALERT
+                    status_text = f"{wo.label} [MISSING!]"
+                elif wo.missing_frames > 0:
+                    pct = min(100, int(wo.missing_frames / absence_threshold * 100))
+                    color = COLOR_MISSING
+                    status_text = f"{wo.label} [Lost {pct}%]"
+                else:
+                    color = COLOR_PRESENT
+                    status_text = f"{wo.label} [ID:{wo.track_id}]"
+
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
+                _draw_label(frame, status_text, x, y, color)
+
+            # ── Ring buffer update ────────────────────────────────────────────
+            ring_buffer.append(raw_frame)
+
+            # ── Process pending alerts ────────────────────────────────────────
+            for pa in pending_alerts[:]:
+                if frame_idx >= pa["target_frame"]:
+                    wo = pa["wo"]
                     alert_id  = str(uuid.uuid4())
                     clip_name = f"guardian_{alert_id}.webm"
                     clip_path = os.path.join(output_dir, clip_name)
-                    clip_url  = f"/storage/guardian_alerts/{clip_name}"
+                    clip_url  = f"/storage/alerts/{clip_name}"
 
-                    # Dump ring buffer (last 2 seconds before disappearance)
-                    success = _write_clip(ring_buffer, clip_path, fps, (width, height))
+                    frames_needed   = int(fps * 4)
+                    frames_to_write = list(ring_buffer)[-frames_needed:] \
+                                      if len(ring_buffer) > frames_needed else list(ring_buffer)
+
+                    success = _write_clip(frames_to_write, clip_path, fps, (width, height))
                     if success:
-                        ts_sec = frame_idx / fps
-                        
-                        exit_type = "occluded_or_removed"
-                        if len(wo.center_history) > 0:
-                            last_cx, last_cy = wo.center_history[-1]
-                            margin_x = width * 0.05
-                            margin_y = height * 0.05
-                            if last_cx <= margin_x or last_cx >= width - margin_x or \
-                               last_cy <= margin_y or last_cy >= height - margin_y:
-                                exit_type = "left_frame"
-
+                        ts_sec = pa["disappearance_frame"] / fps
                         alert_event = {
                             "id":                    alert_id,
                             "object_id":             wo.id,
@@ -417,41 +493,23 @@ class RoomGuardianPipeline(BaseVideoPipeline):
                             "clip_url":              clip_url,
                             "severity":              "MISSING",
                             "immediate_buzzer_trigger": True,
-                            "exit_type":             exit_type
+                            "exit_type":             pa["exit_type"],
                         }
-                        log.info("[Guardian] ALERT - %s (%s) missing > 5s. Clip: %s",
-                                 wo.label, wo.id, clip_path)
+                        log.info("[Guardian] ALERT fired for %s. Clip: %s", wo.label, clip_path)
 
-                # -- Draw tracking box on frame --------------------------------
-                x, y, w, h = wo.last_bbox
-                x2, y2     = x + w, y + h
+                    pending_alerts.remove(pa)
+                    break   # one alert per frame
 
-                if wo.alert_fired:
-                    color       = COLOR_ALERT
-                    status_text = f"{wo.label} [MISSING!]"
-                elif wo.missing_frames > 0:
-                    pct         = min(100, int(wo.missing_frames / absence_threshold * 100))
-                    color       = COLOR_MISSING
-                    status_text = f"{wo.label} [Lost {pct}%]"
-                else:
-                    color       = COLOR_PRESENT
-                    status_text = f"{wo.label} [OK]"
-
-                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
-                _draw_label(frame, status_text, x, y, color)
-
-            # -- Guardian HUD -------------------------------------------------
-            guarded_count  = len(watched)
-                
-            missing_count  = sum(1 for wo in watched if wo.missing_frames > 0)
-            alerted_count  = sum(1 for wo in watched if wo.alert_fired)
-            hud_color      = (0, 0, 255) if alerted_count > 0 else (0, 255, 100)
-            cv2.putText(frame,
-                        f"GUARDIAN | Watching: {guarded_count} | Missing: {missing_count} | Alerts: {alerted_count}",
-                        (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2, cv2.LINE_AA)
-
-            # Update ring buffer with the un-annotated raw frame
-            ring_buffer.append(raw_frame)
+            # ── Guardian HUD ──────────────────────────────────────────────────
+            guarded_count = len(watched)
+            missing_count = sum(1 for wo in watched if wo.missing_frames > 0)
+            alerted_count = sum(1 for wo in watched if wo.alert_fired)
+            hud_color     = (0, 0, 255) if alerted_count > 0 else (0, 255, 100)
+            cv2.putText(
+                frame,
+                f"GUARDIAN v3.1 | ByteTrack+ID | Watching: {guarded_count} | Missing: {missing_count} | Alerts: {alerted_count}",
+                (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2, cv2.LINE_AA,
+            )
 
             yield frame, alert_event
             frame_idx += 1

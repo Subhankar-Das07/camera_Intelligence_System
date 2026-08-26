@@ -1,0 +1,11 @@
+﻿# requirements_openvino.txt
+# ============================================================
+# Optional OpenVINO dependencies for NewIntrusionPipeline.
+# The main requirements.txt is untouched.
+# Install with: pip install -r requirements_openvino.txt
+# ============================================================
+openvino>=2024.0.0
+openvino-dev[pytorch]>=2024.0.0
+
+# Optional: performance profiler for benchmark script
+psutil

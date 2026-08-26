@@ -180,7 +180,15 @@ class FaceRecognizer:
                     state.last_result = result
                     return result
                 else:
-                    # Auto register is false (e.g. Attendance Mode). Return unknown.
+                    # Auto register is false (e.g. Attendance Mode).
+                    # Send to pending approvals queue.
+                    req_id = self._identity_manager.add_pending_identity(
+                        embeddings=emb_matrix,
+                        face_crops=crops[:3],
+                    )
+                    log.info("[Recognizer] Track %d → UNKNOWN face queued for approval (%s).",
+                             track_id, req_id)
+                    
                     self._commit(state, "unknown", "unknown", "Unregistered", 0.0, tracker, track_id)
                     result = RecognitionResult("unknown", "Unregistered", None, 0.0)
                     state.last_result = result

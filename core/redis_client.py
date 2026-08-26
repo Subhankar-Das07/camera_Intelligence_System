@@ -28,6 +28,7 @@ def get_redis() -> redis.Redis:
                 decode_responses=False,
                 socket_connect_timeout=5,
                 socket_timeout=30,
+                protocol=2,
             )
             _client.ping()
         return _client
