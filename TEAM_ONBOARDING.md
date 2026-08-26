@@ -47,6 +47,7 @@ You must be able to open the private GitHub repo and pull the Docker image (ask 
 | API server | FastAPI, Uvicorn, python-multipart, WebSockets |
 | Computer vision | OpenCV, Ultralytics YOLO, NumPy, Shapely |
 | Zone Safety | Pipelines: intrusion, danger zone, fall detection |
+| Site Admin | FastAPI routes, Redis store, **requests** (DVR HTTP snapshots), OpenCV |
 | Face | InsightFace (SCRFD + ArcFace), ONNX Runtime, FAISS, Supervision (ByteTrack), Pillow |
 | Vehicle | YOLO + RapidOCR (ONNX) |
 | Database | **Redis only** (vehicles, face identities/embeddings/crops, session caches). Uploads & alert clips on Docker volume `app_storage` |

@@ -13,7 +13,12 @@
     roi: [],
     previewUrl: "",
     monitorSessionId: null,
+    monitorCameraPick: "",
     monitorPoll: null,
+    monitorFramePoll: null,
+    monitorEventCount: 0,
+    monitorSeenEventIds: null,
+    monitorEvents: [],
     seekDragging: false,
     wasPlayingBeforeDrag: false,
     seekDebounceTimer: null,
@@ -32,6 +37,18 @@
     roiSuggestions: [],
     roiPickMode: false,
     roiSuggestBusy: false,
+    monitorSuggestions: [],
+    monitorSuggestPickMode: false,
+    monitorSuggestBusy: false,
+    monitorUseDvrPoll: false,
+    scanPreviewWizard: false,
+    scanPreviewSidebar: false,
+    scanPreviewTimer: null,
+    scanPreviewGen: 0,
+    scanPreviewApplyRules: false,
+    scanPreviewFocusCamId: "",
+    scanPreviewLastHeroAt: 0,
+    scanPreviewStatusTimer: null,
   };
 
   function emptyGateConfig() {
@@ -325,12 +342,9 @@
   function strokePoly(ctx, pts, w, h, color, fill) {
     if (!pts || pts.length < 2) return;
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    if (fill && color.startsWith("#") && pts.length >= 3) {
-      const r = parseInt(color.slice(1, 3), 16);
-      const g = parseInt(color.slice(3, 5), 16);
-      const b = parseInt(color.slice(5, 7), 16);
-      ctx.fillStyle = `rgba(${r},${g},${b},0.22)`;
+    ctx.lineWidth = fill ? 3 : 2;
+    if (fill && pts.length >= 3) {
+      ctx.fillStyle = colorWithAlpha(color, 0.22);
     }
     ctx.beginPath();
     pts.forEach((p, i) => {
@@ -346,8 +360,24 @@
     ctx.stroke();
   }
 
+  function colorWithAlpha(color, alpha) {
+    if (!color) return `rgba(34,211,238,${alpha})`;
+    if (color.startsWith("rgb(")) {
+      const m = color.match(/rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/);
+      if (m) return `rgba(${m[1]},${m[2]},${m[3]},${alpha})`;
+    }
+    if (color.startsWith("#") && color.length >= 7) {
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+    return color;
+  }
+
   function paintRuleOverlays(ctx, w, h, rule) {
     if (!rule) return;
+    const accent = rule.css_color || "#22d3ee";
     if (rule.scan_type === "gate_analytics") {
       const gc = rule.gate_config || {};
       strokePoly(ctx, gc.count_line, w, h, "#ffff00", false);
@@ -358,7 +388,7 @@
       strokePoly(ctx, zones.far, w, h, "#44cc66", true);
       return;
     }
-    strokePoly(ctx, rule.roi_normalized || [], w, h, "#22d3ee", true);
+    strokePoly(ctx, rule.roi_normalized || [], w, h, accent, true);
   }
 
   function drawRuleOntoCanvas(canvas, img, rule) {
@@ -456,7 +486,7 @@
         </div>`;
     }
     return `<div class="sa-monitor-controls sa-monitor-controls--disabled">
-        <p class="sa-muted">Live RTSP — upload a test video to scrub</p>
+        <p class="sa-muted">Live stream — upload a test video under Cameras to scrub</p>
       </div>`;
   }
 
@@ -633,11 +663,498 @@
     return `<span class="sa-badge ${cls}">${escapeHtml(h || "unknown")}</span>`;
   }
 
+  function scanningCameras() {
+    return state.cameras.filter(
+      (c) =>
+        c.enabled !== false &&
+        state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
+    );
+  }
+
+  function previewCameras() {
+    return state.cameras.filter((c) => c.enabled !== false);
+  }
+
+  function cameraHasEnabledRules(camId) {
+    return state.rules.some((r) => r.camera_id === camId && r.enabled !== false);
+  }
+
+  function previewCamerasWithRules() {
+    return previewCameras().filter((c) => cameraHasEnabledRules(c.id));
+  }
+
+  function previewCamerasWithoutRules() {
+    return previewCameras().filter((c) => !cameraHasEnabledRules(c.id));
+  }
+
+  function previewHeroApplyRules(camId) {
+    return !!(state.scanPreviewApplyRules && camId && cameraHasEnabledRules(camId));
+  }
+
+  function activeScanCameraIds() {
+    const rt = state.status?.runtime || {};
+    if (Array.isArray(rt.active_camera_ids) && rt.active_camera_ids.length) {
+      return rt.active_camera_ids;
+    }
+    const single = rt.active_camera_id || "";
+    return single ? [single] : [];
+  }
+
+  function resolvePreviewFocusCamId() {
+    const cams = previewCameras();
+    if (!cams.length) return "";
+    const activeIds = activeScanCameraIds();
+    if (state.scanPreviewFocusCamId && cams.some((c) => c.id === state.scanPreviewFocusCamId)) {
+      return state.scanPreviewFocusCamId;
+    }
+    const activeId = activeIds[0] || "";
+    if (activeId && cams.some((c) => c.id === activeId)) return activeId;
+    return cams[0].id;
+  }
+
+  function previewSnapshotUrl(camId) {
+    return `${API}/cameras/${encodeURIComponent(camId)}/snapshot?t=${Date.now()}`;
+  }
+
+  function previewHeroUrl(camId) {
+    const apply = previewHeroApplyRules(camId) ? "1" : "0";
+    return `${API}/cameras/${encodeURIComponent(camId)}/preview-frame?apply_rules=${apply}&t=${Date.now()}`;
+  }
+
+  function scanPreviewWanted() {
+    return !!(state.status?.go_live && (state.scanPreviewWizard || state.scanPreviewSidebar));
+  }
+
+  function clearScanPreviewTimer() {
+    if (state.scanPreviewTimer) {
+      clearInterval(state.scanPreviewTimer);
+      state.scanPreviewTimer = null;
+    }
+    clearPreviewStatusTimer();
+  }
+
+  function clearPreviewStatusTimer() {
+    if (state.scanPreviewStatusTimer) {
+      clearInterval(state.scanPreviewStatusTimer);
+      state.scanPreviewStatusTimer = null;
+    }
+  }
+
+  function relativePreviewTime(ts) {
+    if (!ts) return "";
+    const sec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (sec < 60) return sec + "s ago";
+    return Math.floor(sec / 60) + "m ago";
+  }
+
+  function renderPreviewStatusPanel(st) {
+    const legendEl = document.getElementById("w-preview-legend");
+    const gateEl = document.getElementById("w-preview-gate");
+    const eventsEl = document.getElementById("w-preview-events");
+    const show = !!(state.scanPreviewApplyRules && st?.active);
+    if (legendEl) {
+      if (!show) {
+        legendEl.hidden = true;
+        legendEl.innerHTML = "";
+      } else {
+        const ruleStatus = st.rule_status || st.rules || [];
+        const parallelHint =
+          (ruleStatus.length || 0) > 1
+            ? `<p class="sa-preview-parallel-hint">Parallel (up to ${st.parallel_workers || 3})</p>`
+            : "";
+        const items = ruleStatus
+          .map((r) => {
+            const dotCls =
+              r.state === "triggered" ? "sa-preview-rule-dot--triggered" : r.state === "running" ? "sa-preview-rule-dot--running" : "sa-preview-rule-dot--idle";
+            return `<div class="sa-legend-item">
+              <span class="sa-preview-rule-dot ${dotCls}"></span>
+              <span class="sa-legend-swatch" style="background:${escapeHtml(r.css_color || "#666")}"></span>
+              <span>${escapeHtml(r.name || r.id)} — ${escapeHtml(r.scan_type || "")}</span>
+            </div>`;
+          })
+          .join("");
+        legendEl.innerHTML = parallelHint + (items || '<span class="sa-muted">No rules</span>');
+        legendEl.hidden = false;
+      }
+    }
+    if (gateEl) {
+      const gl = st?.gate_live;
+      const hasGate = show && gl && (st.scan_types || []).includes("gate_analytics");
+      if (!hasGate) {
+        gateEl.hidden = true;
+        gateEl.innerHTML = "";
+      } else {
+        const gt = gl.session_totals || {};
+        gateEl.innerHTML = `
+          <span class="sa-gate-badge sa-gate-badge--${escapeHtml(gl.gate_state || "unknown")}">Gate: ${escapeHtml((gl.gate_state || "unknown").toUpperCase())}</span>
+          <div class="sa-gate-stats">
+            <span>Footfall: ${(gt.persons_in || 0) + (gt.persons_out || 0)}</span>
+            <span>People in/out: ${gt.persons_in || 0} / ${gt.persons_out || 0}</span>
+            <span>Cars in/out: ${gt.cars_in || 0} / ${gt.cars_out || 0}</span>
+            <span>Opens/closes: ${gt.gate_opens || 0} / ${gt.gate_closes || 0}</span>
+          </div>`;
+        gateEl.hidden = false;
+      }
+    }
+    if (eventsEl) {
+      const events = show ? (st.events || []).slice(-5).reverse() : [];
+      if (!events.length) {
+        eventsEl.hidden = true;
+        eventsEl.innerHTML = "";
+      } else {
+        eventsEl.innerHTML = events
+          .map(
+            (ev) =>
+              `<span class="sa-preview-event-chip" style="border-color:${escapeHtml(ev.css_color || "#666")}">
+                <span class="sa-legend-swatch" style="background:${escapeHtml(ev.css_color || "#666")}"></span>
+                ${escapeHtml(ev.message || ev.rule_name || "Event")}
+                <span class="sa-muted">${escapeHtml(relativePreviewTime(ev.ts))}</span>
+              </span>`
+          )
+          .join("");
+        eventsEl.hidden = false;
+      }
+    }
+  }
+
+  async function refreshPreviewStatus(gen) {
+    if (gen !== state.scanPreviewGen || !scanPreviewWanted() || !state.scanPreviewWizard) return;
+    if (!state.scanPreviewApplyRules) {
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    const camId = resolvePreviewFocusCamId();
+    if (!camId) {
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    try {
+      const st = await api("/cameras/" + encodeURIComponent(camId) + "/preview-status");
+      if (gen !== state.scanPreviewGen) return;
+      renderPreviewStatusPanel(st);
+    } catch (_) {
+      if (gen === state.scanPreviewGen) renderPreviewStatusPanel(null);
+    }
+  }
+
+  function ensurePreviewStatusLoop() {
+    if (!scanPreviewWanted() || !state.scanPreviewWizard || !state.scanPreviewApplyRules) {
+      clearPreviewStatusTimer();
+      renderPreviewStatusPanel(null);
+      return;
+    }
+    if (state.scanPreviewStatusTimer) return;
+    const gen = state.scanPreviewGen;
+    refreshPreviewStatus(gen);
+    state.scanPreviewStatusTimer = setInterval(() => refreshPreviewStatus(state.scanPreviewGen), 2000);
+  }
+
+  function stopScanPreview() {
+    state.scanPreviewWizard = false;
+    state.scanPreviewSidebar = false;
+    state.scanPreviewApplyRules = false;
+    state.scanPreviewFocusCamId = "";
+    state.scanPreviewLastHeroAt = 0;
+    state.scanPreviewGen += 1;
+    clearScanPreviewTimer();
+    syncScanPreviewUI();
+  }
+
+  function updatePreviewHighlights() {
+    const activeIds = new Set(activeScanCameraIds());
+    const focusId = resolvePreviewFocusCamId();
+    document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact)").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id") || "";
+      card.classList.toggle("is-active", activeIds.has(camId));
+      card.classList.toggle("is-selected", camId === focusId);
+    });
+    document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact) .sa-preview-badge").forEach((badge) => {
+      const card = badge.closest(".sa-preview-card");
+      if (card) badge.hidden = !activeIds.has(card.getAttribute("data-cam-id") || "");
+    });
+    document.querySelectorAll(".sa-preview-card-compact").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id") || "";
+      const isActive = activeIds.has(camId);
+      card.classList.toggle("is-active", isActive);
+      const badge = card.querySelector(".sa-preview-badge");
+      if (badge) badge.hidden = !isActive;
+    });
+    const heroLabel = document.getElementById("w-preview-hero-label");
+    if (heroLabel) {
+      const cam = previewCameras().find((c) => c.id === focusId);
+      heroLabel.textContent = cam ? cam.name : "";
+    }
+    syncPreviewRulesCheckbox();
+  }
+
+  function syncPreviewRulesCheckbox() {
+    const focusId = resolvePreviewFocusCamId();
+    const hasRules = !!(focusId && cameraHasEnabledRules(focusId));
+    if (!hasRules && state.scanPreviewApplyRules) {
+      state.scanPreviewApplyRules = false;
+    }
+    const rulesInner = document.getElementById("w-preview-rules-inner");
+    const rulesLabel = document.querySelector("#w-preview-grid .sa-preview-rules-check");
+    const hint = document.getElementById("w-preview-rules-hint");
+    if (rulesInner) {
+      rulesInner.disabled = !hasRules;
+      rulesInner.checked = hasRules && state.scanPreviewApplyRules;
+    }
+    if (rulesLabel) {
+      rulesLabel.classList.toggle("is-disabled", !hasRules);
+    }
+    if (hint) {
+      hint.hidden = hasRules;
+    }
+  }
+
+  function buildPreviewCardHtml(cam, compact, noRules) {
+    const activeIds = new Set(activeScanCameraIds());
+    const focusId = resolvePreviewFocusCamId();
+    const isActive = activeIds.has(cam.id);
+    const isSelected = !compact && cam.id === focusId;
+    const badge = '<span class="sa-preview-badge"' + (isActive ? "" : " hidden") + ">Scanning</span>";
+    if (compact) {
+      return `<div class="sa-preview-card sa-preview-card-compact${isActive ? " is-active" : ""}" data-cam-id="${escapeHtml(cam.id)}" title="${escapeHtml(cam.name)}">
+        <img alt="" loading="lazy" />
+        ${badge}
+      </div>`;
+    }
+    const noRulesCls = noRules ? " sa-preview-card-no-rules" : "";
+    return `<div class="sa-preview-card${noRulesCls}${isActive ? " is-active" : ""}${isSelected ? " is-selected" : ""}" data-cam-id="${escapeHtml(cam.id)}" role="button" tabindex="0" title="Show in large preview">
+      <div class="sa-preview-thumb"><img alt="" loading="lazy" /></div>
+      <div class="sa-preview-label">${escapeHtml(cam.name)}${badge}</div>
+    </div>`;
+  }
+
+  function buildPreviewGridSectionsHtml() {
+    const withRules = previewCamerasWithRules();
+    const withoutRules = previewCamerasWithoutRules();
+    const withSection = `<section class="sa-preview-group">
+      <h4 class="sa-preview-group-title">With rules</h4>
+      ${
+        withRules.length
+          ? `<div class="sa-preview-grid" data-group="with-rules">${withRules.map((c) => buildPreviewCardHtml(c, false, false)).join("")}</div>`
+          : `<p class="sa-preview-group-empty">No cameras have rules yet.</p>`
+      }
+    </section>`;
+    const noSection = `<section class="sa-preview-group">
+      <h4 class="sa-preview-group-title">No rules yet</h4>
+      ${
+        withoutRules.length
+          ? `<div class="sa-preview-grid" data-group="no-rules">${withoutRules.map((c) => buildPreviewCardHtml(c, false, true)).join("")}</div>`
+          : `<p class="sa-preview-group-empty">All cameras have rules.</p>`
+      }
+    </section>`;
+    return withSection + noSection;
+  }
+
+  function bindPreviewGridClicks() {
+    document.querySelectorAll("#w-preview-grid .sa-preview-card[data-cam-id]").forEach((card) => {
+      const camId = card.getAttribute("data-cam-id");
+      if (!camId) return;
+      card.onclick = () => {
+        state.scanPreviewFocusCamId = camId;
+        updatePreviewHighlights();
+        state.scanPreviewGen += 1;
+        clearPreviewStatusTimer();
+        refreshHeroPreview(state.scanPreviewGen);
+        ensurePreviewStatusLoop();
+      };
+    });
+  }
+
+  function refreshHeroPreview(gen) {
+    if (gen !== state.scanPreviewGen || !scanPreviewWanted() || !state.scanPreviewWizard) return Promise.resolve();
+    const camId = resolvePreviewFocusCamId();
+    const img = document.getElementById("w-preview-hero-img");
+    if (!img || !camId) return Promise.resolve();
+    const apply = previewHeroApplyRules(camId);
+    const url = previewHeroUrl(camId);
+    return new Promise((resolve) => {
+      img.onerror = () => {
+        img.classList.add("sa-preview-error");
+        resolve();
+      };
+      img.onload = () => {
+        img.classList.remove("sa-preview-error");
+        resolve();
+      };
+      img.src = url;
+      state.scanPreviewLastHeroAt = Date.now();
+      updatePreviewHighlights();
+    });
+  }
+
+  async function refreshPreviewFrames(gen) {
+    const cams = previewCameras();
+    for (let i = 0; i < cams.length; i += 1) {
+      if (gen !== state.scanPreviewGen || !scanPreviewWanted()) return;
+      const cam = cams[i];
+      const url = previewSnapshotUrl(cam.id);
+      document.querySelectorAll(`.sa-preview-card[data-cam-id="${CSS.escape(cam.id)}"] img`).forEach((img) => {
+        img.onerror = () => img.classList.add("sa-preview-error");
+        img.onload = () => img.classList.remove("sa-preview-error");
+        img.src = url;
+      });
+      if (i < cams.length - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      }
+    }
+    const heroInterval = previewHeroApplyRules(resolvePreviewFocusCamId()) ? 6000 : 4000;
+    const due = Date.now() - (state.scanPreviewLastHeroAt || 0) >= heroInterval;
+    if (state.scanPreviewWizard && due) {
+      await refreshHeroPreview(gen);
+    }
+    updatePreviewHighlights();
+  }
+
+  function ensureScanPreviewLoop() {
+    if (!scanPreviewWanted() || document.hidden) {
+      clearScanPreviewTimer();
+      return;
+    }
+    if (state.scanPreviewTimer) return;
+    const tick = async () => {
+      if (!scanPreviewWanted() || document.hidden) return;
+      try {
+        state.status = await api("/status");
+        if (!state.status?.go_live) {
+          stopScanPreview();
+          return;
+        }
+        const live = !!state.status.go_live;
+        document.getElementById("live-dot").className = "sa-dot " + (live ? "on" : "off");
+        document.getElementById("live-label").textContent = live ? "Scanning" : "Idle";
+      } catch (_) {
+        /* ignore */
+      }
+      await refreshPreviewFrames(state.scanPreviewGen);
+      updatePreviewHighlights();
+    };
+    tick();
+    state.scanPreviewTimer = setInterval(tick, 4000);
+  }
+
+  function syncScanPreviewUI() {
+    const live = !!state.status?.go_live;
+    const toggleBtn = document.getElementById("live-preview-toggle");
+    const strip = document.getElementById("live-preview-strip");
+
+    if (toggleBtn) {
+      toggleBtn.hidden = !live;
+      toggleBtn.textContent = state.scanPreviewSidebar ? "Hide preview" : "Show preview";
+    }
+    if (strip) {
+      strip.hidden = !live || !state.scanPreviewSidebar;
+      if (!strip.hidden) {
+        const cams = previewCameras();
+        const stripKey = cams.map((c) => c.id).join("|");
+        if (strip.dataset.stripKey !== stripKey) {
+          strip.dataset.stripKey = stripKey;
+          strip.innerHTML = cams.length
+            ? cams.map((c) => buildPreviewCardHtml(c, true)).join("")
+            : '<p class="sa-preview-placeholder">No enabled cameras</p>';
+        }
+      }
+    }
+
+    const wToggle = document.getElementById("w-preview-toggle");
+    const wGrid = document.getElementById("w-preview-grid");
+    if (wToggle) {
+      wToggle.textContent = state.scanPreviewWizard ? "Hide preview" : "Show preview";
+    }
+    if (wGrid) {
+      wGrid.hidden = !live || !state.scanPreviewWizard;
+      if (!wGrid.hidden) {
+        const withRules = previewCamerasWithRules();
+        const withoutRules = previewCamerasWithoutRules();
+        const gridKey = `${withRules.map((c) => c.id).join("|")}||${withoutRules.map((c) => c.id).join("|")}`;
+        if (wGrid.dataset.gridKey !== gridKey || !wGrid.querySelector(".sa-preview-group")) {
+          wGrid.dataset.gridKey = gridKey;
+          const total = withRules.length + withoutRules.length;
+          wGrid.innerHTML = total
+            ? `<label class="sa-preview-rules-check"><input type="checkbox" id="w-preview-rules-inner"${state.scanPreviewApplyRules ? " checked" : ""}> Apply rules on preview</label>
+               <p class="sa-preview-rules-hint" id="w-preview-rules-hint" hidden>Select a camera with rules to preview overlays.</p>
+               <div class="sa-preview-hero">
+                 <img id="w-preview-hero-img" alt="" />
+                 <div id="w-preview-gate" class="sa-gate-live sa-preview-gate" hidden></div>
+                 <div id="w-preview-legend" class="sa-preview-legend" hidden></div>
+                 <div id="w-preview-events" class="sa-preview-events" hidden></div>
+                 <span class="sa-preview-hero-label" id="w-preview-hero-label"></span>
+               </div>
+               ${buildPreviewGridSectionsHtml()}`
+            : '<p class="sa-preview-placeholder">Add enabled cameras to preview.</p>';
+          const rulesInner = document.getElementById("w-preview-rules-inner");
+          if (rulesInner) {
+            rulesInner.onchange = () => {
+              if (rulesInner.disabled) return;
+              state.scanPreviewApplyRules = rulesInner.checked;
+              state.scanPreviewLastHeroAt = 0;
+              state.scanPreviewGen += 1;
+              clearPreviewStatusTimer();
+              refreshHeroPreview(state.scanPreviewGen);
+              ensurePreviewStatusLoop();
+            };
+          }
+          bindPreviewGridClicks();
+          syncPreviewRulesCheckbox();
+        } else {
+          syncPreviewRulesCheckbox();
+        }
+        updatePreviewHighlights();
+      }
+    }
+
+    if (scanPreviewWanted()) {
+      ensureScanPreviewLoop();
+      ensurePreviewStatusLoop();
+    } else {
+      clearScanPreviewTimer();
+      renderPreviewStatusPanel(null);
+    }
+  }
+
+  function toggleScanPreviewSidebar() {
+    state.scanPreviewSidebar = !state.scanPreviewSidebar;
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  }
+
+  function toggleScanPreviewWizard() {
+    state.scanPreviewWizard = !state.scanPreviewWizard;
+    if (state.scanPreviewWizard && !state.scanPreviewFocusCamId) {
+      state.scanPreviewFocusCamId = resolvePreviewFocusCamId();
+    }
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      state.scanPreviewLastHeroAt = 0;
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  }
+
   async function refresh() {
     state.status = await api("/status");
     const live = !!state.status.go_live;
+    if (!live && (state.scanPreviewWizard || state.scanPreviewSidebar)) {
+      state.scanPreviewWizard = false;
+      state.scanPreviewSidebar = false;
+      state.scanPreviewApplyRules = false;
+      state.scanPreviewFocusCamId = "";
+      state.scanPreviewLastHeroAt = 0;
+      state.scanPreviewGen += 1;
+      clearScanPreviewTimer();
+    }
     document.getElementById("live-dot").className = "sa-dot " + (live ? "on" : "off");
     document.getElementById("live-label").textContent = live ? "Scanning" : "Idle";
+    syncScanPreviewUI();
+    if (scanPreviewWanted()) {
+      updatePreviewHighlights();
+    }
   }
 
   async function loadLists() {
@@ -647,7 +1164,8 @@
   }
 
   function syncNavActive(view) {
-    const rulesFamily = view === "rules" || view === "staff" || view === "vehicles";
+    const rulesFamily =
+      view === "rules" || view === "staff" || view === "vehicles" || view === "journeys";
     document.querySelectorAll(".sa-tabs [data-view]").forEach((b) => {
       const v = b.getAttribute("data-view");
       if (b.classList.contains("sa-nav-parent") && v === "rules") {
@@ -665,16 +1183,24 @@
     if (state.view === "monitor" && view !== "monitor") {
       stopMonitorIfAny();
     }
+    if (state.view === "wizard" && view !== "wizard") {
+      state.scanPreviewWizard = false;
+      if (!state.scanPreviewSidebar) {
+        state.scanPreviewGen += 1;
+        clearScanPreviewTimer();
+      }
+    }
     if (!isAdmin() && ADMIN_VIEWS.includes(view)) {
       view = "alerts";
     }
     state.view = view;
     syncNavActive(view);
     render();
+    syncScanPreviewUI();
   }
 
   function render() {
-    const views = { wizard, cameras, rules, staff, vehicles, monitor, alerts, reports, settings };
+    const views = { wizard, cameras, rules, staff, vehicles, monitor, journeys, alerts, reports, settings };
     (views[state.view] || wizard)();
   }
 
@@ -744,6 +1270,8 @@
   }
 
   async function stopMonitorIfAny() {
+    clearMonitorFramePoll();
+    resetMonitorEventTracking();
     if (!state.monitorSessionId) return;
     const sid = state.monitorSessionId;
     state.monitorSessionId = null;
@@ -768,12 +1296,19 @@
         <div class="sa-card"><h3>Rules</h3><div class="sa-stat">${state.status?.rules ?? 0}</div></div>
         <div class="sa-card"><h3>Recent alerts</h3><div class="sa-stat">${state.status?.alerts ?? 0}</div></div>
         <div class="sa-card"><h3>WhatsApp</h3><p>${state.status?.whatsapp_configured ? "API configured" : "Not configured (web alerts still work)"}</p></div>
+        <div class="sa-card"><h3>Email</h3><p>${state.status?.email_configured ? "SMTP configured" : "Not configured — set SMTP_* in .env"}</p></div>
       </div>
       <div class="sa-steps">
         <section class="sa-step">
           <h3>Site profile</h3>
           <div class="sa-form">
             <div class="sa-field"><label>Site name</label><input class="text-input" id="w-name" value="${escapeHtml(s.name)}"></div>
+            <div class="sa-field"><label>Contact name</label><input class="text-input" id="w-contact-name" placeholder="Primary contact" value="${escapeHtml(s.contact_name || "")}"></div>
+            <div class="sa-field">
+              <label>Contact email</label>
+              <input class="text-input" id="w-contact-email" type="email" placeholder="you@example.com" value="${escapeHtml(s.contact_email || "")}">
+              <p class="sa-muted sa-field-hint">Saved for alerts and further communication.</p>
+            </div>
             <div class="sa-field"><label>Type</label>
               <select id="w-type" class="text-input">
                 <option value="shop"${s.type === "shop" ? " selected" : ""}>Shop</option>
@@ -783,6 +1318,7 @@
             </div>
             <div class="sa-field"><label>Timezone</label><input class="text-input" id="w-tz" value="${escapeHtml(s.timezone || "Asia/Kolkata")}"></div>
             <button class="btn primary" id="w-save-site" type="button"${isAdmin() ? "" : " disabled"}>Save site</button>
+            <span class="sa-muted" id="w-site-msg"></span>
           </div>
         </section>
         <section class="sa-step">
@@ -807,37 +1343,71 @@
             <button class="btn primary" type="button" id="w-live"${isAdmin() ? "" : " disabled"}>${s.go_live ? "Stop scanning" : "Start scanning"}</button>
             <span class="sa-muted" id="w-msg"></span>
           </div>
+          ${
+            s.go_live
+              ? `<div class="sa-golive-preview">
+            <p class="sa-muted">On-demand preview — verify all cameras while scanning. Stops when hidden or you leave this page.</p>
+            <button class="btn secondary" type="button" id="w-preview-toggle">${state.scanPreviewWizard ? "Hide preview" : "Show preview"}</button>
+            <div id="w-preview-grid" class="sa-golive-preview-grid"${state.scanPreviewWizard ? "" : " hidden"}></div>
+          </div>`
+              : ""
+          }
         </section>
       </div>`;
     document.getElementById("w-to-cam").onclick = () => go("cameras");
     document.getElementById("w-to-rules").onclick = () => go("rules");
     document.getElementById("w-to-mon").onclick = () => go("monitor");
     document.getElementById("w-save-site").onclick = async () => {
+      const contactEmail = (document.getElementById("w-contact-email")?.value || "").trim();
+      const siteMsg = document.getElementById("w-site-msg");
+      if (!contactEmail || !contactEmail.includes("@")) {
+        if (siteMsg) siteMsg.textContent = "Enter a valid contact email to save.";
+        return;
+      }
       try {
         await api("/site", {
           json: {
             name: document.getElementById("w-name").value,
+            contact_name: (document.getElementById("w-contact-name")?.value || "").trim(),
+            contact_email: contactEmail,
             type: document.getElementById("w-type").value,
             timezone: document.getElementById("w-tz").value,
           },
         });
         await refresh();
+        const msg =
+          state.status?.email_configured
+            ? "Saved — confirmation email sent if SMTP is working."
+            : "Saved (SMTP not configured — alerts email needs .env SMTP_*).";
+        if (siteMsg) siteMsg.textContent = msg;
         document.getElementById("w-msg") && (document.getElementById("w-msg").textContent = "Saved");
       } catch (e) {
-        alert(e.message);
+        if (siteMsg) siteMsg.textContent = e.message || "Save failed";
       }
     };
     document.getElementById("w-live").onclick = async () => {
       try {
+        const turningOff = !!s.go_live;
         await api("/site", {
           json: { go_live: !s.go_live, setup_complete: true },
         });
+        if (turningOff) {
+          stopScanPreview();
+        }
         await refresh();
+        await loadLists();
         wizard();
       } catch (e) {
         alert(e.message);
       }
     };
+    document.getElementById("w-preview-toggle") &&
+      (document.getElementById("w-preview-toggle").onclick = toggleScanPreviewWizard);
+    syncScanPreviewUI();
+    if (state.scanPreviewWizard && scanPreviewWanted()) {
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
   }
 
   function cameras() {
@@ -861,18 +1431,40 @@
       )
       .join("");
     main.innerHTML = `
-      <div class="sa-h"><div><h2>Cameras</h2><p>Live RTSP for production. Upload a video to test without CCTV.</p></div></div>
+      <div class="sa-h"><div><h2>Cameras</h2><p>Add DVR (HTTP snapshot) or NVR (RTSP). Upload a video to test without CCTV.</p></div></div>
       ${
         isAdmin()
           ? `<div class="sa-card" style="margin-bottom:1rem;">
-        <h3>Add live CCTV (RTSP)</h3>
+        <h3>Add live CCTV</h3>
         <div class="sa-form" style="margin-top:0.7rem;">
-          <div class="sa-field"><label>Name</label><input class="text-input" id="c-name" placeholder="Entrance"></div>
-          <div class="sa-field"><label>RTSP URL</label><input class="text-input" id="c-url" placeholder="rtsp://user:pass@nvr:554/..."></div>
+          <div class="sa-field"><label>Name</label><input class="text-input" id="c-name" placeholder="Kitchen"></div>
+          <div class="sa-field">
+            <label>Device type</label>
+            <select class="text-input" id="c-device-type">
+              <option value="dvr">DVR (HTTP snapshot)</option>
+              <option value="rtsp">NVR (RTSP)</option>
+            </select>
+          </div>
+          <div id="c-dvr-fields">
+            <div class="sa-field">
+              <label>HTTP snapshot URL</label>
+              <input class="text-input" id="c-snapshot-url" placeholder="http://192.168.1.100/ISAPI/Streaming/channels/101/picture">
+              <p class="sa-muted sa-field-hint">Hikvision channels: 101, 201, 301 … 801 (cam 1–8 main stream)</p>
+            </div>
+            <div class="sa-field"><label>Username</label><input class="text-input" id="c-http-user" placeholder="admin" autocomplete="username"></div>
+            <div class="sa-field"><label>Password</label><input class="text-input" id="c-http-pass" type="password" placeholder="••••••" autocomplete="current-password"></div>
+          </div>
+          <div id="c-rtsp-fields" hidden>
+            <div class="sa-field"><label>RTSP URL</label><input class="text-input" id="c-rtsp-url" placeholder="rtsp://user:pass@nvr:554/Streaming/Channels/101"></div>
+          </div>
           <div class="sa-row">
             <button class="btn secondary" type="button" id="c-test">Test connection</button>
             <button class="btn primary" type="button" id="c-save" style="width:auto;">Save camera</button>
             <span id="c-msg" class="sa-muted"></span>
+          </div>
+          <div id="c-preview-wrap" class="sa-camera-preview" hidden>
+            <img id="c-preview-img" alt="Camera test preview">
+            <span id="c-preview-meta" class="sa-muted"></span>
           </div>
         </div>
         <div class="divider-or">— OR —</div>
@@ -890,18 +1482,79 @@
       </table>`;
 
     const msg = document.getElementById("c-msg");
+    const deviceType = document.getElementById("c-device-type");
+    const dvrFields = document.getElementById("c-dvr-fields");
+    const rtspFields = document.getElementById("c-rtsp-fields");
+    const previewWrap = document.getElementById("c-preview-wrap");
+    const previewImg = document.getElementById("c-preview-img");
+    const previewMeta = document.getElementById("c-preview-meta");
+
+    function syncCameraDeviceFields() {
+      const isDvr = deviceType?.value === "dvr";
+      if (dvrFields) dvrFields.hidden = !isDvr;
+      if (rtspFields) rtspFields.hidden = isDvr;
+      state.previewUrl = "";
+      if (previewWrap) previewWrap.hidden = true;
+      if (previewImg) previewImg.removeAttribute("src");
+      if (previewMeta) previewMeta.textContent = "";
+      if (msg) {
+        msg.textContent = "";
+        msg.className = "sa-muted";
+      }
+    }
+
+    function cameraTestPayload() {
+      const isDvr = deviceType?.value === "dvr";
+      const base = { name: document.getElementById("c-name")?.value || "Camera" };
+      if (isDvr) {
+        return {
+          ...base,
+          type: "dvr",
+          snapshot_url: document.getElementById("c-snapshot-url")?.value || "",
+          http_user: document.getElementById("c-http-user")?.value || "",
+          http_password: document.getElementById("c-http-pass")?.value || "",
+        };
+      }
+      return {
+        ...base,
+        type: "rtsp",
+        rtsp_url: document.getElementById("c-rtsp-url")?.value || "",
+      };
+    }
+
+    function showCameraPreview(r) {
+      state.previewUrl = r.preview_url || "";
+      if (!previewWrap || !previewImg) return;
+      if (state.previewUrl) {
+        previewWrap.hidden = false;
+        previewImg.src = state.previewUrl + "?t=" + Date.now();
+        if (previewMeta) {
+          previewMeta.textContent = r.width && r.height ? `${r.width}×${r.height}` : "";
+        }
+      } else {
+        previewWrap.hidden = true;
+      }
+    }
+
+    if (deviceType) {
+      deviceType.onchange = syncCameraDeviceFields;
+      syncCameraDeviceFields();
+    }
+
     const testBtn = document.getElementById("c-test");
     if (testBtn) {
       testBtn.onclick = async () => {
         msg.textContent = "Testing…";
+        msg.className = "sa-muted";
         try {
-          const r = await api("/cameras/test-rtsp", {
-            json: { name: document.getElementById("c-name").value, rtsp_url: document.getElementById("c-url").value, type: "rtsp" },
-          });
-          state.previewUrl = r.preview_url;
-          msg.textContent = "Online — frames received";
+          const r = await api("/cameras/test-connection", { json: cameraTestPayload() });
+          showCameraPreview(r);
+          msg.textContent = deviceType?.value === "dvr" ? "Online — snapshot received" : "Online — frames received";
           msg.className = "sa-ok";
         } catch (e) {
+          state.previewUrl = "";
+          if (previewWrap) previewWrap.hidden = true;
+          if (previewImg) previewImg.removeAttribute("src");
           msg.textContent = e.message;
           msg.className = "sa-error";
         }
@@ -911,16 +1564,13 @@
     if (saveBtn) {
       saveBtn.onclick = async () => {
         try {
-          await api("/cameras", {
-            json: {
-              name: document.getElementById("c-name").value || "Camera",
-              type: "rtsp",
-              rtsp_url: document.getElementById("c-url").value,
-              preview_url: state.previewUrl || "",
-              enabled: true,
-              health: state.previewUrl ? "online" : "unknown",
-            },
-          });
+          const payload = {
+            ...cameraTestPayload(),
+            preview_url: state.previewUrl || "",
+            enabled: true,
+            health: state.previewUrl ? "online" : "unknown",
+          };
+          await api("/cameras", { json: payload });
           await loadLists();
           cameras();
         } catch (e) {
@@ -991,7 +1641,7 @@
               </button>
             </td>`
           : `<td class="sa-rule-thumb-cell"><span class="sa-alert-thumb sa-alert-thumb--empty">No preview</span></td>`;
-        return `<tr>
+        return `<tr data-rule-camera-id="${escapeHtml(r.camera_id)}">
           ${thumbCell}
           <td>${escapeHtml(r.name)}</td>
           <td>${escapeHtml(cam?.name || r.camera_id)}</td>
@@ -1011,6 +1661,7 @@
         <div class="sa-row">
           <button class="btn secondary" type="button" id="r-goto-staff">Staff</button>
           <button class="btn secondary" type="button" id="r-goto-vehicles">Vehicles</button>
+          <button class="btn secondary" type="button" id="r-goto-journeys">Journeys</button>
         </div>
       </div>
       ${
@@ -1019,6 +1670,7 @@
         <div class="sa-form">
           <div class="sa-field"><label>Rule name</label><input class="text-input" id="r-name" placeholder="Main gate"></div>
           <div class="sa-field"><label>Camera</label><select class="text-input" id="r-cam">${camOpts}</select></div>
+          <p class="sa-muted" id="r-cam-limit-hint"></p>
           <div class="sa-field">
             <label class="sa-label-row">Scan type
               <button type="button" class="sa-info-btn" id="r-type-info" title="What each scan type means">i</button>
@@ -1028,7 +1680,12 @@
           </div>
           <div class="sa-field"><label>Channels</label>
             <label style="display:inline;margin-right:1rem;"><input type="checkbox" id="ch-web" checked> Web</label>
-            <label style="display:inline;"><input type="checkbox" id="ch-wa"> WhatsApp</label>
+            <label style="display:inline;margin-right:1rem;"><input type="checkbox" id="ch-wa"> WhatsApp</label>
+            <label style="display:inline;"><input type="checkbox" id="ch-email"${
+              (state.status?.site?.contact_email || (state.status?.site?.alert_emails || []).length)
+                ? " checked"
+                : ""
+            }> Email</label>
           </div>
           <div id="gate-setup" class="sa-gate-setup" style="display:none;">
             <p class="sa-muted">Draw each shape on the preview. Click a step, then click the image.</p>
@@ -1046,12 +1703,27 @@
             </div>
             <button class="btn secondary" type="button" id="g-clear-mode">Clear current step</button>
           </div>
+          <div id="pose-trigger-setup" class="sa-pose-trigger-setup" style="display:none;">
+            <div class="sa-field">
+              <label>Body-part trigger</label>
+              <p class="sa-muted sa-field-hint">Alert when any selected body part enters the ROI.</p>
+              <div class="sa-pose-parts">
+                <label><input type="checkbox" class="pose-part" value="head"> Head</label>
+                <label><input type="checkbox" class="pose-part" value="hands"> Hands</label>
+                <label><input type="checkbox" class="pose-part" value="legs"> Legs</label>
+                <label><input type="checkbox" class="pose-part" value="torso"> Torso</label>
+                <label><input type="checkbox" class="pose-part" value="whole"> Whole person</label>
+              </div>
+            </div>
+          </div>
           <p class="sa-muted" id="roi-hint">Click the preview to draw ROI, or use Suggest regions (FastSAM) to click a detected area. Fall / face / vehicle can run without a polygon.</p>
+          <p class="sa-muted sa-roi-preview-status" id="roi-preview-status" hidden></p>
           <div class="sa-canvas-wrap" id="roi-wrap" style="display:none;">
             <img id="roi-img" alt="Preview">
             <canvas id="roi-cv"></canvas>
           </div>
           <div class="sa-row">
+            <button class="btn secondary" type="button" id="r-refresh-preview">Refresh preview</button>
             <button class="btn secondary" type="button" id="r-suggest">Suggest regions</button>
             <button class="btn secondary" type="button" id="r-suggest-done" style="display:none;">Done picking</button>
             <button class="btn secondary" type="button" id="r-clear">Clear ROI</button>
@@ -1061,13 +1733,14 @@
       </div>`
           : ""
       }
-      <table class="sa-table">
+      <table class="sa-table" id="r-rules-table">
         <thead><tr><th>Preview</th><th>Name</th><th>Camera</th><th>Scan</th><th>Geometry</th><th>On</th><th></th></tr></thead>
         <tbody>${rows || '<tr><td colspan="7" class="sa-muted">No rules yet</td></tr>'}</tbody>
       </table>`;
 
     document.getElementById("r-goto-staff")?.addEventListener("click", () => go("staff"));
     document.getElementById("r-goto-vehicles")?.addEventListener("click", () => go("vehicles"));
+    document.getElementById("r-goto-journeys")?.addEventListener("click", () => go("journeys"));
 
     state.rules.forEach((r) => {
       const cam = state.cameras.find((c) => c.id === r.camera_id);
@@ -1086,11 +1759,34 @@
 
     const typeSel = document.getElementById("r-type");
     const gateSetup = document.getElementById("gate-setup");
+    const poseSetup = document.getElementById("pose-trigger-setup");
     const roiHint = document.getElementById("roi-hint");
     const typeHint = document.getElementById("r-type-hint");
 
     function isGateType() {
       return typeSel?.value === "gate_analytics";
+    }
+
+    function isPoseTriggerType() {
+      const t = typeSel?.value || "";
+      return t === "intrusion" || t === "danger_zone";
+    }
+
+    function defaultPoseParts(scanType) {
+      if (scanType === "intrusion") return ["legs"];
+      if (scanType === "danger_zone") return ["whole"];
+      return [];
+    }
+
+    function setPosePartChecks(parts) {
+      const set = new Set(parts || []);
+      document.querySelectorAll(".pose-part").forEach((el) => {
+        el.checked = set.has(el.value);
+      });
+    }
+
+    function selectedPoseParts() {
+      return Array.from(document.querySelectorAll(".pose-part:checked")).map((el) => el.value);
     }
 
     function syncTypeHint() {
@@ -1117,7 +1813,9 @@
 
     function syncGateUi() {
       const gate = isGateType();
+      const pose = isPoseTriggerType();
       if (gateSetup) gateSetup.style.display = gate ? "block" : "none";
+      if (poseSetup) poseSetup.style.display = pose ? "block" : "none";
       if (roiHint && !state.roiPickMode) {
         roiHint.textContent = gate
           ? "Gate rule: draw count line, gate ROI, and three distance zones — or Suggest regions and click a shape for ROI/zones."
@@ -1133,8 +1831,11 @@
     document.getElementById("r-type-info")?.addEventListener("click", () => openScanCatalogHelp());
 
     typeSel?.addEventListener("change", () => {
+      if (isPoseTriggerType()) {
+        setPosePartChecks(defaultPoseParts(typeSel.value));
+      }
       syncGateUi();
-      showPreview();
+      loadRulePreview();
     });
 
     document.querySelectorAll(".sa-gate-step").forEach((b) => {
@@ -1155,25 +1856,133 @@
     });
 
     const camSel = document.getElementById("r-cam");
-    function showPreview() {
-      const cam = state.cameras.find((c) => c.id === camSel?.value);
+    const MAX_RULES_PER_CAMERA = 3;
+
+    function enabledRulesOnCamera(camId) {
+      return state.rules.filter((r) => r.camera_id === camId && r.enabled !== false);
+    }
+
+    function syncCameraRuleLimitHint() {
+      const hint = document.getElementById("r-cam-limit-hint");
+      if (!hint || !camSel) return;
+      const camId = camSel.value;
+      const n = enabledRulesOnCamera(camId).length;
+      if (!camId) {
+        hint.textContent = "";
+        return;
+      }
+      hint.textContent =
+        n >= MAX_RULES_PER_CAMERA
+          ? `This camera already has ${MAX_RULES_PER_CAMERA} enabled rules (max). Disable or remove one to add another.`
+          : `${n} of ${MAX_RULES_PER_CAMERA} enabled rules on this camera. Monitor runs all rules in parallel.`;
+    }
+
+    function syncRulesTableCameraHighlight(camId) {
+      document.querySelectorAll("#r-rules-table tbody tr[data-rule-camera-id]").forEach((row) => {
+        const rowCamId = row.getAttribute("data-rule-camera-id") || "";
+        const match = !!camId && rowCamId === camId;
+        row.classList.toggle("is-camera-highlight", match);
+        row.classList.toggle("is-camera-dimmed", !!camId && !match);
+      });
+    }
+
+    function setRoiPreviewStatus(msg, isError) {
+      const el = document.getElementById("roi-preview-status");
+      if (!el) return;
+      if (!msg) {
+        el.hidden = true;
+        el.textContent = "";
+        el.classList.remove("sa-roi-preview-status--error");
+        return;
+      }
+      el.hidden = false;
+      el.textContent = msg;
+      el.classList.toggle("sa-roi-preview-status--error", !!isError);
+    }
+
+    function applyRoiImage(url) {
       const wrap = document.getElementById("roi-wrap");
       const img = document.getElementById("roi-img");
-      state.roiSuggestions = [];
-      state.roiPickMode = false;
-      if (!wrap || !img || !cam?.preview_url) {
+      if (!wrap || !img || !url) {
         if (wrap) wrap.style.display = "none";
-        syncRoiPickUi();
         return;
       }
       wrap.style.display = "inline-block";
+      wrap.classList.remove("sa-roi-loading");
       img.onload = () => bindCanvas(img, document.getElementById("roi-cv"), isGateType());
-      img.src = cam.preview_url;
-      syncRoiPickUi();
+      img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
     }
+
+    async function loadRulePreview() {
+      const camId = camSel?.value;
+      const cam = state.cameras.find((c) => c.id === camId);
+      const wrap = document.getElementById("roi-wrap");
+      const refreshBtn = document.getElementById("r-refresh-preview");
+      state.roiSuggestions = [];
+      state.roiPickMode = false;
+      syncRoiPickUi();
+      syncCameraRuleLimitHint();
+      syncRulesTableCameraHighlight(camId || "");
+
+      if (!camId || !cam) {
+        if (wrap) wrap.style.display = "none";
+        setRoiPreviewStatus("");
+        return;
+      }
+
+      if (wrap) {
+        wrap.style.display = "inline-block";
+        wrap.classList.add("sa-roi-loading");
+      }
+      if (refreshBtn) refreshBtn.disabled = true;
+      setRoiPreviewStatus("Loading latest frame…");
+
+      try {
+        const data = await api("/cameras/" + encodeURIComponent(camId) + "/fresh-preview");
+        const previewUrl = data.preview_url || "";
+        if (previewUrl) {
+          const idx = state.cameras.findIndex((c) => c.id === camId);
+          if (idx >= 0) {
+            state.cameras[idx] = { ...state.cameras[idx], preview_url: previewUrl, health: "online" };
+          }
+          setRoiPreviewStatus("");
+          applyRoiImage(previewUrl);
+          return;
+        }
+        throw new Error("No preview returned");
+      } catch (e) {
+        const fallback = cam.preview_url || "";
+        if (fallback) {
+          setRoiPreviewStatus(
+            "Could not reach camera — showing last saved preview. " + (e.message || ""),
+            true
+          );
+          applyRoiImage(fallback);
+        } else {
+          if (wrap) {
+            wrap.style.display = "none";
+            wrap.classList.remove("sa-roi-loading");
+          }
+          setRoiPreviewStatus(
+            "Could not reach camera — re-test the connection under Cameras. " + (e.message || ""),
+            true
+          );
+        }
+      } finally {
+        if (refreshBtn) refreshBtn.disabled = false;
+      }
+    }
+
     if (camSel) {
-      camSel.onchange = showPreview;
-      showPreview();
+      camSel.onchange = () => {
+        syncRulesTableCameraHighlight(camSel.value);
+        loadRulePreview();
+      };
+      loadRulePreview();
+    }
+    document.getElementById("r-refresh-preview")?.addEventListener("click", () => loadRulePreview());
+    if (isPoseTriggerType() && !selectedPoseParts().length) {
+      setPosePartChecks(defaultPoseParts(typeSel?.value || ""));
     }
     syncGateUi();
 
@@ -1183,7 +1992,7 @@
       const img = document.getElementById("roi-img");
       const cv = document.getElementById("roi-cv");
       if (!img || !cv || !document.getElementById("roi-wrap")?.style.display || document.getElementById("roi-wrap").style.display === "none") {
-        return alert("Camera needs a preview still. Re-test RTSP or re-upload the file.");
+        return alert("Camera needs a preview still. Re-test the connection or re-upload the file.");
       }
       state.roiSuggestBusy = true;
       syncRoiPickUi();
@@ -1241,14 +2050,26 @@
       const channels = [];
       if (document.getElementById("ch-web").checked) channels.push("web");
       if (document.getElementById("ch-wa").checked) channels.push("whatsapp");
+      if (document.getElementById("ch-email")?.checked) channels.push("email");
+      const camId = document.getElementById("r-cam").value;
+      if (enabledRulesOnCamera(camId).length >= MAX_RULES_PER_CAMERA) {
+        return alert(`Max ${MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.`);
+      }
       const payload = {
         name: document.getElementById("r-name").value || "Rule",
-        camera_id: document.getElementById("r-cam").value,
+        camera_id: camId,
         scan_type: scanType,
         roi_normalized: state.roi,
         channels: channels.length ? channels : ["web"],
         enabled: true,
       };
+      if (scanType === "intrusion" || scanType === "danger_zone") {
+        const parts = selectedPoseParts();
+        if (!parts.length) {
+          return alert("Select at least one body part for the trigger.");
+        }
+        payload.pose_trigger = { parts, min_conf: 0.5, require_person: true };
+      }
       if (scanType === "gate_analytics") {
         const dirEl = document.querySelector('input[name="g-dir"]:checked');
         state.gateConfig.direction_in = dirEl ? dirEl.value : "left";
@@ -1416,6 +2237,7 @@
               ${st !== "ignored" ? `<button class="btn secondary" type="button" data-veh-ignore="${escapeHtml(v.id)}">Ignore</button>` : ""}
               ${st !== "risk" && st !== "danger" ? `<button class="btn danger" type="button" data-veh-risk="${escapeHtml(v.id)}">Mark risk</button>` : ""}
               ${st === "risk" || st === "danger" ? `<button class="btn secondary" type="button" data-veh-approve="${escapeHtml(v.id)}">Clear risk → ours</button>` : ""}
+              <button class="btn danger" type="button" data-veh-del="${escapeHtml(v.id)}" data-veh-plate="${escapeHtml(v.plate || v.label || "")}">Remove</button>
             </div>
           </div>
         </article>`;
@@ -1481,6 +2303,18 @@
         }
       };
     });
+    main.querySelectorAll("[data-veh-del]").forEach((b) => {
+      b.onclick = async () => {
+        const plate = b.getAttribute("data-veh-plate") || "this vehicle";
+        if (!confirm("Remove plate " + plate + " from Vehicles?")) return;
+        try {
+          await api("/known-vehicles/" + b.getAttribute("data-veh-del"), { method: "DELETE" });
+          vehicles();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+    });
   }
 
   function bindRoi(img, canvas) {
@@ -1516,6 +2350,101 @@
     ctx.stroke();
   }
 
+  let monitorAudioCtx = null;
+
+  function playMonitorBipTone(ctx) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.22, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.16);
+  }
+
+  function playMonitorBeepsForNewEvents(events) {
+    if (!state.monitorSeenEventIds) state.monitorSeenEventIds = new Set();
+    const seen = state.monitorSeenEventIds;
+    const fresh = (events || []).filter((ev) => {
+      const eid = ev.event_id || ev.id;
+      return eid && !seen.has(eid);
+    });
+    fresh.forEach((ev, idx) => {
+      const eid = ev.event_id || ev.id;
+      seen.add(eid);
+      setTimeout(() => playMonitorBip(), idx * 120);
+    });
+  }
+
+  function seedMonitorSeenEvents(events) {
+    state.monitorSeenEventIds = new Set();
+    (events || []).forEach((ev) => {
+      const eid = ev.event_id || ev.id;
+      if (eid) state.monitorSeenEventIds.add(eid);
+    });
+  }
+
+  function resetMonitorEventTracking() {
+    state.monitorEventCount = 0;
+    state.monitorSeenEventIds = new Set();
+  }
+
+  function playMonitorBip() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!monitorAudioCtx) monitorAudioCtx = new AC();
+      const ctx = monitorAudioCtx;
+      if (ctx.state === "suspended") {
+        ctx.resume().then(() => playMonitorBipTone(ctx)).catch(() => {});
+        return;
+      }
+      playMonitorBipTone(ctx);
+    } catch (_) {
+      /* ignore autoplay / AudioContext errors */
+    }
+  }
+
+  function eventAsRule(ev) {
+    return {
+      scan_type: ev.scan_type,
+      roi_normalized: ev.roi_normalized || [],
+      gate_config: ev.gate_config || {},
+      css_color: ev.css_color,
+    };
+  }
+
+  function openEventLightbox(ev) {
+    const title = `${ev.rule_name || "Event"} · ${(ev.scan_type || "").replace(/_/g, " ")}`;
+    if (ev.clip_url && !ev.thumb_url) {
+      openLightbox({ title, videoUrl: ev.clip_url });
+      return;
+    }
+    const thumb = ev.thumb_url;
+    if (!thumb) {
+      openLightbox({ title, body: '<p class="sa-muted">No snapshot for this event.</p>' });
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.className = "sa-lightbox-media";
+      const maxW = Math.min(720, img.naturalWidth);
+      const scale = maxW / img.naturalWidth;
+      canvas.width = maxW;
+      canvas.height = Math.round(img.naturalHeight * scale);
+      drawRuleOntoCanvas(canvas, img, eventAsRule(ev));
+      openLightbox({ title, canvas });
+    };
+    img.onerror = () => openLightbox({ title, imageUrl: thumb });
+    img.src = thumb;
+  }
+
   function eventTrackerHtml(events) {
     const list = events || [];
     if (!list.length) {
@@ -1529,15 +2458,20 @@
       .reverse()
       .map((ev) => {
         const t = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : "";
+        const eid = ev.event_id || ev.id || "";
+        const swatch = ev.css_color
+          ? `<span class="sa-event-chip-swatch" style="background:${escapeHtml(ev.css_color)}"></span>`
+          : "";
+        const borderStyle = ev.css_color ? ` style="border-color:${escapeHtml(ev.css_color)}"` : "";
         const media = ev.thumb_url
           ? `<img src="${escapeHtml(ev.thumb_url)}" alt="">`
           : ev.clip_url
             ? `<video src="${escapeHtml(ev.clip_url)}" muted playsinline preload="metadata"></video>`
             : `<span class="sa-event-chip-empty">No snap</span>`;
-        return `<button type="button" class="sa-event-chip" data-ev-thumb="${escapeHtml(ev.thumb_url || "")}" data-ev-clip="${escapeHtml(ev.clip_url || "")}" data-ev-title="${escapeHtml(ev.rule_name || ev.scan_type || "Event")}">
+        return `<button type="button" class="sa-event-chip" data-event-id="${escapeHtml(eid)}"${borderStyle} data-ev-thumb="${escapeHtml(ev.thumb_url || "")}" data-ev-clip="${escapeHtml(ev.clip_url || "")}" data-ev-title="${escapeHtml(ev.rule_name || ev.scan_type || "Event")}">
           <div class="sa-event-chip-media">${media}</div>
           <div class="sa-event-chip-meta">
-            <strong>${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</strong>
+            ${swatch}<strong>${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</strong>
             <span>${escapeHtml(ev.rule_name || "")}</span>
             <span class="sa-muted">${escapeHtml(t)}</span>
           </div>
@@ -1553,6 +2487,12 @@
   function bindEventTrackerClicks(root) {
     (root || document).querySelectorAll(".sa-event-chip").forEach((b) => {
       b.onclick = () => {
+        const eid = b.getAttribute("data-event-id");
+        const ev = (state.monitorEvents || []).find((e) => (e.event_id || e.id) === eid);
+        if (ev) {
+          openEventLightbox(ev);
+          return;
+        }
         const title = b.getAttribute("data-ev-title") || "Event";
         const clip = b.getAttribute("data-ev-clip") || "";
         const thumb = b.getAttribute("data-ev-thumb") || "";
@@ -1575,26 +2515,459 @@
     }
   }
 
+  function clearMonitorFramePoll() {
+    if (state.monitorFramePoll) {
+      clearInterval(state.monitorFramePoll);
+      state.monitorFramePoll = null;
+    }
+  }
+
+  function hideMonitorOverlays() {
+    const loading = document.getElementById("sa-monitor-loading");
+    const errEl = document.getElementById("sa-monitor-error");
+    if (loading) loading.hidden = true;
+    if (errEl) errEl.hidden = true;
+  }
+
+  function monitorCameraType(monStatus) {
+    if (monStatus?.camera_type) return monStatus.camera_type;
+    const cam = state.cameras.find((c) => c.id === monStatus?.camera_id);
+    return cam?.type || "rtsp";
+  }
+
+  function bindMonitorStreamImg(useDvrPoll, sessionId) {
+    const img = document.getElementById("sa-monitor-video");
+    const loading = document.getElementById("sa-monitor-loading");
+    const errEl = document.getElementById("sa-monitor-error");
+    if (!img) return;
+
+    clearMonitorFramePoll();
+    if (errEl) errEl.hidden = true;
+
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'C',location:'site-admin.js:bindMonitorStreamImg',message:'bind start',data:{useDvrPoll:!!useDvrPoll,sessionId:sessionId||'',src:(img.getAttribute('src')||'').slice(0,120),complete:!!img.complete,naturalWidth:img.naturalWidth||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+
+    img.onload = () => {
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'C',location:'site-admin.js:img.onload',message:'img loaded',data:{naturalWidth:img.naturalWidth||0,naturalHeight:img.naturalHeight||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0,useDvrPoll:!!useDvrPoll},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      hideMonitorOverlays();
+      syncMonitorHitCanvas();
+    };
+    img.onerror = () => {
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'A',location:'site-admin.js:img.onerror',message:'img error',data:{useDvrPoll:!!useDvrPoll,src:(img.getAttribute('src')||'').slice(0,120)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      /* Keep overlay hidden when polling — a failed refresh must not block the last good frame */
+      if (useDvrPoll) return;
+    };
+
+    if (img.complete && img.naturalWidth > 0) {
+      hideMonitorOverlays();
+      syncMonitorHitCanvas();
+    }
+
+    if (useDvrPoll && sessionId) {
+      const refresh = () => {
+        if (state.view !== "monitor" || !state.monitorSessionId) return;
+        img.src = `/api/site-admin/monitor/frame/${encodeURIComponent(sessionId)}?t=${Date.now()}`;
+      };
+      refresh();
+      // #region agent log
+      fetch(`/api/site-admin/monitor/frame/${encodeURIComponent(sessionId)}?t=${Date.now()}`, { method: "GET" })
+        .then((r) => r.blob().then((b) => ({ status: r.status, size: b.size, type: b.type })))
+        .then((info) => {
+          fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'B',location:'site-admin.js:frameProbe',message:'DVR frame probe',data:info,timestamp:Date.now()})}).catch(()=>{});
+        })
+        .catch((e) => {
+          fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'B',location:'site-admin.js:frameProbe',message:'DVR frame probe failed',data:{err:String(e&&e.message||e)},timestamp:Date.now()})}).catch(()=>{});
+        });
+      // #endregion
+      state.monitorFramePoll = setInterval(refresh, 1000);
+      window.setTimeout(hideMonitorOverlays, 4000);
+      return;
+    }
+
+    // #region agent log
+    window.setTimeout(() => {
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'D',location:'site-admin.js:bind+2s',message:'rtsp img state after 2s',data:{naturalWidth:img.naturalWidth||0,clientW:img.clientWidth||0,clientH:img.clientHeight||0,complete:!!img.complete,src:(img.getAttribute('src')||'').slice(0,120)},timestamp:Date.now()})}).catch(()=>{});
+    }, 2000);
+    // #endregion
+
+    window.setTimeout(hideMonitorOverlays, 2500);
+  }
+
+  function syncMonitorHitCanvas() {
+    const img = document.getElementById("sa-monitor-video");
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (!img || !canvas) return;
+    const w = img.clientWidth;
+    const h = img.clientHeight;
+    if (w < 8 || h < 8) return;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    if (state.monitorSuggestPickMode && (state.monitorSuggestions || []).length) {
+      drawMonitorSuggestions(ctx, canvas);
+      return;
+    }
+
+    const live = state._monitorJourneyLive || [];
+    live.forEach((j) => {
+      const bn = j.bbox_norm;
+      if (!bn || bn.length !== 4) return;
+      const x1 = bn[0] * w;
+      const y1 = bn[1] * h;
+      const x2 = bn[2] * w;
+      const y2 = bn[3] * h;
+      ctx.strokeStyle = j.watched ? "#f97316" : "#22d3ee";
+      ctx.lineWidth = j.watched ? 3 : 2;
+      ctx.strokeRect(x1, y1, Math.max(4, x2 - x1), Math.max(4, y2 - y1));
+      if (j.watched) {
+        ctx.fillStyle = "rgba(249, 115, 22, 0.15)";
+        ctx.fillRect(x1, y1, Math.max(4, x2 - x1), Math.max(4, y2 - y1));
+      }
+    });
+    const sam = state._samSelection;
+    if (sam && (sam.polygon || []).length >= 3) {
+      ctx.beginPath();
+      sam.polygon.forEach((p, i) => {
+        const x = p[0] * w;
+        const y = p[1] * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = "rgba(34, 211, 238, 0.28)";
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2.5;
+      ctx.fill();
+      ctx.stroke();
+      if (sam.gid) {
+        const cx = sam.polygon.reduce((s, p) => s + p[0], 0) / sam.polygon.length;
+        const cy = sam.polygon.reduce((s, p) => s + p[1], 0) / sam.polygon.length;
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "bold 13px sans-serif";
+        ctx.fillText(sam.gid + (sam.watched ? " · watching" : "") + (sam.local_track_id != null ? " · t" + sam.local_track_id : ""), cx * w - 40, cy * h);
+      }
+    }
+  }
+
+  function drawMonitorSuggestions(ctx, canvas) {
+    (state.monitorSuggestions || []).forEach((r, idx) => {
+      const pts = r.polygon || [];
+      if (pts.length < 3) return;
+      const hue = (idx * 47) % 360;
+      ctx.strokeStyle = `hsla(${hue}, 80%, 60%, 0.95)`;
+      ctx.fillStyle = `hsla(${hue}, 70%, 50%, 0.18)`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = p[0] * canvas.width;
+        const y = p[1] * canvas.height;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+      ctx.fillStyle = `hsla(${hue}, 90%, 70%, 0.95)`;
+      ctx.font = "11px sans-serif";
+      ctx.fillText(String(idx + 1), cx * canvas.width - 4, cy * canvas.height + 4);
+    });
+  }
+
+  function findMonitorSuggestionAt(nx, ny) {
+    const hit = [];
+    for (const r of state.monitorSuggestions || []) {
+      const poly = r.polygon || [];
+      if (poly.length >= 3 && pointInPoly([nx, ny], poly)) hit.push(r);
+    }
+    if (!hit.length) return null;
+    hit.sort((a, b) => (a.area || 1) - (b.area || 1));
+    return hit[0];
+  }
+
+  function freezeMonitorVideo() {
+    clearMonitorFramePoll();
+    const img = document.getElementById("sa-monitor-video");
+    if (!img || !(img.naturalWidth > 0)) return;
+    try {
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      c.getContext("2d").drawImage(img, 0, 0);
+      const dataUrl = c.toDataURL("image/jpeg", 0.85);
+      state._monitorFrozenSrc = dataUrl;
+      img.src = dataUrl;
+    } catch (_) {
+      /* keep last frame if capture fails */
+    }
+  }
+
+  function exitMonitorSuggestMode(resumeLive) {
+    state.monitorSuggestPickMode = false;
+    state.monitorSuggestions = [];
+    state.monitorSuggestBusy = false;
+    state._monitorFrozenSrc = "";
+    syncMonitorSuggestUi();
+    if (resumeLive && state.monitorSessionId) {
+      bindMonitorStreamImg(!!state.monitorUseDvrPoll, state.monitorSessionId);
+    }
+    syncMonitorHitCanvas();
+  }
+
+  async function suggestWatchRegion(region) {
+    if (!state.monitorSessionId || !region) return;
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (canvas) canvas.classList.add("sa-sam-busy");
+    try {
+      const r = await api("/monitor/suggest-watch", {
+        method: "POST",
+        json: {
+          session_id: state.monitorSessionId,
+          polygon: region.polygon || [],
+          watch: true,
+        },
+      });
+      state._samSelection = {
+        gid: r.gid,
+        polygon: r.segment?.polygon || region.polygon || [],
+        bbox_norm: r.segment?.bbox_norm || [],
+        label: r.journey?.label || "person",
+        watched: !!r.watched,
+        local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+      };
+      if (r.segment?.bbox_norm) {
+        const live = state._monitorJourneyLive || [];
+        const item = {
+          gid: r.gid,
+          label: r.journey?.label || "person",
+          bbox_norm: r.segment.bbox_norm,
+          watched: !!r.watched,
+          match_method: "person_track",
+          local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+        };
+        state._monitorJourneyLive = [item, ...live.filter((j) => j.gid !== r.gid)].slice(0, 20);
+      }
+      const msg = r.message || "Selected — watching";
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = msg;
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 3500);
+      }
+      exitMonitorSuggestMode(true);
+      if (state.view === "monitor") {
+        setTimeout(() => monitor(), 400);
+      }
+    } catch (e) {
+      alert(e.message || "Suggest watch failed");
+    } finally {
+      if (canvas) canvas.classList.remove("sa-sam-busy");
+    }
+  }
+
+  async function samSelectAtClick(nx, ny) {
+    if (!state.monitorSessionId) return;
+    const canvas = document.getElementById("sa-monitor-hit");
+    if (canvas) canvas.classList.add("sa-sam-busy");
+    try {
+      const r = await api("/monitor/sam-select", {
+        method: "POST",
+        json: {
+          session_id: state.monitorSessionId,
+          nx,
+          ny,
+          watch: true,
+        },
+      });
+      state._samSelection = {
+        gid: r.gid,
+        polygon: r.segment?.polygon || [],
+        bbox_norm: r.segment?.bbox_norm || [],
+        label: r.journey?.label || "person",
+        watched: !!r.watched,
+        local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+      };
+      if (r.segment?.bbox_norm) {
+        const live = state._monitorJourneyLive || [];
+        const item = {
+          gid: r.gid,
+          label: r.journey?.label || "person",
+          bbox_norm: r.segment.bbox_norm,
+          watched: !!r.watched,
+          match_method: "person_track",
+          local_track_id: r.local_track_id ?? r.segment?.track_id ?? null,
+        };
+        state._monitorJourneyLive = [item, ...live.filter((j) => j.gid !== r.gid)].slice(0, 20);
+      }
+      syncMonitorHitCanvas();
+      const msg = r.message || "Tracking person";
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = msg;
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 3500);
+      }
+      // Refresh watched panel without full remount if possible
+      if (state.view === "monitor") {
+        setTimeout(() => monitor(), 400);
+      }
+    } catch (e) {
+      alert(e.message || "Person select failed");
+    } finally {
+      if (canvas) canvas.classList.remove("sa-sam-busy");
+    }
+  }
+
+  function hitJourneyAt(nx, ny) {
+    const live = state._monitorJourneyLive || [];
+    let best = null;
+    let bestArea = Infinity;
+    for (const j of live) {
+      const bn = j.bbox_norm;
+      if (!bn || bn.length !== 4) continue;
+      if (nx >= bn[0] && nx <= bn[2] && ny >= bn[1] && ny <= bn[3]) {
+        const area = (bn[2] - bn[0]) * (bn[3] - bn[1]);
+        if (area < bestArea) {
+          bestArea = area;
+          best = j;
+        }
+      }
+    }
+    return best;
+  }
+
+  async function toggleWatchGid(gid, currentlyWatched) {
+    if (!gid) return;
+    try {
+      if (currentlyWatched) {
+        await api("/journeys/" + encodeURIComponent(gid) + "/watch", { method: "DELETE" });
+      } else {
+        await api("/journeys/" + encodeURIComponent(gid) + "/watch", { method: "POST" });
+      }
+      if (state.view === "monitor") monitor();
+      else if (state.view === "journeys") journeys();
+    } catch (e) {
+      alert(e.message || "Watch failed");
+    }
+  }
+
+  function bindWatchControls(root) {
+    const el = root || main;
+    el.querySelectorAll("[data-watch-gid]").forEach((b) => {
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        const gid = b.getAttribute("data-watch-gid");
+        const wrap = b.closest(".sa-journey-badge-wrap");
+        const watched = wrap?.classList.contains("is-watched") || b.textContent.trim() === "Unwatch";
+        toggleWatchGid(gid, watched);
+      };
+    });
+    el.querySelectorAll(".sa-journey-badge[data-gid]").forEach((b) => {
+      b.onclick = () => {
+        state._journeyFocus = b.getAttribute("data-gid");
+        go("journeys");
+      };
+    });
+    document.getElementById("mon-goto-alerts")?.addEventListener("click", () => go("alerts"));
+    const canvas = document.getElementById("sa-monitor-hit");
+    const img = document.getElementById("sa-monitor-video");
+    if (canvas && img) {
+      canvas.classList.toggle("sa-pick-mode", !!state.monitorSuggestPickMode);
+      canvas.onclick = async (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        const nx = (ev.clientX - rect.left) / rect.width;
+        const ny = (ev.clientY - rect.top) / rect.height;
+
+        if (state.monitorSuggestPickMode) {
+          const region = findMonitorSuggestionAt(nx, ny);
+          if (!region) {
+            const toast = document.getElementById("mon-sam-toast");
+            if (toast) {
+              toast.textContent = "Click a highlighted person to track";
+              toast.hidden = false;
+              setTimeout(() => {
+                toast.hidden = true;
+              }, 2500);
+            }
+            return;
+          }
+          await suggestWatchRegion(region);
+          return;
+        }
+
+        const hit = hitJourneyAt(nx, ny);
+        if (hit && hit.gid) {
+          await toggleWatchGid(hit.gid, !!hit.watched);
+          return;
+        }
+        // Direct click: YOLO person under cursor → track + Watch
+        await samSelectAtClick(nx, ny);
+      };
+      syncMonitorHitCanvas();
+    }
+  }
+
+  function syncMonitorSuggestUi() {
+    const btn = document.getElementById("mon-suggest");
+    const btnDone = document.getElementById("mon-suggest-done");
+    const wrap = document.querySelector(".sa-monitor-wrap");
+    const canvas = document.getElementById("sa-monitor-hit");
+    const hint = document.getElementById("mon-track-hint");
+    if (btn) {
+      btn.disabled = !!state.monitorSuggestBusy || !state.monitorSessionId;
+      btn.textContent = state.monitorSuggestBusy ? "Finding…" : "Suggest people";
+      btn.style.display = state.monitorSuggestPickMode ? "none" : "inline-block";
+    }
+    if (btnDone) btnDone.style.display = state.monitorSuggestPickMode ? "inline-block" : "none";
+    if (wrap) wrap.classList.toggle("sa-pick-active", !!state.monitorSuggestPickMode);
+    if (canvas) canvas.classList.toggle("sa-pick-mode", !!state.monitorSuggestPickMode);
+    if (hint) hint.hidden = !state.monitorSuggestPickMode;
+  }
+
   async function monitor() {
     if (state.monitorPoll) {
       clearInterval(state.monitorPoll);
       state.monitorPoll = null;
     }
+    if (!state.monitorSessionId) {
+      clearMonitorFramePoll();
+    }
     await loadLists();
     const monStatus = await api("/monitor/status");
     if (monStatus.active && monStatus.session_id) {
       state.monitorSessionId = monStatus.session_id;
+      if (monStatus.camera_id) {
+        state.monitorCameraPick = monStatus.camera_id;
+      }
+    } else if (state.monitorSessionId && !monStatus.active) {
+      state.monitorSessionId = null;
     }
 
     const camerasWithRules = state.cameras.filter((c) =>
       state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
     );
-    const camOpts = camerasWithRules
-      .map((c) => {
-        const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
-        return `<option value="${c.id}">${escapeHtml(c.name)} (${n} rules)</option>`;
-      })
-      .join("");
+    const activeCamId = monStatus.active ? monStatus.camera_id || state.monitorCameraPick : state.monitorCameraPick;
+    const camOpts =
+      `<option value=""${!activeCamId ? " selected" : ""}>Select camera…</option>` +
+      camerasWithRules
+        .map((c) => {
+          const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
+          const sel = c.id === activeCamId ? " selected" : "";
+          return `<option value="${c.id}"${sel}>${escapeHtml(c.name)} (${n} rules)</option>`;
+        })
+        .join("");
 
     const activeRules = monStatus.active ? monStatus.rules || [] : [];
     const legend = activeRules
@@ -1614,6 +2987,7 @@
     const hasGate = (monStatus.scan_types || []).includes("gate_analytics");
     const gl = monStatus.gate_live || {};
     const gt = gl.session_totals || {};
+    const streamLive = !!(monStatus.active && state.monitorSessionId);
     const gatePanel =
       hasGate && state.monitorSessionId
         ? `<div class="sa-gate-live sa-card">
@@ -1628,10 +3002,112 @@
           </div>`
         : "";
 
-    const streaming = state.monitorSessionId
-      ? `<div class="sa-monitor-wrap">
+    // Prefer session journey_live (has bbox_norm / SAM picks) over Redis summary
+    const journeyLive = (() => {
+      const fromSession = monStatus.journey_live || [];
+      if (fromSession.some((j) => j.bbox_norm && j.bbox_norm.length === 4)) return fromSession;
+      return fromSession;
+    })();
+    state._monitorJourneyLive = journeyLive;
+    state._samSelection = monStatus.sam_selection || state._samSelection || null;
+    const journeyPanel =
+      streamLive && journeyLive.length
+        ? `<div class="sa-journey-live sa-card">
+            <h3>Journeys on this camera</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Click <strong>Watch</strong> to send hops to Alerts. Click the badge to open the path.</p>
+            <div class="sa-journey-badges">
+              ${journeyLive
+                .map((j) => {
+                  const gid = j.gid || "";
+                  const label = j.label || "unknown";
+                  const hops = j.hop_summary || "";
+                  const watched = !!j.watched;
+                  return `<div class="sa-journey-badge-wrap${watched ? " is-watched" : ""}">
+                    <button type="button" class="sa-journey-badge" data-gid="${escapeHtml(gid)}" title="${escapeHtml(hops)}">
+                      <strong>${escapeHtml(gid)}</strong>
+                      <span>${escapeHtml(label)}</span>
+                      ${hops ? `<span class="sa-muted sa-journey-hops">${escapeHtml(hops)}</span>` : ""}
+                    </button>
+                    <button type="button" class="btn ${watched ? "danger" : "primary"} sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">
+                      ${watched ? "Unwatch" : "Watch"}
+                    </button>
+                  </div>`;
+                })
+                .join("")}
+            </div>
+          </div>`
+        : "";
+
+    let watchedList = [];
+    try {
+      const wd = await api("/journeys-watched?limit=30");
+      watchedList = wd.journeys || [];
+    } catch (_) {
+      watchedList = [];
+    }
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'A',location:'site-admin.js:watchedPanel',message:'watched list for panel',data:{count:watchedList.length,items:(watchedList||[]).slice(0,5).map(j=>({gid:j.gid,label:j.label,thumb_url:(j.thumb_url||'').slice(0,80),last_thumb_url:(j.last_thumb_url||'').slice(0,80),keys:Object.keys(j||{}).filter(k=>k.includes('thumb')||k==='gid')}))},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    const watchedIds = new Set(watchedList.map((j) => j.gid).filter(Boolean));
+    // Merge watched flag onto live badges if Redis list has them
+    journeyLive.forEach((j) => {
+      if (j.gid && watchedIds.has(j.gid)) j.watched = true;
+    });
+
+    const watchedPanel =
+      watchedList.length > 0
+        ? `<div class="sa-card sa-watched-panel">
+            <h3>Watching → Alerts</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Pinned targets. New camera hops create Alerts entries.</p>
+            <div class="sa-journey-badges">
+              ${watchedList
+                .map((j) => {
+                  const gid = j.gid || "";
+                  const thumb = j.thumb_url || j.last_thumb_url || "";
+                  const thumbHtml = thumb
+                    ? `<img class="sa-watched-thumb" src="${escapeHtml(thumb)}" alt="">`
+                    : `<div class="sa-watched-thumb sa-watched-thumb--empty"></div>`;
+                  return `<div class="sa-journey-badge-wrap is-watched">
+                    <button type="button" class="sa-journey-badge sa-journey-badge--with-thumb" data-gid="${escapeHtml(gid)}">
+                      ${thumbHtml}
+                      <span class="sa-journey-badge-text">
+                        <strong>${escapeHtml(gid)}</strong>
+                        <span>${escapeHtml(j.label || "unknown")}</span>
+                        <span class="sa-muted sa-journey-hops">${escapeHtml(j.hop_summary || j.last_camera_name || "")}</span>
+                      </span>
+                    </button>
+                    <button type="button" class="btn danger sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">Unwatch</button>
+                  </div>`;
+                })
+                .join("")}
+            </div>
+            <button class="btn secondary" type="button" id="mon-goto-alerts" style="margin-top:0.5rem;width:auto;">Open Alerts</button>
+          </div>`
+        : `<div class="sa-card sa-watched-panel"><h3>Watching → Alerts</h3><p class="sa-muted">No pinned targets yet. Click a person on the video or press Watch on a journey badge.</p></div>`;
+
+    const useDvrPoll = streamLive && monitorCameraType(monStatus) === "dvr";
+    state.monitorUseDvrPoll = useDvrPoll;
+    const videoSrc =
+      streamLive && !state.monitorSuggestPickMode
+        ? useDvrPoll
+          ? `/api/site-admin/monitor/frame/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+          : `/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}?t=${Date.now()}`
+        : streamLive
+          ? ""
+          : "";
+    // #region agent log
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'E',location:'site-admin.js:monitor',message:'monitor render stream',data:{streamLive:!!streamLive,cameraType:monitorCameraType(monStatus),useDvrPoll:!!useDvrPoll,sessionId:state.monitorSessionId||'',camPick:state.monitorCameraPick||'',camName:monStatus.camera_name||'',scanTypes:monStatus.scan_types||[],videoSrc:(videoSrc||'').slice(0,140),active:!!monStatus.active,suggestPick:!!state.monitorSuggestPickMode},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    const streaming = streamLive
+      ? `<div class="sa-monitor-wrap sa-monitor-wrap--clickable${state.monitorSuggestPickMode ? " sa-pick-active" : ""}">
+          <div id="sa-monitor-loading" class="sa-monitor-loading"${state.monitorSuggestPickMode ? " hidden" : ""}>Connecting…</div>
+          <div id="sa-monitor-error" class="sa-monitor-error" hidden>
+            Stream unavailable — check camera or Docker network to DVR
+          </div>
           <img id="sa-monitor-video" class="sa-monitor-video" alt="Live monitor"
-            src="/api/site-admin/monitor/stream/${escapeHtml(state.monitorSessionId)}">
+            src="${videoSrc || (state._monitorFrozenSrc || "")}">
+          <canvas id="sa-monitor-hit" class="sa-monitor-hit${state.monitorSuggestPickMode ? " sa-pick-mode" : ""}" title="Suggest people or click a person to Watch"></canvas>
+          <div id="mon-sam-toast" class="sa-sam-toast" hidden></div>
         </div>
         ${monitorControlsHtml(monStatus.active ? monStatus : null)}`
       : `<div class="sa-monitor-wrap"><p class="placeholder-msg" style="padding:2rem;">Select a camera and click Watch live</p></div>`;
@@ -1640,56 +3116,178 @@
       <div class="sa-h">
         <div>
           <h2>Live monitor</h2>
-          <p>Select a camera that already has rules, then Watch live. Add cameras under Cameras and draw rules under Rules.</p>
+          <p>Select a camera with rules, then Watch live. Press <strong>Suggest people</strong> (or click a person on the video) — YOLO + ByteTrack follows them and pins Watch; hops go to <strong>Alerts</strong>. Cyan boxes are tracked journeys.</p>
         </div>
       </div>
       ${heavyNote}
       <div class="sa-row" style="margin-bottom:1rem;">
-        <select class="text-input" id="mon-cam" style="max-width:320px;" ${state.monitorSessionId ? "disabled" : ""}>
+        <select class="text-input" id="mon-cam" style="max-width:320px;" ${streamLive ? "disabled" : ""}>
           ${camOpts || '<option value="">No cameras with rules</option>'}
         </select>
         ${
           isAdmin()
-            ? state.monitorSessionId
+            ? streamLive
               ? `<button class="btn danger" type="button" id="mon-stop">Stop</button>`
               : `<button class="btn primary" type="button" id="mon-start" style="width:auto;">Watch live</button>`
             : `<span class="sa-muted">Viewer — watch only when Admin starts a session</span>`
         }
+        ${
+          streamLive
+            ? `<button class="btn secondary" type="button" id="mon-suggest">Suggest people</button>
+               <button class="btn secondary" type="button" id="mon-suggest-done" style="display:none;">Done picking</button>
+               <button class="btn secondary" type="button" id="mon-clear">Clear</button>`
+            : ""
+        }
+        <button class="btn" type="button" id="mon-test-beep">Test beep</button>
       </div>
+      <p id="mon-track-hint" class="sa-muted" ${state.monitorSuggestPickMode ? "" : "hidden"} style="margin:-0.35rem 0 0.85rem;">Click a highlighted person to track them (Watch → Alerts). Or Done picking.</p>
       ${streaming}
       ${gatePanel}
+      ${journeyPanel}
+      ${watchedPanel}
       ${eventTrackerHtml(monStatus.events || [])}
       <div class="sa-card">
         <h3>Rules on this stream</h3>
         <div class="sa-legend">${legend || '<span class="sa-muted">Start monitoring to see rule legend</span>'}</div>
       </div>`;
 
+    document.getElementById("mon-cam")?.addEventListener("change", (e) => {
+      state.monitorCameraPick = e.target.value || "";
+    });
+
+    document.getElementById("mon-test-beep")?.addEventListener("click", () => {
+      playMonitorBip();
+    });
+
     document.getElementById("mon-start")?.addEventListener("click", async () => {
-      const camId = document.getElementById("mon-cam")?.value;
-      if (!camId) return alert("Choose a camera with rules");
+      const camSel = document.getElementById("mon-cam");
+      const camId = camSel?.value;
+      if (!camId) return alert("Select a camera with rules");
+      const startBtn = document.getElementById("mon-start");
+      if (startBtn) {
+        startBtn.disabled = true;
+        startBtn.textContent = "Starting…";
+      }
       try {
         const r = await api("/monitor/start", { method: "POST", json: { camera_id: camId } });
         state.monitorSessionId = r.session_id;
+        state.monitorCameraPick = camId;
+        state.monitorEventCount = 0;
+        resetMonitorEventTracking();
         monitor();
       } catch (e) {
         alert(e.message);
+        if (startBtn) {
+          startBtn.disabled = false;
+          startBtn.textContent = "Watch live";
+        }
       }
     });
 
     document.getElementById("mon-stop")?.addEventListener("click", async () => {
+      exitMonitorSuggestMode(false);
       await stopMonitorIfAny();
+      state.monitorCameraPick = "";
       monitor();
     });
 
+    document.getElementById("mon-suggest")?.addEventListener("click", async () => {
+      if (!state.monitorSessionId || state.monitorSuggestBusy) return;
+      state.monitorSuggestBusy = true;
+      syncMonitorSuggestUi();
+      try {
+        freezeMonitorVideo();
+        const data = await api("/monitor/suggest-regions", {
+          method: "POST",
+          json: { session_id: state.monitorSessionId },
+        });
+        state.monitorSuggestions = data.regions || [];
+        if (!state.monitorSuggestions.length) {
+          exitMonitorSuggestMode(true);
+          alert("No people found in this frame. Wait a moment and try again.");
+          return;
+        }
+        state.monitorSuggestPickMode = true;
+        syncMonitorSuggestUi();
+        syncMonitorHitCanvas();
+        const toast = document.getElementById("mon-sam-toast");
+        if (toast) {
+          toast.textContent = "Click a highlighted person to track";
+          toast.hidden = false;
+          setTimeout(() => {
+            toast.hidden = true;
+          }, 3000);
+        }
+      } catch (e) {
+        exitMonitorSuggestMode(true);
+        alert(e.message || "Suggest people failed");
+      } finally {
+        state.monitorSuggestBusy = false;
+        syncMonitorSuggestUi();
+      }
+    });
+    document.getElementById("mon-suggest-done")?.addEventListener("click", () => {
+      exitMonitorSuggestMode(true);
+    });
+
+    document.getElementById("mon-clear")?.addEventListener("click", async () => {
+      // Rules-parity Clear: drop suggest masks + SAM overlay only (keep Watch + live session)
+      if (state.monitorSuggestPickMode) {
+        exitMonitorSuggestMode(true);
+      }
+      state._samSelection = null;
+      syncMonitorHitCanvas();
+      if (state.monitorSessionId) {
+        try {
+          await api("/monitor/clear-selection", {
+            method: "POST",
+            json: { session_id: state.monitorSessionId },
+          });
+        } catch (_) {
+          /* client clear is enough if API unavailable */
+        }
+      }
+      // #region agent log
+      fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'F',location:'site-admin.js:mon-clear',message:'monitor clear selection',data:{sessionId:state.monitorSessionId||''},timestamp:Date.now(),runId:'post-fix'})}).catch(()=>{});
+      // #endregion
+      const toast = document.getElementById("mon-sam-toast");
+      if (toast) {
+        toast.textContent = "Selection cleared";
+        toast.hidden = false;
+        setTimeout(() => {
+          toast.hidden = true;
+        }, 2000);
+      }
+    });
+
+    if (streamLive && !state.monitorSuggestPickMode) {
+      bindMonitorStreamImg(useDvrPoll, state.monitorSessionId);
+      hideMonitorOverlays();
+    } else if (streamLive && state.monitorSuggestPickMode) {
+      clearMonitorFramePoll();
+      hideMonitorOverlays();
+      const img = document.getElementById("sa-monitor-video");
+      if (img && state._monitorFrozenSrc && !img.getAttribute("src")) {
+        img.src = state._monitorFrozenSrc;
+      }
+    }
+    bindWatchControls(main);
+    syncMonitorSuggestUi();
+    if (state.monitorSuggestPickMode) syncMonitorHitCanvas();
+
     bindEventTrackerClicks(main);
 
+    state.monitorEvents = monStatus.events || [];
+
     if (state.monitorSessionId && monStatus.active) {
+      seedMonitorSeenEvents(monStatus.events || []);
+      state.monitorEventCount = (monStatus.events || []).length;
       state.monitorPaused = !!monStatus.paused;
       syncMonitorPlayback(monStatus);
       bindMonitorControls(monStatus);
     }
 
-    if (state.monitorSessionId) {
+    if (state.monitorSessionId && monStatus.active) {
       state.monitorPoll = setInterval(async () => {
         if (state.view !== "monitor") {
           clearInterval(state.monitorPoll);
@@ -1697,8 +3295,23 @@
         }
         try {
           const st = await api("/monitor/status");
+          if (!st.active && state.monitorSessionId) {
+            state.monitorSessionId = null;
+            resetMonitorEventTracking();
+            clearInterval(state.monitorPoll);
+            state.monitorPoll = null;
+            monitor();
+            return;
+          }
+          if (st.active) {
+            hideMonitorOverlays();
+          }
           syncMonitorPlayback(st);
-          renderEventTrackerStrip(st.events || []);
+          const events = st.events || [];
+          state.monitorEvents = events;
+          playMonitorBeepsForNewEvents(events);
+          state.monitorEventCount = events.length;
+          renderEventTrackerStrip(events);
           const gateEl = document.querySelector(".sa-gate-live");
           if (st.gate_live && gateEl) {
             const gl2 = st.gate_live;
@@ -1718,6 +3331,45 @@
                 <span>Opens/closes: ${gt2.gate_opens || 0} / ${gt2.gate_closes || 0}</span>`;
             }
           }
+          const jLive = st.journey_live || [];
+          state._monitorJourneyLive = jLive;
+          syncMonitorHitCanvas();
+          let jPanel = document.querySelector(".sa-journey-live");
+          if (jLive.length) {
+            const html = `<h3>Journeys on this camera</h3>
+            <p class="sa-muted" style="margin:0 0 0.5rem;">Click <strong>Watch</strong> to send hops to Alerts.</p>
+            <div class="sa-journey-badges">${jLive
+              .map((j) => {
+                const gid = j.gid || "";
+                const label = j.label || "unknown";
+                const hops = j.hop_summary || "";
+                const watched = !!j.watched;
+                return `<div class="sa-journey-badge-wrap${watched ? " is-watched" : ""}">
+                  <button type="button" class="sa-journey-badge" data-gid="${escapeHtml(gid)}" title="${escapeHtml(hops)}">
+                    <strong>${escapeHtml(gid)}</strong>
+                    <span>${escapeHtml(label)}</span>
+                    ${hops ? `<span class="sa-muted sa-journey-hops">${escapeHtml(hops)}</span>` : ""}
+                  </button>
+                  <button type="button" class="btn ${watched ? "danger" : "primary"} sa-watch-btn" data-watch-gid="${escapeHtml(gid)}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">
+                    ${watched ? "Unwatch" : "Watch"}
+                  </button>
+                </div>`;
+              })
+              .join("")}</div>`;
+            if (!jPanel) {
+              const wrap = document.createElement("div");
+              wrap.className = "sa-journey-live sa-card";
+              wrap.innerHTML = html;
+              const gate = document.querySelector(".sa-gate-live");
+              (gate || document.querySelector(".sa-monitor-wrap"))?.after(wrap);
+              jPanel = wrap;
+            } else {
+              jPanel.innerHTML = html;
+            }
+            bindWatchControls(jPanel);
+          } else if (jPanel) {
+            jPanel.remove();
+          }
         } catch (_) {
           /* ignore */
         }
@@ -1725,9 +3377,200 @@
     }
   }
 
+  function formatJourneyTime(ts) {
+    if (!ts) return "—";
+    try {
+      return new Date(Number(ts) * 1000).toLocaleString();
+    } catch (_) {
+      return "—";
+    }
+  }
+
+  async function journeys() {
+    const kind = state._journeyKind || "";
+    const known = state._journeyKnown || "";
+    const minutes = state._journeyMinutes || "60";
+    let q = `/journeys?limit=60&active_minutes=${encodeURIComponent(minutes)}`;
+    if (kind) q += `&kind=${encodeURIComponent(kind)}`;
+    if (known) q += `&known=${encodeURIComponent(known)}`;
+    let data = { journeys: [] };
+    try {
+      data = await api(q);
+    } catch (_) {
+      data = { journeys: [] };
+    }
+    const list = data.journeys || [];
+    const focus = state._journeyFocus || "";
+    let detailHtml = "";
+    if (focus) {
+      try {
+        const detail = await api("/journeys/" + encodeURIComponent(focus));
+        const hops = detail.hops || [];
+        const timeline = detail.timeline || [];
+        detailHtml = `<div class="sa-card sa-journey-detail" style="margin-bottom:1rem;">
+          <div class="sa-row" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">
+            <h3>${escapeHtml(detail.gid || focus)} · ${escapeHtml(detail.label || "unknown")}</h3>
+            <div class="sa-row">
+              <button class="btn ${detail.watched ? "danger" : "primary"}" type="button" id="j-watch-toggle" data-watch-gid="${escapeHtml(detail.gid || focus)}" style="width:auto;">
+                ${detail.watched ? "Unwatch" : "Watch → Alerts"}
+              </button>
+              <button class="btn danger" type="button" id="j-remove-track" data-remove-gid="${escapeHtml(detail.gid || focus)}" style="width:auto;">Remove track</button>
+              <button class="btn secondary" type="button" id="j-clear-focus">Close</button>
+            </div>
+          </div>
+          <p class="sa-muted">${escapeHtml(detail.kind || "")}${detail.person_id ? " · face " + escapeHtml(detail.person_id) : ""}${detail.plate ? " · plate " + escapeHtml(detail.plate) : ""}${detail.watched ? " · <strong>watching</strong>" : ""}</p>
+          <p class="sa-journey-path"><strong>Path:</strong> ${escapeHtml(detail.hop_summary || "—")}</p>
+          <ol class="sa-journey-hops-list">
+            ${hops
+              .map(
+                (h) =>
+                  `<li><strong>${escapeHtml(h.camera_name || h.camera_id || "?")}</strong>
+                  <span class="sa-muted">${escapeHtml(formatJourneyTime(h.first_ts))} → ${escapeHtml(formatJourneyTime(h.last_ts))}</span>
+                  <span class="sa-badge">${escapeHtml(h.match_method || "")}</span></li>`
+              )
+              .join("") || "<li class='sa-muted'>No hops yet</li>"}
+          </ol>
+          <div class="sa-journey-timeline" style="max-height:220px;overflow:auto;">
+            ${(timeline || [])
+              .slice(0, 40)
+              .map(
+                (ev) =>
+                  `<div class="sa-journey-event">
+                    <span>${escapeHtml(ev.camera_name || ev.camera_id || "")}</span>
+                    <span class="sa-muted">${escapeHtml(formatJourneyTime(ev.ts))}</span>
+                    <span class="sa-badge">${escapeHtml(ev.match_method || "")}</span>
+                    ${ev.thumb_url ? `<img src="${escapeHtml(ev.thumb_url)}" alt="" class="sa-journey-thumb">` : ""}
+                  </div>`
+              )
+              .join("")}
+          </div>
+        </div>`;
+      } catch (_) {
+        detailHtml = `<p class="sa-muted">Could not load journey ${escapeHtml(focus)}</p>`;
+      }
+    }
+
+    const rows = list
+      .map((j) => {
+        const knownTag = j.person_id || j.plate ? "known" : "anon";
+        const watchTag = j.watched ? "watching" : "";
+        return `<tr class="${focus === j.gid ? "is-camera-highlight" : ""}" data-open-journey="${escapeHtml(j.gid || "")}">
+          <td><strong>${escapeHtml(j.gid || "")}</strong></td>
+          <td>${escapeHtml(j.label || "unknown")}</td>
+          <td>${escapeHtml(j.kind || "")}</td>
+          <td><span class="sa-badge">${knownTag}</span>${watchTag ? ` <span class="sa-badge sa-badge-watch">${watchTag}</span>` : ""}</td>
+          <td>${escapeHtml(j.last_camera_name || j.last_camera_id || "—")}</td>
+          <td class="sa-muted">${escapeHtml(j.hop_summary || "—")}</td>
+          <td class="sa-muted">${escapeHtml(formatJourneyTime(j.last_seen_at))}</td>
+          <td>
+            <button type="button" class="btn danger j-row-remove" data-remove-gid="${escapeHtml(j.gid || "")}" style="width:auto;padding:0.25rem 0.5rem;font-size:0.8rem;">Remove</button>
+          </td>
+        </tr>`;
+      })
+      .join("");
+
+    main.innerHTML = `
+      <div class="sa-h">
+        <div>
+          <h2>Journeys</h2>
+          <p>Same person or vehicle across cameras. Open a row, then <strong>Watch → Alerts</strong> to pin them — or <strong>Remove track</strong> to delete that journey entirely.</p>
+        </div>
+      </div>
+      ${detailHtml}
+      <div class="sa-row" style="margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;">
+        <label class="sa-muted">Window
+          <select class="text-input" id="j-minutes" style="max-width:120px;display:inline-block;">
+            <option value="15"${minutes === "15" ? " selected" : ""}>15 min</option>
+            <option value="60"${minutes === "60" ? " selected" : ""}>1 hour</option>
+            <option value="360"${minutes === "360" ? " selected" : ""}>6 hours</option>
+            <option value="1440"${minutes === "1440" ? " selected" : ""}>24 hours</option>
+          </select>
+        </label>
+        <label class="sa-muted">Kind
+          <select class="text-input" id="j-kind" style="max-width:140px;display:inline-block;">
+            <option value=""${!kind ? " selected" : ""}>All</option>
+            <option value="person"${kind === "person" ? " selected" : ""}>People</option>
+            <option value="vehicle"${kind === "vehicle" ? " selected" : ""}>Vehicles</option>
+          </select>
+        </label>
+        <label class="sa-muted">Identity
+          <select class="text-input" id="j-known" style="max-width:140px;display:inline-block;">
+            <option value=""${!known ? " selected" : ""}>All</option>
+            <option value="known"${known === "known" ? " selected" : ""}>Known</option>
+            <option value="anonymous"${known === "anonymous" ? " selected" : ""}>Anonymous</option>
+          </select>
+        </label>
+        <button class="btn secondary" type="button" id="j-refresh">Refresh</button>
+      </div>
+      <table class="sa-table" id="j-table">
+        <thead><tr><th>ID</th><th>Label</th><th>Kind</th><th>Type</th><th>Last camera</th><th>Path</th><th>Last seen</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" class="sa-muted">No journeys in this window. Enable Go live with face, vehicle, or gate rules.</td></tr>'}</tbody>
+      </table>`;
+
+    const refresh = () => {
+      state._journeyMinutes = document.getElementById("j-minutes")?.value || "60";
+      state._journeyKind = document.getElementById("j-kind")?.value || "";
+      state._journeyKnown = document.getElementById("j-known")?.value || "";
+      journeys();
+    };
+    document.getElementById("j-refresh")?.addEventListener("click", refresh);
+    document.getElementById("j-minutes")?.addEventListener("change", refresh);
+    document.getElementById("j-kind")?.addEventListener("change", refresh);
+    document.getElementById("j-known")?.addEventListener("change", refresh);
+    document.getElementById("j-clear-focus")?.addEventListener("click", () => {
+      state._journeyFocus = "";
+      journeys();
+    });
+    document.getElementById("j-watch-toggle")?.addEventListener("click", () => {
+      const b = document.getElementById("j-watch-toggle");
+      const gid = b?.getAttribute("data-watch-gid");
+      const watched = (b?.textContent || "").includes("Unwatch");
+      toggleWatchGid(gid, watched);
+    });
+
+    async function removeJourneyTrack(gid) {
+      if (!gid) return;
+      if (!confirm("Remove track " + gid + "? This deletes the journey and stops watching. Alerts already created stay in the inbox.")) {
+        return;
+      }
+      try {
+        await api("/journeys/" + encodeURIComponent(gid), { method: "DELETE" });
+        if (state._journeyFocus === gid) state._journeyFocus = "";
+        if (state._samSelection?.gid === gid) state._samSelection = null;
+        journeys();
+      } catch (e) {
+        alert(e.message || "Could not remove track");
+      }
+    }
+
+    document.getElementById("j-remove-track")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const gid = document.getElementById("j-remove-track")?.getAttribute("data-remove-gid");
+      removeJourneyTrack(gid);
+    });
+    main.querySelectorAll(".j-row-remove").forEach((b) => {
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        removeJourneyTrack(b.getAttribute("data-remove-gid"));
+      };
+    });
+
+    main.querySelectorAll("[data-open-journey]").forEach((row) => {
+      row.style.cursor = "pointer";
+      row.onclick = () => {
+        state._journeyFocus = row.getAttribute("data-open-journey");
+        journeys();
+      };
+    });
+  }
+
   async function alerts() {
     const data = await api("/alerts?limit=80");
     state.alerts = data.alerts || [];
+    // #region agent log
+    const jw = (state.alerts || []).filter((a) => (a.scan_type || "") === "journey_watch" || (a.type || "").startsWith("journey"));
+    fetch('http://127.0.0.1:7882/ingest/fe2e7aa2-a7a9-441d-825a-22b76c0017f9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'46c418'},body:JSON.stringify({sessionId:'46c418',hypothesisId:'D',location:'site-admin.js:alerts',message:'journey_watch alert thumbs',data:{total:state.alerts.length,journeyCount:jw.length,samples:jw.slice(0,5).map(a=>({id:a.id,gid:a.gid,type:a.type,scan_type:a.scan_type,thumb_len:(a.thumb_url||'').length,thumb:(a.thumb_url||'').slice(0,60)}))},timestamp:Date.now(),runId:'post-fix'})}).catch(()=>{});
+    // #endregion
     const items = state.alerts
       .map((a) => {
         const t = a.created_at ? new Date(a.created_at * 1000).toLocaleString() : "";
@@ -1744,6 +3587,7 @@
               ${!a.acked ? `<button class="btn secondary" data-ack="${a.id}" type="button">Ack</button>` : ""}
               ${isAdmin() ? `<button class="btn secondary" data-mute="${a.id}" type="button">Mute 1h</button>` : ""}
               <button class="btn secondary" data-wa="${a.id}" type="button">WhatsApp</button>
+              ${isAdmin() ? `<button class="btn secondary" data-email="${a.id}" type="button">Email</button>` : ""}
               <button class="btn danger" data-del-alert="${a.id}" type="button">Remove</button>
             </div>
           </div>
@@ -1754,7 +3598,7 @@
       <div class="sa-h">
         <div>
           <h2>Alerts</h2>
-          <p>Inbox for rule matches. Select several and Remove selected, or remove one at a time.</p>
+          <p>Inbox for rule matches. Select several to Email or Remove, or act on one at a time.</p>
         </div>
         <div class="sa-alert-actions sa-row">
           <button class="btn secondary" type="button" id="a-refresh">Refresh</button>
@@ -1762,6 +3606,11 @@
             state.alerts.length
               ? `<button class="btn secondary" type="button" id="a-select-all">Select all</button>
                  <button class="btn secondary" type="button" id="a-clear-sel">Clear</button>
+                 ${
+                   isAdmin()
+                     ? `<button class="btn secondary" type="button" id="a-email-sel" disabled>Email selected</button>`
+                     : ""
+                 }
                  <button class="btn danger" type="button" id="a-remove-sel" disabled>Remove selected</button>`
               : ""
           }
@@ -1773,8 +3622,11 @@
       return Array.from(main.querySelectorAll(".sa-alert-cb:checked")).map((cb) => cb.value);
     }
     function syncBulkBtn() {
-      const btn = document.getElementById("a-remove-sel");
-      if (btn) btn.disabled = selectedIds().length === 0;
+      const n = selectedIds().length;
+      const removeBtn = document.getElementById("a-remove-sel");
+      const emailBtn = document.getElementById("a-email-sel");
+      if (removeBtn) removeBtn.disabled = n === 0;
+      if (emailBtn) emailBtn.disabled = n === 0;
     }
 
     document.getElementById("a-refresh").onclick = () => alerts();
@@ -1789,6 +3641,27 @@
         cb.checked = false;
       });
       syncBulkBtn();
+    });
+    document.getElementById("a-email-sel")?.addEventListener("click", async () => {
+      const ids = selectedIds();
+      if (!ids.length) return;
+      if (ids.length > 1 && !confirm("Email " + ids.length + " alerts to site recipients?")) return;
+      try {
+        const r = await api("/alerts/share-email", { method: "POST", json: { ids } });
+        if (!r.configured) {
+          alert("SMTP not configured — set PASSWORD_EMAIL / EMAIL_FROM in .env, then recreate the app container.");
+          return;
+        }
+        alert(
+          "Emailed " +
+            (r.sent || 0) +
+            " of " +
+            ids.length +
+            (r.failed ? " (" + r.failed + " failed — check Settings alert emails)" : "")
+        );
+      } catch (e) {
+        alert(e.message || "Email failed");
+      }
     });
     document.getElementById("a-remove-sel")?.addEventListener("click", async () => {
       const ids = selectedIds();
@@ -1833,6 +3706,28 @@
         alert(r.configured ? JSON.stringify(r.results) : "WhatsApp API not configured. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.");
       };
     });
+    main.querySelectorAll("[data-email]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          const r = await api("/alerts/" + b.getAttribute("data-email") + "/share-email", {
+            method: "POST",
+            json: {},
+          });
+          if (!r.configured) {
+            alert("SMTP not configured — set PASSWORD_EMAIL / EMAIL_FROM in .env, then recreate the app container.");
+            return;
+          }
+          const ok = r.ok || (r.results || []).some((x) => x.ok);
+          alert(
+            ok
+              ? "Email sent to site recipients."
+              : "Email failed — " + ((r.results || [])[0]?.reason || "check Settings alert emails")
+          );
+        } catch (e) {
+          alert(e.message || "Email failed");
+        }
+      };
+    });
     main.querySelectorAll("[data-del-alert]").forEach((b) => {
       b.onclick = async () => {
         if (!confirm("Remove this alert?")) return;
@@ -1848,12 +3743,15 @@
 
   async function reports() {
     await loadLists();
+    const period = document.getElementById("rep-period")?.value || "daily";
     const hours = document.getElementById("rep-hours")?.value || "24";
     const ruleFilter = document.getElementById("rep-gate-rule")?.value || "";
     const data = await api("/reports?hours=" + hours);
-    let gateData = { totals: {}, rules: [] };
+    let gateData = { totals: {}, rules: [], daily: [] };
     try {
-      const q = "/reports/gate?hours=" + hours + (ruleFilter ? "&rule_id=" + encodeURIComponent(ruleFilter) : "");
+      let q = "/reports/gate?period=" + encodeURIComponent(period);
+      if (period === "hours") q += "&hours=" + encodeURIComponent(hours);
+      if (ruleFilter) q += "&rule_id=" + encodeURIComponent(ruleFilter);
       gateData = await api(q);
     } catch (_) {
       /* ignore */
@@ -1869,10 +3767,48 @@
     const gateRuleOpts = gateRules
       .map((r) => `<option value="${r.id}"${ruleFilter === r.id ? " selected" : ""}>${escapeHtml(r.name)}</option>`)
       .join("");
+    const periodLabels = { daily: "Today", weekly: "Last 7 days", monthly: "This month", hours: "Custom hours" };
+    const periodLabel = periodLabels[period] || period;
+    const showHoursInput = period === "hours";
+    const showDailyTable = period !== "hours" && (gateData.daily || []).length > 0;
+    const ruleNameById = Object.fromEntries(gateRules.map((r) => [r.id, r.name]));
+    const dailyRows = (gateData.daily || [])
+      .map((row) => {
+        const c = row.counters || {};
+        const dateStr = row.date
+          ? row.date.slice(0, 4) + "-" + row.date.slice(4, 6) + "-" + row.date.slice(6, 8)
+          : "—";
+        const rname = ruleNameById[row.rule_id] || row.rule_id || "—";
+        return `<tr>
+          <td>${escapeHtml(dateStr)}</td>
+          <td>${escapeHtml(rname)}</td>
+          <td>${c.footfall || 0}</td>
+          <td>${c.persons_in || 0}</td>
+          <td>${c.persons_out || 0}</td>
+          <td>${c.cars_in || 0}</td>
+          <td>${c.cars_out || 0}</td>
+          <td>${c.gate_opens || 0}</td>
+          <td>${c.gate_closes || 0}</td>
+        </tr>`;
+      })
+      .join("");
+    let gateCsvQ = "/reports/gate/csv?period=" + encodeURIComponent(period);
+    if (period === "hours") gateCsvQ += "&hours=" + encodeURIComponent(hours);
+    if (ruleFilter) gateCsvQ += "&rule_id=" + encodeURIComponent(ruleFilter);
     main.innerHTML = `
-      <div class="sa-h"><div><h2>Reports</h2><p>Alert summaries and gate activity counters. Export CSV when you need a file.</p></div></div>
-      <div class="sa-row" style="margin-bottom:1rem;">
-        <label class="sa-muted">Hours <input class="text-input" id="rep-hours" type="number" min="1" value="${escapeHtml(hours)}" style="width:6rem;display:inline-block;"></label>
+      <div class="sa-h"><div><h2>Reports</h2><p>Alert summaries and gate activity (footfall = people in + out). Export CSV when you need a file.</p></div></div>
+      <div class="sa-row" style="margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;">
+        <label class="sa-muted">Period
+          <select class="text-input" id="rep-period" style="max-width:160px;display:inline-block;">
+            <option value="daily"${period === "daily" ? " selected" : ""}>Today</option>
+            <option value="weekly"${period === "weekly" ? " selected" : ""}>Last 7 days</option>
+            <option value="monthly"${period === "monthly" ? " selected" : ""}>This month</option>
+            <option value="hours"${period === "hours" ? " selected" : ""}>Custom hours</option>
+          </select>
+        </label>
+        <label class="sa-muted"${showHoursInput ? "" : ' style="display:none;"'} id="rep-hours-wrap">Hours
+          <input class="text-input" id="rep-hours" type="number" min="1" value="${escapeHtml(hours)}" style="width:6rem;display:inline-block;">
+        </label>
         <button class="btn secondary" type="button" id="rep-go">Generate</button>
         <a class="btn secondary" href="${API}/reports/csv?hours=${escapeHtml(hours)}" style="display:inline-block;text-decoration:none;">Alerts CSV</a>
       </div>
@@ -1882,7 +3818,7 @@
         <div class="sa-card"><h3>People seen</h3><p>${(data.attendance_people || []).map(escapeHtml).join(", ") || "—"}</p></div>
       </div>
       <div class="sa-card" style="margin-top:1rem;">
-        <h3>Gate activity</h3>
+        <h3>Gate activity — ${escapeHtml(periodLabel)}</h3>
         <div class="sa-row" style="margin-bottom:0.75rem;">
           <label class="sa-muted">Gate rule
             <select class="text-input" id="rep-gate-rule" style="max-width:220px;display:inline-block;">
@@ -1890,31 +3826,53 @@
               ${gateRuleOpts}
             </select>
           </label>
-          <a class="btn secondary" href="${API}/reports/gate/csv?hours=${escapeHtml(hours)}${ruleFilter ? "&rule_id=" + encodeURIComponent(ruleFilter) : ""}" style="display:inline-block;text-decoration:none;">Gate CSV</a>
+          <a class="btn secondary" href="${API}${gateCsvQ}" style="display:inline-block;text-decoration:none;">Gate CSV</a>
         </div>
         <div class="sa-gate-report-grid">
-          <div class="sa-card sa-gate-stat"><h4>Gate opens</h4><div class="sa-stat">${gt.gate_opens || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Gate closes</h4><div class="sa-stat">${gt.gate_closes || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Footfall</h4><div class="sa-stat">${gt.footfall || 0}</div><p class="sa-muted">People in + out</p></div>
           <div class="sa-card sa-gate-stat"><h4>People in</h4><div class="sa-stat">${gt.persons_in || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>People out</h4><div class="sa-stat">${gt.persons_out || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Cars in</h4><div class="sa-stat">${gt.cars_in || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Cars out</h4><div class="sa-stat">${gt.cars_out || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Bikes in</h4><div class="sa-stat">${gt.bikes_in || 0}</div></div>
-          <div class="sa-card sa-gate-stat"><h4>Bikes out</h4><div class="sa-stat">${gt.bikes_out || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Vehicle crossings</h4><div class="sa-stat">${gt.vehicle_crossings || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Gate opens</h4><div class="sa-stat">${gt.gate_opens || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Gate closes</h4><div class="sa-stat">${gt.gate_closes || 0}</div></div>
+          <div class="sa-card sa-gate-stat"><h4>Bikes in/out</h4><div class="sa-stat">${gt.bikes_in || 0} / ${gt.bikes_out || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Near zone</h4><div class="sa-stat">${gt.near_events || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Medium zone</h4><div class="sa-stat">${gt.medium_events || 0}</div></div>
           <div class="sa-card sa-gate-stat"><h4>Far zone</h4><div class="sa-stat">${gt.far_events || 0}</div></div>
         </div>
+        ${
+          showDailyTable
+            ? `<div class="sa-daily-report" style="margin-top:1rem;overflow-x:auto;">
+          <h4>Daily breakdown</h4>
+          <table class="sa-table">
+            <thead><tr>
+              <th>Date</th><th>Rule</th><th>Footfall</th><th>In</th><th>Out</th>
+              <th>Cars in</th><th>Cars out</th><th>Opens</th><th>Closes</th>
+            </tr></thead>
+            <tbody>${dailyRows || "<tr><td colspan='9'>No daily data in this period</td></tr>"}</tbody>
+          </table>
+        </div>`
+            : ""
+        }
       </div>
       <div class="sa-card"><h3>By type</h3><ul class="sa-muted">${types || "<li>None</li>"}</ul></div>
       <div class="sa-card" style="margin-top:0.8rem;"><h3>By camera</h3><ul class="sa-muted">${cams || "<li>None</li>"}</ul></div>`;
     document.getElementById("rep-go").onclick = () => reports();
     document.getElementById("rep-gate-rule")?.addEventListener("change", () => reports());
+    document.getElementById("rep-period")?.addEventListener("change", () => {
+      const p = document.getElementById("rep-period")?.value;
+      const wrap = document.getElementById("rep-hours-wrap");
+      if (wrap) wrap.style.display = p === "hours" ? "" : "none";
+      if (p !== "hours") reports();
+    });
   }
 
   function settings() {
     const s = state.status?.site || {};
     const nums = (s.whatsapp_numbers || []).join(", ");
+    const emails = (s.alert_emails || []).join(", ");
     main.innerHTML = `
       <div class="sa-h"><div><h2>Settings</h2><p>Roles, quiet hours, and recipients. Viewer can only open Alerts and Reports.</p></div></div>
       <div class="sa-form">
@@ -1925,11 +3883,27 @@
           </select>
         </div>
         <div class="sa-field"><label>Admin PIN (optional)</label><input class="text-input" id="s-pin" type="password" placeholder="Leave blank for open admin" value="${escapeHtml(s.admin_pin)}"></div>
+        <div class="sa-field"><label>Contact name</label><input class="text-input" id="s-contact-name" placeholder="Primary contact" value="${escapeHtml(s.contact_name || "")}"></div>
+        <div class="sa-field">
+          <label>Contact email</label>
+          <input class="text-input" id="s-contact-email" type="email" placeholder="you@example.com" value="${escapeHtml(s.contact_email || "")}">
+          <p class="sa-muted sa-field-hint">Primary address for alerts and further communication (kept first in the list below).</p>
+        </div>
         <div class="sa-field"><label>Quiet hours start</label><input class="text-input" id="s-qh1" placeholder="22:00" value="${escapeHtml(s.quiet_hours_start)}"></div>
         <div class="sa-field"><label>Quiet hours end</label><input class="text-input" id="s-qh2" placeholder="07:00" value="${escapeHtml(s.quiet_hours_end)}"></div>
         <div class="sa-field"><label>WhatsApp numbers (comma separated, country code)</label><input class="text-input" id="s-wa" value="${escapeHtml(nums)}"></div>
+        <div class="sa-field">
+          <label>Alert emails (comma separated)</label>
+          <input class="text-input" id="s-email" value="${escapeHtml(emails)}" placeholder="ops@example.com, owner@example.com">
+          <p class="sa-muted sa-field-hint">${
+            state.status?.email_configured
+              ? "SMTP ready (PASSWORD_EMAIL / EMAIL_FROM from .env). Extra addresses allowed; contact email stays primary."
+              : "SMTP not configured — set SMTP_SERVER, USERNAME_EMAIL, PASSWORD_EMAIL, EMAIL_FROM in .env, then recreate the app container."
+          }</p>
+        </div>
         <button class="btn primary" type="button" id="s-save"${isAdmin() ? "" : " disabled"}>Save settings</button>
         <button class="btn secondary" type="button" id="s-test"${isAdmin() ? "" : " disabled"}>Send WhatsApp test</button>
+        <button class="btn secondary" type="button" id="s-test-email"${isAdmin() ? "" : " disabled"}>Send email test</button>
         <span id="s-msg" class="sa-muted"></span>
       </div>`;
     document.getElementById("s-role").onchange = async (e) => {
@@ -1939,32 +3913,76 @@
       e.target.value = state.role;
     };
     document.getElementById("s-save").onclick = async () => {
+      const contactEmail = (document.getElementById("s-contact-email")?.value || "").trim();
+      if (contactEmail && !contactEmail.includes("@")) {
+        document.getElementById("s-msg").textContent = "Enter a valid contact email.";
+        return;
+      }
       const numbers = document
         .getElementById("s-wa")
+        .value.split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const alertEmails = document
+        .getElementById("s-email")
         .value.split(",")
         .map((x) => x.trim())
         .filter(Boolean);
       await api("/site", {
         json: {
           admin_pin: document.getElementById("s-pin").value,
+          contact_name: (document.getElementById("s-contact-name")?.value || "").trim(),
+          contact_email: contactEmail,
           quiet_hours_start: document.getElementById("s-qh1").value,
           quiet_hours_end: document.getElementById("s-qh2").value,
           whatsapp_numbers: numbers,
+          alert_emails: alertEmails,
         },
       });
       await refresh();
       document.getElementById("s-msg").textContent = "Saved";
+      settings();
     };
     document.getElementById("s-test").onclick = async () => {
       const r = await api("/whatsapp/test", { method: "POST", json: { message: "Site Admin test" } });
       document.getElementById("s-msg").textContent = r.configured
-        ? "Sent (check phone)"
-        : "API not configured — set env vars";
+        ? "WhatsApp sent (check phone)"
+        : "WhatsApp API not configured — set env vars";
+    };
+    document.getElementById("s-test-email").onclick = async () => {
+      const r = await api("/email/test", {
+        method: "POST",
+        json: { message: "Site Admin email test", subject: "Camera Intelligence test" },
+      });
+      const ok = (r.results || []).some((x) => x.ok);
+      document.getElementById("s-msg").textContent = !r.configured
+        ? "SMTP not configured — set PASSWORD_EMAIL in .env"
+        : ok
+          ? "Email sent (check inbox)"
+          : "Email failed — " + ((r.results || [])[0]?.reason || "unknown");
     };
   }
 
   document.querySelectorAll(".sa-tabs [data-view]").forEach((b) => {
     b.onclick = () => go(b.getAttribute("data-view"));
+  });
+
+  document.getElementById("live-preview-toggle")?.addEventListener("click", toggleScanPreviewSidebar);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearScanPreviewTimer();
+      return;
+    }
+    if (scanPreviewWanted()) {
+      ensureScanPreviewLoop();
+      state.scanPreviewGen += 1;
+      refreshPreviewFrames(state.scanPreviewGen);
+    }
+  });
+
+  window.addEventListener("beforeunload", () => {
+    clearScanPreviewTimer();
   });
 
   roleSwitch?.querySelectorAll(".sa-role-btn").forEach((btn) => {

@@ -118,6 +118,7 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                 "track_side": {},
                 "crossed": set(),
                 "track_band": {},
+                "journey_labels": {},
                 "gate_state": "unknown",
                 "baseline_score": None,
                 "baseline_samples": [],
@@ -209,6 +210,8 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                     deltas["gate_closes"] += 1
 
         band_counts = {"near": 0, "medium": 0, "far": 0}
+        person_tracks: List[Dict[str, Any]] = []
+        journey_labels: Dict[int, str] = dict(st.get("journey_labels") or {})
 
         try:
             results = self.detector.track(
@@ -228,9 +231,10 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                     if tid not in active:
                         st["track_side"].pop(tid, None)
                         st["track_band"].pop(tid, None)
+                        journey_labels.pop(tid, None)
 
                 for box, tid, cls_id in zip(boxes, track_ids, cls_ids):
-                    x1, y1, x2, y2 = box
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
                     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
                     tid = int(tid)
                     kind = _classify(int(cls_id))
@@ -239,6 +243,15 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
 
                     foot = _foot_point(x1, y1, x2, y2)
                     cx, cy = int(foot[0]), int(foot[1])
+
+                    if kind == "person":
+                        person_tracks.append(
+                            {
+                                "track_id": tid,
+                                "xyxy": [x1, y1, x2, y2],
+                                "kind": kind,
+                            }
+                        )
 
                     if kind == "person" and zones:
                         band = _band_for_point(foot, zones, w, h)
@@ -274,9 +287,16 @@ class GateAnalyticsPipeline(BaseVideoPipeline):
                     color = (0, 220, 60) if kind == "person" else (255, 180, 0)
                     cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
                     cv2.circle(out, (cx, cy), 4, color, -1)
-                    cv2.putText(out, f"{kind}:{tid}", (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                    jlabel = journey_labels.get(tid) or ""
+                    tag = f"{kind}:{tid}"
+                    if jlabel:
+                        tag = f"{jlabel} {tag}"
+                    cv2.putText(out, tag, (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                st["journey_labels"] = journey_labels
         except Exception as e:
             logger.warning("gate analytics frame error: %s", e)
+
+        meta["person_tracks"] = person_tracks
 
         for k, v in deltas.items():
             st["session_totals"][k] = st["session_totals"].get(k, 0) + v

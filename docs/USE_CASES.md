@@ -13,6 +13,18 @@ Rules are the heart of Site Admin. Each saved rule is `camera + scan_type + geom
 | Face / staff attendance | `face_attendance` | Staff presence; approve in **Staff** | High | Identity — learn then approve |
 | Vehicle / number plate | `vehicle` | Plates; approve in **Vehicles** | High | See identity flow below |
 
+## Cross-camera journeys
+
+Site Admin can link the **same person or vehicle across cameras**:
+
+1. **Face** — shared `person_id` (FAISS) → stable global ID `G########`
+2. **Plate** — normalized plate key → same global ID on any camera
+3. **Anonymous Re-ID** — person appearance (OSNet ONNX if present, else OpenCV fallback) within a handoff window (~120s)
+
+See **Journeys** in Site Admin for the camera path (Cam A → Cam B). Live Monitor shows badges for journeys on the active camera.
+
+Gate **counts** stay per camera; journeys are a parallel trail.
+
 ## Coming soon (listed in Rules dropdown; cannot save yet)
 
 | Label | `scan_type` | Typical need | Fit |

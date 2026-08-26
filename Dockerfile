@@ -23,8 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Pre-download YOLO weights so first Monitor / pipeline run is not blocked on GitHub
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt'); YOLO('yolov8n-pose.pt')"
+# Bundled weights in models/ — host must download first; no GitHub access during Docker build.
+COPY scripts/ensure_ultralytics_weights.py scripts/
+COPY models/ models/
+ENV BUILD_IN_DOCKER=1
+RUN python scripts/ensure_ultralytics_weights.py
 
 COPY . .
 

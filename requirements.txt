@@ -26,3 +26,7 @@ rapidocr-onnxruntime
 
 # ── Redis (single application database) ──────────────────────────────────────
 redis
+
+# ── Site Admin (DVR HTTP snapshot cameras) ───────────────────────────────────
+# Hikvision ISAPI /picture fetch with HTTP digest auth
+requests
