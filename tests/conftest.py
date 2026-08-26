@@ -31,11 +31,16 @@ def _stub_module(dotted_name: str, **attrs):
 # ---------------------------------------------------------------------------
 # Third-party stubs (Docker-only packages)
 # ---------------------------------------------------------------------------
-_stub_module("redis")
-_stub_module("redis.client")
-_stub_module("rapidocr_onnxruntime")
-_stub_module("paddleocr")
-_stub_module("paddle")
+_THIRD_PARTY_STUBS = [
+    "redis",
+    "redis.client",
+    "rapidocr_onnxruntime",
+    "paddleocr",
+    "paddle",
+    "faiss",
+]
+for _mod in _THIRD_PARTY_STUBS:
+    _stub_module(_mod)
 
 # ultralytics — must expose a callable YOLO class
 _yolo_cls = _mock.MagicMock(name="YOLO")
@@ -58,43 +63,12 @@ sys.modules["cv2"] = _cv2
 # Shapely — use the real library if installed, otherwise stub it out
 # ---------------------------------------------------------------------------
 try:
-    from shapely.geometry import Point as _Point, Polygon as _Polygon   # noqa
-    _shape_ns = types.SimpleNamespace(Point=_Point, Polygon=_Polygon)
+    from shapely.geometry import Point as _Point, Polygon as _Polygon, box as _box   # noqa
+    _shape_ns = types.SimpleNamespace(Point=_Point, Polygon=_Polygon, box=_box)
     sys.modules["shapely"] = _mock.MagicMock(_SHAPELY_AVAILABLE=True)
     sys.modules["shapely.geometry"] = _shape_ns
 except ImportError:
     sys.modules["shapely"] = _mock.MagicMock(_SHAPELY_AVAILABLE=False)
     sys.modules["shapely.geometry"] = _mock.MagicMock()
 
-# ---------------------------------------------------------------------------
-# Project-internal stubs (these import Redis at module level)
-# ---------------------------------------------------------------------------
 
-# core.redis_client — provide the two symbols that database.py needs
-def _redis_str(val, default=""):
-    if isinstance(val, bytes):
-        return val.decode()
-    return str(val) if val else default
-
-
-_rc_mod = types.ModuleType("core.redis_client")
-_rc_mod.get_redis = _mock.MagicMock(return_value=_mock.MagicMock())
-_rc_mod.redis_str = _redis_str
-sys.modules["core"] = _mock.MagicMock()
-sys.modules["core.redis_client"] = _rc_mod
-
-# core.base_pipeline — minimal no-op base class
-class _BaseVideoPipeline:
-    def initialize(self, **kwargs): pass
-    def process_frame(self, *a, **kw): pass
-    def run_on_video(self, *a, **kw): return iter([])
-
-
-_bp_mod = types.ModuleType("core.base_pipeline")
-_bp_mod.BaseVideoPipeline = _BaseVideoPipeline
-sys.modules["core.base_pipeline"] = _bp_mod
-
-# core.video_source
-_vs_mod = types.ModuleType("core.video_source")
-_vs_mod.get_video_source = _mock.MagicMock()
-sys.modules["core.video_source"] = _vs_mod

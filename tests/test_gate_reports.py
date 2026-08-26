@@ -98,7 +98,12 @@ class GateReportStorageTests(unittest.TestCase):
         rule_id = "rule-gate-3"
         now = time.time()
         day_bucket = time.strftime("%Y%m%d", time.localtime(now))
+        hour_bucket = time.strftime("%Y%m%d%H", time.localtime(now))
         self.fake.hashes[f"gate:daily:{rule_id}:{day_bucket}"] = {
+            b"persons_in": b"5",
+            b"persons_out": b"2",
+        }
+        self.fake.hashes[f"gate:hourly:{rule_id}:{hour_bucket}"] = {
             b"persons_in": b"5",
             b"persons_out": b"2",
         }

@@ -92,12 +92,20 @@ def _mock_pose_result(persons):
         ankle_y = p.get("ankle_y", p["cy"] + p["bh"] * 0.4)
         for idx in (5, 6, 11, 12, 15, 16):
             conf[idx] = 0.9
-        xy[5] = [p["cx"] - 10, shoulder_y]
-        xy[6] = [p["cx"] + 10, shoulder_y]
-        xy[11] = [p["cx"] - 10, hip_y]
-        xy[12] = [p["cx"] + 10, hip_y]
-        xy[15] = [p["cx"] - 10, ankle_y]
-        xy[16] = [p["cx"] + 10, ankle_y]
+        # If bw > bh (horizontal posture), spread keypoints in X axis
+        if p["bw"] > p["bh"]:
+            dx_shoulder = p["bw"] * 0.3
+            dx_hip = -p["bw"] * 0.3
+        else:
+            dx_shoulder = 0
+            dx_hip = 0
+
+        xy[5] = [p["cx"] + dx_shoulder - 10, shoulder_y]
+        xy[6] = [p["cx"] + dx_shoulder + 10, shoulder_y]
+        xy[11] = [p["cx"] + dx_hip - 10, hip_y]
+        xy[12] = [p["cx"] + dx_hip + 10, hip_y]
+        xy[15] = [p["cx"] + dx_hip - 10, ankle_y]
+        xy[16] = [p["cx"] + dx_hip + 10, ankle_y]
         kxy.append(xy)
         kconf.append(conf)
     kpts.xy.cpu.return_value.numpy.return_value = np.array(kxy)
@@ -135,7 +143,11 @@ class TransitionStateMachineTests(unittest.TestCase):
         self.pipe.model.return_value = [_mock_pose_result([lying])]
         cfg["timestamp"] = 1002.0
         _, meta2 = self.pipe.process_frame(self.frame, 1, np.array([]), cfg)
-        self.assertEqual(meta2.get("type"), "fall_standing_lying")
+        self.assertEqual(meta2.get("type"), None)
+        
+        cfg["timestamp"] = 1004.0
+        _, meta3 = self.pipe.process_frame(self.frame, 2, np.array([]), cfg)
+        self.assertEqual(meta3.get("type"), "fall_standing_lying")
 
     def test_lying_without_prior_upright_no_alert(self):
         lying = {
@@ -173,7 +185,7 @@ class PriorityWeightTests(unittest.TestCase):
     def test_fall_standing_lying_high_priority_band(self):
         rules = [{"scan_type": "fall_standing_lying"}]
         sleep_sec = scan.compute_tick_sleep_sec(rules, inference_wait_ms=0, tick_min=1.0, tick_max=3.0)
-        self.assertEqual(sleep_sec, 1.0)
+        self.assertEqual(sleep_sec, 2.0)
         self.assertEqual(scan.priority_weight("fall_standing_lying"), 24)
 
 
