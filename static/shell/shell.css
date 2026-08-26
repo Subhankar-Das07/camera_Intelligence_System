@@ -44,21 +44,45 @@ body {
 
 .cis-brand {
     display: flex;
-    flex-direction: column;
+    align-items: center;
+    gap: 0.65rem;
     text-decoration: none;
     color: var(--text-primary);
-    min-width: 180px;
+    min-width: 0;
+    flex-shrink: 0;
+}
+
+.cis-brand-logo {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    object-fit: cover;
+    flex-shrink: 0;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.cis-brand--logo-only .cis-brand-logo {
+    width: 44px;
+    height: 44px;
+}
+
+.cis-brand-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
 }
 
 .cis-brand strong {
     font-size: 0.95rem;
     letter-spacing: 0.02em;
     color: #60a5fa;
+    line-height: 1.2;
 }
 
-.cis-brand span {
+.cis-brand-tag {
     font-size: 0.7rem;
     color: var(--text-secondary);
+    line-height: 1.25;
 }
 
 .cis-nav-links {
@@ -88,6 +112,15 @@ body {
     color: #fff;
     background: rgba(59, 130, 246, 0.22);
     border-color: rgba(59, 130, 246, 0.45);
+}
+
+/* Landing Overview: transparent sticky bar sits over full-bleed hero */
+body.landing {
+    background: #0c1219;
+}
+
+body.landing .cis-page {
+    min-height: 0;
 }
 
 .cis-page {

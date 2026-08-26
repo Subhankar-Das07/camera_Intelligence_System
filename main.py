@@ -34,6 +34,7 @@ from core.redis_client import get_redis, redis_str
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
 from core.site_admin_api import router as site_admin_router
+from core.site_admin_search_api import router as site_admin_search_router
 from core.site_admin_runtime import start_runtime
 from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
@@ -71,11 +72,13 @@ ALERTS_DIR  = os.path.join(STORAGE_DIR, "alerts")
 for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
     os.makedirs(d, exist_ok=True)
 os.makedirs("storage/vehicle_images", exist_ok=True)
+os.makedirs("storage/search", exist_ok=True)
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
 app.include_router(mobile_router)
 app.include_router(site_admin_router)
+app.include_router(site_admin_search_router)
 
 @app.on_event("startup")
 async def _on_startup():

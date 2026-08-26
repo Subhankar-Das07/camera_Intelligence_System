@@ -51,6 +51,19 @@
     scanPreviewFocusCamId: "",
     scanPreviewLastHeroAt: 0,
     scanPreviewStatusTimer: null,
+    searchStep: 1,
+    searchCameraId: "",
+    searchRuleIds: [],
+    searchClipStartSec: 0,
+    searchClipEndSec: 180,
+    searchVideoMeta: null,
+    searchClipDragging: false,
+    searchFilmstripCache: {},
+    searchFilmstripGen: 0,
+    searchJobId: "",
+    searchPoll: null,
+    searchProgress: null,
+    searchResults: [],
   };
 
   function emptyGateConfig() {
@@ -603,7 +616,23 @@
     return data;
   }
 
-  const ADMIN_VIEWS = ["wizard", "cameras", "rules", "staff", "vehicles", "settings"];
+  async function searchApi(path, opts = {}) {
+    const method = opts.method || (opts.json || opts.body ? "POST" : "GET");
+    const res = await fetch("/api/site-admin/search" + path, {
+      method,
+      headers: headers(opts.json ? { "Content-Type": "application/json" } : opts.headers),
+      body: opts.json ? JSON.stringify(opts.json) : opts.body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      const msg = typeof d === "string" ? d : d ? JSON.stringify(d) : res.statusText;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  const ADMIN_VIEWS = ["wizard", "cameras", "rules", "staff", "vehicles", "settings", "search"];
 
   function isAdmin() {
     return state.role !== "viewer";
@@ -622,6 +651,9 @@
       b.style.display = locked ? "none" : "";
     });
     document.querySelectorAll(".sa-nav-group[data-nav-group='rules']").forEach((g) => {
+      g.style.display = hideAdmin ? "none" : "";
+    });
+    document.querySelectorAll(".sa-nav-group[data-nav-group='others']").forEach((g) => {
       g.style.display = hideAdmin ? "none" : "";
     });
   }
@@ -1334,6 +1366,9 @@
   }
 
   function go(view) {
+    if (state.view === "search" && view !== "search") {
+      searchStopPoll();
+    }
     if (state.view === "monitor" && view !== "monitor") {
       stopMonitorIfAny();
     }
@@ -1364,6 +1399,7 @@
       journeys,
       alerts,
       reports,
+      search: searchView,
       settings,
     };
     (views[state.view] || wizard)();
@@ -4210,6 +4246,510 @@
     });
   }
 
+  function searchStopPoll() {
+    if (state.searchPoll) {
+      clearInterval(state.searchPoll);
+      state.searchPoll = null;
+    }
+  }
+
+  function searchRulesForCamera(camId) {
+    return state.rules.filter((r) => r.camera_id === camId && r.enabled !== false);
+  }
+
+  function searchClipWindowSec(meta) {
+    const dur = Number(meta?.duration_sec) || 0;
+    const maxClip = Number(meta?.max_clip_sec) || 180;
+    return Math.min(maxClip, dur || maxClip);
+  }
+
+  function searchInitClipFromMeta(meta) {
+    const dur = Number(meta?.duration_sec) || 0;
+    const win = searchClipWindowSec(meta);
+    state.searchVideoMeta = meta;
+    state.searchClipStartSec = 0;
+    state.searchClipEndSec = Math.min(win, dur || win);
+  }
+
+  function searchSetClipStart(startSec) {
+    const meta = state.searchVideoMeta;
+    if (!meta) return;
+    const dur = Number(meta.duration_sec) || 0;
+    const win = searchClipWindowSec(meta);
+    const maxStart = Math.max(0, dur - win);
+    const start = Math.max(0, Math.min(Number(startSec) || 0, maxStart));
+    state.searchClipStartSec = start;
+    state.searchClipEndSec = Math.min(start + win, dur);
+  }
+
+  function searchClipLabel() {
+    return `${formatMonitorTime(state.searchClipStartSec)} – ${formatMonitorTime(state.searchClipEndSec)}`;
+  }
+
+  const SEARCH_FILMSTRIP_FRAMES = 18;
+  const SEARCH_FILMSTRIP_HEIGHT = 48;
+
+  function searchSeekVideo(video, timeSec) {
+    return new Promise((resolve) => {
+      if (!video) {
+        resolve(false);
+        return;
+      }
+      const target = Math.max(0, Math.min(timeSec, (video.duration || timeSec) - 0.05));
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        video.removeEventListener("seeked", onSeeked);
+        resolve(ok);
+      };
+      const onSeeked = () => finish(true);
+      video.addEventListener("seeked", onSeeked);
+      try {
+        video.currentTime = target;
+      } catch (_) {
+        finish(false);
+        return;
+      }
+      setTimeout(() => finish(false), 4000);
+    });
+  }
+
+  async function searchBuildFilmstrip(videoEl, meta) {
+    const camId = meta?.camera_id || state.searchCameraId;
+    const thumbsEl = document.getElementById("sr-clip-thumbs");
+    const loadingEl = document.getElementById("sr-clip-filmstrip-loading");
+    if (!thumbsEl || !videoEl || !camId) return;
+
+    const gen = ++state.searchFilmstripGen;
+    const cached = state.searchFilmstripCache[camId];
+    if (cached?.urls?.length) {
+      thumbsEl.innerHTML = "";
+      cached.urls.forEach((u) => {
+        const img = document.createElement("img");
+        img.src = u;
+        img.className = "sa-search-filmstrip-thumb";
+        img.alt = "";
+        thumbsEl.appendChild(img);
+      });
+      if (loadingEl) loadingEl.hidden = true;
+      if (!state.searchClipDragging) videoEl.currentTime = state.searchClipStartSec;
+      return;
+    }
+
+    if (loadingEl) loadingEl.hidden = false;
+    thumbsEl.innerHTML = "";
+
+    const dur = Number(meta.duration_sec) || videoEl.duration || 0;
+    if (dur <= 0) {
+      if (loadingEl) loadingEl.hidden = true;
+      return;
+    }
+
+    const n = Math.max(4, Math.min(SEARCH_FILMSTRIP_FRAMES, Math.max(4, Math.ceil(dur / 15))));
+    const urls = [];
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    for (let i = 0; i < n; i++) {
+      if (gen !== state.searchFilmstripGen) return;
+      const t = n <= 1 ? 0 : (i / (n - 1)) * Math.max(0, dur - 0.1);
+      const ok = await searchSeekVideo(videoEl, t);
+      if (!ok || !videoEl.videoWidth) continue;
+      const aspect = videoEl.videoWidth / Math.max(1, videoEl.videoHeight);
+      canvas.width = Math.max(32, Math.round(SEARCH_FILMSTRIP_HEIGHT * aspect));
+      canvas.height = SEARCH_FILMSTRIP_HEIGHT;
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      const url = canvas.toDataURL("image/jpeg", 0.62);
+      urls.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.className = "sa-search-filmstrip-thumb";
+      img.alt = "";
+      thumbsEl.appendChild(img);
+    }
+
+    if (gen !== state.searchFilmstripGen) return;
+    state.searchFilmstripCache[camId] = { urls };
+    if (loadingEl) loadingEl.hidden = true;
+    if (!state.searchClipDragging) videoEl.currentTime = state.searchClipStartSec;
+  }
+
+  function searchWireClipTimeline() {
+    const track = document.getElementById("sr-clip-track");
+    const box = document.getElementById("sr-clip-box");
+    const video = document.getElementById("sr-clip-video");
+    const shadeL = document.getElementById("sr-clip-shade-l");
+    const shadeR = document.getElementById("sr-clip-shade-r");
+    const meta = state.searchVideoMeta;
+    if (!track || !box || !meta) return;
+
+    const dur = Number(meta.duration_sec) || 1;
+    const win = searchClipWindowSec(meta);
+    const draggable = dur > win + 0.5;
+
+    const applyBox = () => {
+      const leftPct = (state.searchClipStartSec / dur) * 100;
+      const widthPct = (win / dur) * 100;
+      box.style.left = `${leftPct}%`;
+      box.style.width = `${widthPct}%`;
+      box.classList.toggle("is-locked", !draggable);
+      if (shadeL) shadeL.style.width = `${leftPct}%`;
+      if (shadeR) {
+        shadeR.style.left = `${leftPct + widthPct}%`;
+        shadeR.style.width = `${Math.max(0, 100 - leftPct - widthPct)}%`;
+      }
+      const label = document.getElementById("sr-clip-label");
+      if (label) {
+        label.textContent = `${searchClipLabel()} of ${formatMonitorTime(dur)}`;
+      }
+      if (video && !state.searchClipDragging) {
+        video.currentTime = state.searchClipStartSec;
+      }
+    };
+
+    applyBox();
+
+    if (!draggable) return;
+
+    const posToStart = (clientX) => {
+      const rect = track.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const centerSec = ratio * dur;
+      searchSetClipStart(centerSec - win / 2);
+      applyBox();
+    };
+
+    const bindDrag = (getX) => (e) => {
+      e.preventDefault();
+      state.searchClipDragging = true;
+      const onMove = (ev) => {
+        if (!state.searchClipDragging) return;
+        posToStart(getX(ev));
+      };
+      const endDrag = () => {
+        state.searchClipDragging = false;
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", endDrag);
+        document.removeEventListener("touchmove", onMove);
+        document.removeEventListener("touchend", endDrag);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", endDrag);
+      document.addEventListener("touchmove", onMove, { passive: true });
+      document.addEventListener("touchend", endDrag);
+    };
+
+    box.addEventListener("mousedown", bindDrag((ev) => ev.clientX));
+    box.addEventListener(
+      "touchstart",
+      bindDrag((ev) => (ev.touches[0] ? ev.touches[0].clientX : 0)),
+      { passive: false }
+    );
+
+    track.addEventListener("click", (e) => {
+      if (e.target === box || box.contains(e.target)) return;
+      posToStart(e.clientX);
+    });
+  }
+
+  function searchInitClipEditor() {
+    const video = document.getElementById("sr-clip-video");
+    const meta = state.searchVideoMeta;
+    if (!video || !meta) return;
+    searchWireClipTimeline();
+    const runFilmstrip = () => {
+      searchBuildFilmstrip(video, meta).catch(() => {});
+    };
+    if (video.readyState >= 1) {
+      runFilmstrip();
+    } else {
+      video.addEventListener("loadedmetadata", runFilmstrip, { once: true });
+    }
+  }
+
+  async function searchView() {
+    if (!isAdmin()) {
+      main.innerHTML = `<p class="sa-muted">Search is admin-only.</p>`;
+      return;
+    }
+    await loadLists();
+    const step = state.searchStep;
+    const stepLabels = ["Pick feed", "Select clip", "Select rules", "Scan & results"];
+    const stepper = stepLabels
+      .map((label, i) => {
+        const n = i + 1;
+        const cls = n === step ? "is-active" : n < step ? "is-done" : "";
+        return `<li class="sa-search-step ${cls}"><span class="sa-search-step-num">${n}</span><span class="sa-search-step-label">${escapeHtml(label)}</span></li>`;
+      })
+      .join("");
+
+    const fileCams = state.cameras.filter((c) => c.type === "file");
+    let body = "";
+    let clipMetaError = "";
+
+    if (step === 2 && state.searchCameraId) {
+      const needMeta =
+        !state.searchVideoMeta || state.searchVideoMeta.camera_id !== state.searchCameraId;
+      if (needMeta) {
+        try {
+          const res = await searchApi(`/cameras/${state.searchCameraId}/video-meta`);
+          searchInitClipFromMeta(res.meta || {});
+        } catch (e) {
+          clipMetaError = e.message || String(e);
+        }
+      }
+    }
+
+    if (step === 1) {
+      const camCards = fileCams.length
+        ? fileCams
+            .map((c) => {
+              const sel = c.id === state.searchCameraId ? " is-selected" : "";
+              const thumb = c.preview_url
+                ? `<img src="${escapeHtml(c.preview_url)}" alt="" class="sa-search-src-thumb">`
+                : "";
+              return `<button type="button" class="sa-search-src${sel}" data-cam="${escapeHtml(c.id)}">${thumb}<span><strong>${escapeHtml(c.name || c.id)}</strong><span class="sa-muted">Uploaded video</span></span></button>`;
+            })
+            .join("")
+        : `<p class="sa-muted">No uploaded videos yet. <button type="button" class="btn secondary" id="sr-goto-cams">Go to Cameras</button> to upload an MP4 first.</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 1 — Select camera feed</h3><p class="sa-muted">Uses videos uploaded in Cameras (file-type cameras only).</p><div class="sa-search-sources">${camCards}</div></div>`;
+    } else if (step === 2) {
+      const cam = state.cameras.find((c) => c.id === state.searchCameraId);
+      const meta = state.searchVideoMeta;
+      if (clipMetaError) {
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3><p class="sa-error">${escapeHtml(clipMetaError)}</p></div>`;
+      } else if (meta) {
+        const dur = Number(meta.duration_sec) || 0;
+        const win = searchClipWindowSec(meta);
+        const shortClip = dur <= win + 0.5;
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3>
+          <p class="sa-muted">Camera: <strong>${escapeHtml(cam?.name || state.searchCameraId || "—")}</strong>. Scan limited to <strong>${Math.round(win / 60)} min</strong> per job.</p>
+          ${shortClip ? `<p class="sa-muted">Full clip will be scanned (under 3 min).</p>` : `<p class="sa-muted">Drag the highlighted 3-minute window on the strip over the preview.</p>`}
+          ${
+            meta.video_url
+              ? `<div class="sa-search-clip-editor">
+            <video id="sr-clip-video" class="sa-search-preview-video" src="${escapeHtml(meta.video_url)}" controls muted playsinline preload="metadata"></video>
+            <div class="sa-search-clip-overlay">
+              <p class="sa-search-filmstrip-loading" id="sr-clip-filmstrip-loading">Building preview strip…</p>
+              <div class="sa-search-filmstrip" id="sr-clip-track" role="slider" aria-label="Scan clip position">
+                <div class="sa-search-filmstrip-thumbs" id="sr-clip-thumbs"></div>
+                <div class="sa-search-filmstrip-shade sa-search-filmstrip-shade--left" id="sr-clip-shade-l"></div>
+                <div class="sa-search-filmstrip-shade sa-search-filmstrip-shade--right" id="sr-clip-shade-r"></div>
+                <div class="sa-search-timeline-box" id="sr-clip-box"></div>
+              </div>
+              <div class="sa-search-clip-time" id="sr-clip-label">${escapeHtml(searchClipLabel())} of ${escapeHtml(formatMonitorTime(dur))}</div>
+            </div>
+          </div>`
+              : ""
+          }
+        </div>`;
+      } else {
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3><p class="sa-muted">Loading video info…</p></div>`;
+      }
+    } else if (step === 3) {
+      const cam = state.cameras.find((c) => c.id === state.searchCameraId);
+      const rules = searchRulesForCamera(state.searchCameraId);
+      const ruleChecks = rules.length
+        ? rules
+            .map((r) => {
+              const checked = state.searchRuleIds.includes(r.id) ? " checked" : "";
+              const label = catalogById(r.scan_type)?.label || (r.scan_type || "").replace(/_/g, " ");
+              return `<label class="sa-search-target"><input type="checkbox" class="sr-rule-cb" value="${escapeHtml(r.id)}"${checked}> <strong>${escapeHtml(r.name || r.id)}</strong> <span class="sa-badge">${escapeHtml(label)}</span></label>`;
+            })
+            .join("")
+        : `<p class="sa-muted">No rules for this camera. <button type="button" class="btn secondary" id="sr-goto-rules">Go to Rules</button> to create rules first.</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 3 — Select rules to replay</h3><p class="sa-muted">Camera: <strong>${escapeHtml(cam?.name || state.searchCameraId || "—")}</strong>. Clip: <strong>${escapeHtml(searchClipLabel())}</strong>. Choose up to 3 existing rules.</p><div class="sa-search-targets">${ruleChecks}</div></div>`;
+    } else {
+      const prog = state.searchProgress || { percent: 0, message: "Ready", phase: "idle" };
+      const scanning = state.searchJobId && prog.phase !== "done" && prog.phase !== "error";
+      const resultCards = (state.searchResults || []).length
+        ? state.searchResults
+            .map(
+              (ev) => `<article class="sa-search-result">
+              ${ev.thumb_url ? `<img src="${escapeHtml(ev.thumb_url)}" alt="" class="sa-search-cand-thumb">` : `<div class="sa-search-cand-thumb sa-search-cand-thumb--empty"></div>`}
+              <div class="sa-search-result-meta">
+                <strong>${escapeHtml(ev.rule_name || "")}</strong>
+                <span class="sa-badge">${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</span>
+                <p class="sa-muted">${escapeHtml(ev.message || "")}</p>
+                <span class="sa-muted">@ ${escapeHtml(formatMonitorTime(ev.ts_sec ?? 0))}</span>
+              </div>
+            </article>`
+            )
+            .join("")
+        : `<p class="sa-muted">${state.searchJobId && prog.phase === "done" ? "No rule breaks detected in this clip." : "Results appear here after the scan completes."}</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 4 — Scan &amp; results</h3>
+        <p class="sa-muted">Scan window: <strong>${escapeHtml(searchClipLabel())}</strong></p>
+        <div class="sa-search-progress" role="progressbar" aria-valuenow="${prog.percent || 0}"><div class="sa-search-progress-bar" style="width:${Math.min(100, prog.percent || 0)}%"></div></div>
+        <p class="sa-muted sa-search-progress-msg">${escapeHtml(prog.message || prog.phase || "")}</p>
+        ${!state.searchJobId || prog.phase === "error" ? `<button type="button" class="btn primary" id="sr-start"${scanning ? " disabled" : ""}>Start scan</button>` : ""}
+        ${prog.phase === "error" ? `<p class="sa-error">${escapeHtml(prog.message || "Scan failed")}</p>` : ""}
+        <div class="sa-search-results">${resultCards}</div>
+      </div>`;
+    }
+
+    main.innerHTML = `<div class="sa-h"><div><h2>Search</h2><p>Replay uploaded footage with your existing camera rules and review when rules break.</p></div></div>
+      <ol class="sa-search-stepper">${stepper}</ol>${body}
+      <div class="sa-row sa-search-nav">
+        ${step > 1 ? `<button type="button" class="btn secondary" id="sr-back">Back</button>` : ""}
+        ${step < 4 ? `<button type="button" class="btn primary" id="sr-next"${step === 2 && (clipMetaError || !state.searchVideoMeta) ? " disabled" : ""}>Continue</button>` : `<button type="button" class="btn secondary" id="sr-restart">New search</button>`}
+      </div>`;
+
+    document.getElementById("sr-goto-cams")?.addEventListener("click", () => go("cameras"));
+    document.getElementById("sr-goto-rules")?.addEventListener("click", () => go("rules"));
+
+    document.getElementById("sr-back")?.addEventListener("click", () => {
+      searchStopPoll();
+      if (step === 4) {
+        state.searchJobId = "";
+        state.searchProgress = null;
+        state.searchResults = [];
+      }
+      state.searchStep = Math.max(1, step - 1);
+      searchView();
+    });
+
+    document.getElementById("sr-restart")?.addEventListener("click", () => {
+      searchStopPoll();
+      state.searchStep = 1;
+      state.searchCameraId = "";
+      state.searchRuleIds = [];
+      state.searchVideoMeta = null;
+      state.searchClipStartSec = 0;
+      state.searchClipEndSec = 180;
+      state.searchJobId = "";
+      state.searchProgress = null;
+      state.searchResults = [];
+      searchView();
+    });
+
+    document.getElementById("sr-next")?.addEventListener("click", () => {
+      if (step === 1) {
+        if (!state.searchCameraId) {
+          alert("Select a camera feed");
+          return;
+        }
+        state.searchRuleIds = [];
+        state.searchVideoMeta = null;
+        state.searchStep = 2;
+        searchView();
+        return;
+      }
+      if (step === 2) {
+        if (!state.searchVideoMeta) {
+          alert("Wait for video info to load");
+          return;
+        }
+        state.searchStep = 3;
+        searchView();
+        return;
+      }
+      if (step === 3) {
+        const picked = [...main.querySelectorAll(".sr-rule-cb:checked")].map((el) => el.value);
+        if (!picked.length) {
+          alert("Select at least one rule");
+          return;
+        }
+        if (picked.length > 3) {
+          alert("Maximum 3 rules per search");
+          return;
+        }
+        state.searchRuleIds = picked;
+        state.searchStep = 4;
+        searchView();
+      }
+    });
+
+    if (step === 1) {
+      main.querySelectorAll(".sa-search-src[data-cam]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.searchCameraId = btn.getAttribute("data-cam") || "";
+          state.searchRuleIds = [];
+          state.searchVideoMeta = null;
+          searchView();
+        });
+      });
+    }
+
+    if (step === 2 && state.searchVideoMeta && !clipMetaError) {
+      searchInitClipEditor();
+    }
+
+    if (step === 3) {
+      main.querySelectorAll(".sr-rule-cb").forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const picked = [...main.querySelectorAll(".sr-rule-cb:checked")].map((el) => el.value);
+          if (picked.length > 3) {
+            cb.checked = false;
+            alert("Maximum 3 rules per search");
+            return;
+          }
+          state.searchRuleIds = picked;
+        });
+      });
+    }
+
+    if (step === 4) {
+      document.getElementById("sr-start")?.addEventListener("click", async () => {
+        try {
+          const { job } = await searchApi("/jobs", {
+            json: {
+              camera_id: state.searchCameraId,
+              rule_ids: state.searchRuleIds,
+              start_sec: state.searchClipStartSec,
+              end_sec: state.searchClipEndSec,
+            },
+          });
+          state.searchJobId = job.id;
+          state.searchProgress = { percent: 0, message: "Queued", phase: "queued" };
+          state.searchResults = [];
+          searchView();
+          searchStopPoll();
+          state.searchPoll = setInterval(async () => {
+            try {
+              if (!state.searchJobId) return;
+              const st = await searchApi(`/jobs/${state.searchJobId}`);
+              state.searchProgress = st.progress || state.searchProgress;
+              const jobSt = st.job || {};
+              if (jobSt.status === "error") {
+                searchStopPoll();
+                if (state.view === "search") searchView();
+                return;
+              }
+              if (jobSt.status === "done") {
+                searchStopPoll();
+                const res = await searchApi(`/jobs/${state.searchJobId}/results`);
+                state.searchResults = res.results || [];
+                if (state.view === "search") searchView();
+                return;
+              }
+              if (state.view === "search" && state.searchStep === 4) {
+                const bar = main.querySelector(".sa-search-progress-bar");
+                const msgEl = main.querySelector(".sa-search-progress-msg");
+                if (bar) bar.style.width = `${Math.min(100, state.searchProgress?.percent || 0)}%`;
+                if (msgEl) msgEl.textContent = state.searchProgress?.message || state.searchProgress?.phase || "";
+              }
+            } catch (_) {
+              /* ignore poll errors */
+            }
+          }, 1500);
+        } catch (e) {
+          alert(e.message || String(e));
+        }
+      });
+      if (state.searchJobId && state.searchPoll) {
+        /* polling active */
+      } else if (state.searchJobId && state.searchProgress?.phase === "done" && !state.searchResults.length) {
+        searchApi(`/jobs/${state.searchJobId}/results`)
+          .then((res) => {
+            state.searchResults = res.results || [];
+            if (state.view === "search") searchView();
+          })
+          .catch(() => {});
+      }
+    }
+  }
+
   function settings() {
     const s = state.status?.site || {};
     const nums = (s.whatsapp_numbers || []).join(", ");
@@ -4308,6 +4848,12 @@
     b.onclick = () => go(b.getAttribute("data-view"));
   });
 
+  document.getElementById("sa-nav-others")?.addEventListener("click", () => {
+    document.querySelectorAll(".sa-nav-group[data-nav-group='others']").forEach((g) => {
+      g.classList.toggle("is-open");
+    });
+  });
+
   document.getElementById("live-preview-toggle")?.addEventListener("click", toggleScanPreviewSidebar);
 
   document.addEventListener("visibilitychange", () => {
@@ -4337,6 +4883,16 @@
     .catch((e) => {
       main.innerHTML = `<p class="sa-error">Could not reach Site Admin API. Is Redis running? ${escapeHtml(e.message)}</p>`;
     });
+
+  window.SASearch = {
+    state,
+    main,
+    escapeHtml,
+    isAdmin,
+    loadLists,
+    searchApi,
+    search: searchView,
+  };
 
   setInterval(() => {
     refresh().catch(() => {});

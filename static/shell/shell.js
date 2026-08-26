@@ -5,11 +5,16 @@
 (function () {
   function currentNavKey() {
     const path = window.location.pathname.replace(/\/+$/, "") || "/";
-    if (path === "/" || path.endsWith("/features/overview")) return "overview";
-    if (path.includes("/features/zone-safety")) return "zone-safety";
-    if (path.includes("/features/vehicle")) return "vehicle";
-    if (path.includes("/features/face")) return "face";
-    if (path.includes("/features/site-admin")) return "site-admin";
+    if (path === "/" || path.endsWith("/features/overview")) return "home";
+    // Engineer feature pages live under Site Admin → Others; highlight Site Admin
+    if (
+      path.includes("/features/zone-safety") ||
+      path.includes("/features/vehicle") ||
+      path.includes("/features/face") ||
+      path.includes("/features/site-admin")
+    ) {
+      return "site-admin";
+    }
     return "";
   }
 
