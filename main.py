@@ -13,6 +13,21 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import List, Tuple, Dict, Any, Optional
 import json
+import numpy as np
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Convert numpy scalars/arrays to native Python types before JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 
 from core.registry import registry
 from core.redis_client import get_redis, redis_str
@@ -116,7 +131,7 @@ def _vr_alerts_key(session_id: str) -> str:
 
 
 def _append_session_alert(session_id: str, alert_event: Dict[str, Any]) -> None:
-    get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event).encode())
+    get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event, cls=_NumpyEncoder).encode())
 
 
 def _get_session_alerts(session_id: str) -> List[Dict[str, Any]]:
@@ -528,7 +543,7 @@ def stop_analysis(session_id: str):
         # Prevent double-posting: Attendance reports are handled by /api/attendance/stop
         if mode != "attendance":
             r = get_redis()
-            r.hset(f"reports:{mode}", session_id, json.dumps(report))
+            r.hset(f"reports:{mode}", session_id, json.dumps(report, cls=_NumpyEncoder))
         
     return {"status": "stopped"}
 
@@ -971,7 +986,7 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
                 # Use Redis Sets to avoid duplicate alerts for the same plate
                 added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
                 if added:
-                    r.rpush(_vr_alerts_key(session_id), json.dumps(alert).encode())
+                    r.rpush(_vr_alerts_key(session_id), json.dumps(alert, cls=_NumpyEncoder).encode())
 
         if frame is not None:
             ok, buf = cv2.imencode('.jpg', frame)
