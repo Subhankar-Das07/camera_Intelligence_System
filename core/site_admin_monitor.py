@@ -30,7 +30,7 @@ os.makedirs(MONITOR_TEMP_PREVIEW_DIR, exist_ok=True)
 MAX_SESSION_EVENTS = 50
 MAX_PREVIEW_EVENTS = 20
 # Heavy pipelines block the go-live preview lock for minutes; run them in workers only.
-PREVIEW_LIGHT_SCAN_TYPES = frozenset({"intrusion", "danger_zone", "gate_analytics"})
+PREVIEW_LIGHT_SCAN_TYPES = frozenset({"intrusion", "danger_zone", "gate_analytics", "loitering"})
 MONITOR_RULE_WORKERS = max(1, min(3, int(os.environ.get("SITE_ADMIN_MONITOR_RULE_WORKERS", "3"))))
 
 RULE_COLORS = [
@@ -410,6 +410,10 @@ def _draw_pose_cache_markers(
 
 
 def _monitor_eval_state(session: Dict[str, Any], frame_idx: int, pose_cache: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # Persist track/dwell/streak across frames (required for loitering + N-frame confirm).
+    dwell = session.setdefault("_dwell", {})
+    trackers = session.setdefault("_sv_trackers", {})
+    streaks = session.setdefault("_verify_streaks", {})
     return {
         "frame_idx": frame_idx,
         "pose_cache": pose_cache,
@@ -421,6 +425,9 @@ def _monitor_eval_state(session: Dict[str, Any], frame_idx: int, pose_cache: Opt
         "monitor_session": session,
         "session_lock": session.get("session_lock"),
         "skip_gate_store": bool(session.get("preview_only")) and not session.get("persist_stats"),
+        "_dwell": dwell,
+        "_sv_trackers": trackers,
+        "_verify_streaks": streaks,
     }
 
 
@@ -899,12 +906,30 @@ def _process_frame(session: Dict[str, Any], frame: np.ndarray) -> np.ndarray:
     frame_idx = session["frame_idx"]
     out = frame.copy()
 
-    needs_pose = any((r.get("scan_type") or "") in ("intrusion", "danger_zone") for r in rules)
+    needs_pose = any(
+        (r.get("scan_type") or "") in ("intrusion", "danger_zone", "loitering") for r in rules
+    )
     pose_cache = scan.build_pose_cache(frame) if needs_pose else None
     eval_state = _monitor_eval_state(session, frame_idx, pose_cache)
 
     hits = _evaluate_rules_parallel(session, cam, frame, rules, eval_state)
     hit_rule_ids = {rule.get("id") or "" for rule, _, _ in hits}
+
+    # Surface latest verifier votes for preview legend chips
+    votes_by_rule = eval_state.get("verifier_votes_by_rule") or {}
+    if votes_by_rule:
+        session["verifier_votes_by_rule"] = dict(votes_by_rule)
+        # Prefer a vote from a hit; else any recent
+        session["verifier_votes"] = None
+        for rule, event, _ in hits:
+            vv = (event or {}).get("verifier_votes")
+            if vv:
+                session["verifier_votes"] = vv
+                break
+        if session.get("verifier_votes") is None:
+            session["verifier_votes"] = next(iter(votes_by_rule.values()), None)
+    elif eval_state.get("verifier_votes"):
+        session["verifier_votes"] = eval_state.get("verifier_votes")
 
     for rule, event, annotated in hits:
         snap = annotated if annotated is not None else out
@@ -1012,7 +1037,7 @@ def _process_frame_for_stream(session: Dict[str, Any], frame: np.ndarray) -> Tup
     Live Monitor / DVR poll path: never block the HTTP response on face/vehicle.
     Those share a singleton InsightFace/YOLO with go-live workers and can hang
     forever under concurrent process_frame — matching go-live hero preview, we
-    only run light rules here and draw geometry for heavy ones.
+    only run light rules here (pose / gate / loitering) and draw geometry for heavy ones.
     """
     _refresh_watched_person_tracks(session, frame)
 
@@ -1498,6 +1523,10 @@ def get_preview_status(cam_id: str) -> Dict[str, Any]:
         }
         if session.get("gate_live"):
             out["gate_live"] = session.get("gate_live")
+        if session.get("verifier_votes"):
+            out["verifier_votes"] = session.get("verifier_votes")
+        if session.get("verifier_votes_by_rule"):
+            out["verifier_votes_by_rule"] = session.get("verifier_votes_by_rule")
         journey_live = session.get("journey_live")
         if not journey_live:
             try:

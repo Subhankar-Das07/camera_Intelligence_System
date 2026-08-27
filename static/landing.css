@@ -1,0 +1,585 @@
+/* Landing page — Camera Intelligence (steel slate + teal) */
+
+:root {
+    --lp-slate: #0c1219;
+    --lp-slate-mid: #151d28;
+    --lp-ink: #e8eef4;
+    --lp-muted: #9aabbc;
+    --lp-teal: #2dd4bf;
+    --lp-teal-dim: #0f766e;
+    --lp-panel: rgba(12, 18, 25, 0.72);
+    --lp-border: rgba(148, 163, 184, 0.28);
+    --lp-font: "Sora", system-ui, sans-serif;
+    --lp-serif: "Source Serif 4", Georgia, serif;
+}
+
+body.landing {
+    font-family: var(--lp-font);
+    background: var(--lp-slate);
+    color: var(--lp-ink);
+    overflow-x: hidden;
+}
+
+/* Logo-only overlay on hero (no nav links) */
+.lp-logo-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 3;
+    padding: 1.25rem 1.5rem;
+    background: linear-gradient(180deg, rgba(12, 18, 25, 0.88) 0%, rgba(12, 18, 25, 0.35) 70%, transparent 100%);
+    pointer-events: none;
+}
+
+.lp-logo-bar .cis-brand {
+    pointer-events: auto;
+}
+
+.lp-logo-bar .cis-brand-logo {
+    width: 44px;
+    height: 44px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* ── Hero (first viewport) ─────────────────────────────────────────────── */
+.lp-hero {
+    position: relative;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    align-items: flex-end;
+    padding: 2.5rem 1.5rem 3rem;
+}
+
+.lp-hero-media {
+    position: absolute;
+    inset: 0;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    z-index: 0;
+}
+
+.lp-hero-veil {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background:
+        linear-gradient(105deg, rgba(12, 18, 25, 0.94) 0%, rgba(12, 18, 25, 0.72) 38%, rgba(12, 18, 25, 0.45) 100%),
+        linear-gradient(0deg, rgba(12, 18, 25, 0.9) 0%, transparent 50%);
+    pointer-events: none;
+}
+
+.lp-hero-scan {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    background:
+        repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(45, 212, 191, 0.03) 2px,
+            rgba(45, 212, 191, 0.03) 3px
+        );
+    opacity: 0.6;
+}
+
+.lp-hero-inner {
+    position: relative;
+    z-index: 2;
+    width: min(1120px, 100%);
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 1.1fr minmax(280px, 360px);
+    gap: 2rem 2.5rem;
+    align-items: center;
+}
+
+.lp-hero-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.lp-eyebrow {
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--lp-teal);
+    margin: 0 0 0.85rem;
+}
+
+.lp-headline {
+    font-family: var(--lp-serif);
+    font-size: clamp(1.65rem, 3.2vw, 2.35rem);
+    font-weight: 600;
+    font-optical-sizing: auto;
+    line-height: 1.2;
+    color: #fff;
+    margin: 0 0 0.85rem;
+    max-width: 20ch;
+}
+
+.lp-lede {
+    font-size: 1.02rem;
+    line-height: 1.55;
+    color: var(--lp-muted);
+    margin: 0 0 1.1rem;
+    max-width: 42ch;
+}
+
+.lp-hero-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.lp-hero-chips li {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #cbd5e1;
+    border: 1px solid rgba(45, 212, 191, 0.35);
+    padding: 0.35rem 0.65rem;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.55);
+}
+
+.lp-hero-side {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+/* Mock live monitor — reinforces AI/CCTV product story */
+.lp-monitor {
+    background: rgba(8, 12, 18, 0.88);
+    border: 1px solid rgba(45, 212, 191, 0.28);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+
+.lp-monitor-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.45rem 0.65rem;
+    background: rgba(21, 29, 40, 0.95);
+    border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.lp-monitor-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #475569;
+}
+
+.lp-monitor-dot:first-child { background: #ef4444; }
+.lp-monitor-dot:nth-child(2) { background: #f59e0b; }
+.lp-monitor-dot:nth-child(3) { background: #22c55e; }
+
+.lp-monitor-title {
+    margin-left: auto;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--lp-teal);
+}
+
+.lp-monitor-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    grid-template-rows: auto auto;
+    gap: 4px;
+    padding: 4px;
+    min-height: 140px;
+}
+
+.lp-monitor-tile {
+    position: relative;
+    min-height: 64px;
+    border-radius: 4px;
+    background:
+        linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.95) 100%),
+        repeating-linear-gradient(90deg, transparent, transparent 8px, rgba(45, 212, 191, 0.04) 8px, rgba(45, 212, 191, 0.04) 9px);
+    border: 1px solid rgba(71, 85, 105, 0.5);
+}
+
+.lp-monitor-tile--main {
+    grid-row: span 2;
+    min-height: 132px;
+}
+
+.lp-box {
+    position: absolute;
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    padding: 0.2rem 0.35rem;
+    border-radius: 3px;
+    border: 1px solid;
+    white-space: nowrap;
+}
+
+.lp-box--vehicle {
+    top: 18%;
+    left: 8%;
+    width: 52%;
+    height: 38%;
+    border-color: #2dd4bf;
+    color: #2dd4bf;
+    background: rgba(45, 212, 191, 0.08);
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 0.25rem;
+}
+
+.lp-box--plate {
+    bottom: 12%;
+    right: 8%;
+    border-color: #38bdf8;
+    color: #7dd3fc;
+    background: rgba(56, 189, 248, 0.12);
+}
+
+.lp-box--person {
+    top: 22%;
+    left: 10%;
+    width: 55%;
+    height: 55%;
+    border-color: #a78bfa;
+    color: #c4b5fd;
+    background: rgba(167, 139, 250, 0.08);
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 0.2rem;
+}
+
+.lp-box--zone {
+    top: 30%;
+    left: 12%;
+    width: 70%;
+    height: 40%;
+    border-color: #f87171;
+    color: #fca5a5;
+    background: rgba(248, 113, 113, 0.1);
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 0.2rem;
+}
+
+.lp-login {
+    align-self: stretch;
+    background: var(--lp-panel);
+    border: 1px solid var(--lp-border);
+    border-radius: 12px;
+    padding: 1.35rem 1.4rem 1.25rem;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+}
+
+.lp-login-title {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0 0 0.25rem;
+    color: #fff;
+}
+
+.lp-login-hint {
+    font-size: 0.8rem;
+    color: var(--lp-muted);
+    margin: 0 0 1rem;
+}
+
+.lp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--lp-muted);
+}
+
+.lp-input {
+    width: 100%;
+    padding: 0.65rem 0.75rem;
+    border-radius: 8px;
+    border: 1px solid var(--lp-border);
+    background: rgba(21, 29, 40, 0.9);
+    color: var(--lp-ink);
+    font-family: var(--lp-font);
+    font-size: 0.92rem;
+    outline: none;
+}
+
+.lp-input:focus {
+    border-color: rgba(45, 212, 191, 0.55);
+    box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.12);
+}
+
+.lp-input::placeholder {
+    color: #64748b;
+}
+
+.lp-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    margin-top: 0.35rem;
+    padding: 0.75rem 1rem;
+    border: none;
+    border-radius: 8px;
+    background: linear-gradient(180deg, #2dd4bf 0%, #14b8a6 100%);
+    color: #042f2e;
+    font-family: var(--lp-font);
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    transition: filter 0.15s, transform 0.12s;
+}
+
+.lp-submit:hover {
+    filter: brightness(1.06);
+}
+
+.lp-submit:active {
+    transform: translateY(1px);
+}
+
+.lp-submit--link {
+    box-sizing: border-box;
+}
+
+.lp-reset {
+    display: block;
+    width: 100%;
+    margin-top: 0.75rem;
+    padding: 0.4rem;
+    border: none;
+    background: transparent;
+    color: var(--lp-muted);
+    font-family: var(--lp-font);
+    font-size: 0.78rem;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.lp-reset:hover {
+    color: #fff;
+}
+
+/* ── Capabilities strip ────────────────────────────────────────────────── */
+.lp-caps {
+    background: var(--lp-slate-mid);
+    padding: 3.5rem 1.5rem 4rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.lp-caps-head {
+    width: min(1120px, 100%);
+    margin: 0 auto 1.75rem;
+}
+
+.lp-caps-head h2 {
+    font-family: var(--lp-serif);
+    font-size: clamp(1.35rem, 2.2vw, 1.75rem);
+    font-weight: 600;
+    margin: 0 0 0.4rem;
+    color: #fff;
+}
+
+.lp-caps-head p {
+    margin: 0;
+    color: var(--lp-muted);
+    font-size: 0.95rem;
+}
+
+.lp-caps-row {
+    width: min(1120px, 100%);
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.1rem;
+}
+
+.lp-cap {
+    margin: 0;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    background: var(--lp-slate);
+}
+
+.lp-cap img {
+    display: block;
+    width: 100%;
+    height: 180px;
+    object-fit: cover;
+}
+
+.lp-cap figcaption {
+    padding: 0.85rem 1rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.lp-cap strong {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #fff;
+}
+
+.lp-cap span {
+    font-size: 0.82rem;
+    color: var(--lp-muted);
+}
+
+.lp-cap-tags {
+    width: min(1120px, 100%);
+    margin: 1.5rem auto 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.lp-cap-tags li {
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--lp-teal);
+    border: 1px solid rgba(45, 212, 191, 0.35);
+    padding: 0.35rem 0.7rem;
+    border-radius: 999px;
+    background: rgba(45, 212, 191, 0.08);
+}
+
+/* ── AI insights / statistics ──────────────────────────────────────────── */
+.lp-insights {
+    background: var(--lp-slate);
+    padding: 3.5rem 1.5rem 4rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.lp-stats {
+    width: min(1120px, 100%);
+    margin: 0 auto 2rem;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 0.75rem;
+}
+
+.lp-stat {
+    background: rgba(21, 29, 40, 0.85);
+    border: 1px solid var(--lp-border);
+    border-radius: 10px;
+    padding: 1.1rem 0.85rem;
+    text-align: center;
+}
+
+.lp-stat-value {
+    display: block;
+    font-size: clamp(1.35rem, 2.2vw, 1.75rem);
+    font-weight: 700;
+    color: var(--lp-teal);
+    line-height: 1.2;
+    margin-bottom: 0.35rem;
+}
+
+.lp-stat-label {
+    display: block;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--lp-muted);
+}
+
+.lp-insights-row {
+    width: min(1120px, 100%);
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.1rem;
+}
+
+.lp-insights-note {
+    width: min(1120px, 100%);
+    margin: 1.25rem auto 0;
+    font-size: 0.8rem;
+    color: var(--lp-muted);
+    text-align: center;
+}
+
+@media (max-width: 1020px) {
+    .lp-stats {
+        grid-template-columns: repeat(3, 1fr);
+    }
+}
+
+@media (max-width: 860px) {
+    .lp-hero {
+        align-items: stretch;
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
+
+    .lp-hero-inner {
+        grid-template-columns: 1fr;
+        gap: 1.5rem;
+    }
+
+    .lp-headline {
+        max-width: none;
+    }
+
+    .lp-lede {
+        max-width: none;
+    }
+
+    .lp-hero-side {
+        width: 100%;
+        max-width: 400px;
+    }
+
+    .lp-monitor {
+        display: none;
+    }
+
+    .lp-login {
+        width: 100%;
+    }
+
+    .lp-caps-row {
+        grid-template-columns: 1fr;
+    }
+
+    .lp-cap img {
+        height: 200px;
+    }
+
+    .lp-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .lp-insights-row {
+        grid-template-columns: 1fr;
+    }
+}

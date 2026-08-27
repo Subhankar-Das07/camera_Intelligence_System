@@ -78,21 +78,45 @@ def _cameras_with_rules() -> List[str]:
 
 
 def get_runtime_status() -> Dict[str, Any]:
-    workers = store.list_runtime_worker_heartbeats(max_age_sec=5.0)
-    active_ids = [w.get("camera_id") for w in workers if w.get("camera_id")]
+    workers = store.list_runtime_worker_heartbeats(max_age_sec=600.0)
+    now = time.time()
+    enriched = []
+    active_ids: List[str] = []
+    for w in workers:
+        item = dict(w)
+        last = float(item.get("last_tick_at") or item.get("updated_at") or 0)
+        age = max(0.0, now - last) if last else None
+        item["age_sec"] = round(age, 1) if age is not None else None
+        status = str(item.get("status") or "").strip().lower()
+        if not status:
+            if age is None:
+                status = "unknown"
+            elif age <= 5.0:
+                status = "scanning"
+            elif age <= 20.0:
+                status = "waiting"
+            else:
+                status = "stale"
+        item["status"] = status
+        if status in ("scanning", "waiting") and item.get("camera_id"):
+            active_ids.append(item["camera_id"])
+        elif status == "paused" and item.get("camera_id"):
+            # Still "in the pool" but not evaluating rules
+            pass
+        enriched.append(item)
     live = bool(store.get_site().get("go_live"))
     scanning = live and (bool(active_ids) or bool(_workers))
     first = active_ids[0] if active_ids else ""
-    first_worker = workers[0] if workers else {}
     return {
         "scanning": scanning,
         "active_camera_ids": active_ids,
         "active_camera_id": first,
         "active_rule_id": "",
         "active_scan_type": "",
-        "workers": workers,
+        "workers": enriched,
         "worker_count": len(_workers),
         "inference_slots": _runtime_config.get("inference_slots", 2),
+        "server_time": now,
     }
 
 
@@ -116,11 +140,31 @@ def camera_worker_main(
                 break
 
             if store.is_camera_monitored_redis(camera_id):
+                store.set_runtime_worker_heartbeat(
+                    camera_id,
+                    {
+                        "last_tick_at": time.time(),
+                        "status": "paused",
+                        "pause_reason": "monitor",
+                        "inference_wait_ms": 0,
+                        "rule_count": 0,
+                    },
+                )
                 time.sleep(1.0)
                 continue
 
             cam = store.get_camera(camera_id)
             if not cam or cam.get("enabled") is False:
+                store.set_runtime_worker_heartbeat(
+                    camera_id,
+                    {
+                        "last_tick_at": time.time(),
+                        "status": "offline",
+                        "pause_reason": "camera_disabled",
+                        "inference_wait_ms": 0,
+                        "rule_count": 0,
+                    },
+                )
                 time.sleep(2.0)
                 continue
 
@@ -130,6 +174,16 @@ def camera_worker_main(
                 if r.get("camera_id") == camera_id and r.get("enabled", True)
             ]
             if not rules:
+                store.set_runtime_worker_heartbeat(
+                    camera_id,
+                    {
+                        "last_tick_at": time.time(),
+                        "status": "idle",
+                        "pause_reason": "no_rules",
+                        "inference_wait_ms": 0,
+                        "rule_count": 0,
+                    },
+                )
                 time.sleep(2.0)
                 continue
 
@@ -137,6 +191,16 @@ def camera_worker_main(
             if frame is None:
                 store.save_camera(
                     {**cam, "health": "offline", "last_error": "Source unavailable"}
+                )
+                store.set_runtime_worker_heartbeat(
+                    camera_id,
+                    {
+                        "last_tick_at": time.time(),
+                        "status": "offline",
+                        "pause_reason": "source_unavailable",
+                        "inference_wait_ms": 0,
+                        "rule_count": len(rules),
+                    },
                 )
                 time.sleep(tick_max)
                 continue
@@ -180,6 +244,7 @@ def camera_worker_main(
                     "last_tick_at": now,
                     "inference_wait_ms": round(last_wait_ms, 1),
                     "rule_count": len(rules),
+                    "status": "waiting" if last_wait_ms > 1500 else "scanning",
                 },
             )
 

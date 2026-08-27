@@ -1,4 +1,5 @@
 import cv2
+import time
 import numpy as np
 from ultralytics import YOLO
 from shapely.geometry import Point, Polygon
@@ -26,6 +27,7 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
         roi_poly = Polygon(roi_pixels)
 
         frame_idx = 0
+        start_time = time.time()
         intrusion_active = False
         intrusion_frames_without_detection = 0
         patience = int(fps * 2) # Wait 2 seconds before closing clip
@@ -45,7 +47,7 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
             if cooldown_frames > 0:
                 cooldown_frames -= 1
 
-            results = self.model(frame, classes=[0], verbose=False)[0]
+            results = self.model(frame, classes=[0], conf=0.45, imgsz=640, verbose=False)[0]
             
             # Draw skeleton over the person natively
             frame = results.plot()
@@ -86,9 +88,12 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
                     cooldown_frames = cooldown_frames_max
                     alert_id = str(uuid.uuid4())
                     alert_start_frame = frame_idx
-                    alert_path = os.path.join(output_dir, f"alert_{alert_id}.webm")
-                    fourcc = cv2.VideoWriter_fourcc(*'vp80')
-                    alert_writer = cv2.VideoWriter(alert_path, fourcc, fps, (width, height))
+                    alert_path = os.path.join(output_dir, f"alert_{alert_id}.mp4")
+                    # Dynamically calculate actual processing FPS to prevent fast-forwarding
+                    elapsed_time = time.time() - start_time
+                    actual_fps = max(5.0, frame_idx / elapsed_time) if elapsed_time > 0 and frame_idx > 0 else fps
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v") if "'" not in "mp4v" else cv2.VideoWriter_fourcc(*"mp4v")
+                    alert_writer = cv2.VideoWriter(alert_path, cv2.VideoWriter_fourcc(*"mp4v"), actual_fps, (width, height))
                 
                 if intrusion_active:
                     intrusion_frames_without_detection = 0
@@ -107,7 +112,7 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
                                 "id": alert_id,
                                 "timestamp_sec": timestamp_sec,
                                 "formatted_time": f"{int(timestamp_sec // 60):02d}:{int(timestamp_sec % 60):02d}",
-                                "clip_url": f"/storage/alerts/alert_{alert_id}.webm"
+                                "clip_url": f"/storage/alerts/alert_{alert_id}.mp4"
                             }
 
             if intrusion_active and alert_writer:
@@ -125,7 +130,8 @@ class IntrusionDetectionPipeline(BaseVideoPipeline):
                 "id": alert_id,
                 "timestamp_sec": timestamp_sec,
                 "formatted_time": f"{int(timestamp_sec // 60):02d}:{int(timestamp_sec % 60):02d}",
-                "clip_url": f"/storage/alerts/alert_{alert_id}.webm"
+                "clip_url": f"/storage/alerts/alert_{alert_id}.mp4"
             }
 
         cap.release()
+

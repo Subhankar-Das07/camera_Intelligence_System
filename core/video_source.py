@@ -17,13 +17,11 @@ class ThreadedCamera:
             src = int(src)
         self.src = src
         
-        # Use DirectShow on Windows for local webcams (integers) to prevent MSMF hangs
-        if isinstance(self.src, int) and os.name == 'nt':
-            self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
-        else:
-            self.cap = cv2.VideoCapture(self.src)
+        self.cap = cv2.VideoCapture(self.src)
             
+        print(f"DEBUG: isOpened = {self.cap.isOpened()}")
         self.grabbed, self.frame = self.cap.read()
+        print(f"DEBUG: read() returned grabbed={self.grabbed}, frame={'None' if self.frame is None else 'Valid'}")
         self.started = False
         self.read_lock = threading.Lock()
         self.thread = None
@@ -84,7 +82,16 @@ def get_video_source(input_path):
     For URLs, returns a background-threaded camera to ensure frames don't buffer and cause lag.
     """
     if hasattr(input_path, 'read') and hasattr(input_path, 'isOpened'):
-        return input_path
+        class SharedCameraWrapper:
+            def __init__(self, cam):
+                self.cam = cam
+            def read(self): return self.cam.read()
+            def isOpened(self): return self.cam.isOpened()
+            def get(self, propId): return self.cam.get(propId)
+            def release(self): pass
+            @property
+            def src(self): return getattr(self.cam, 'src', None)
+        return SharedCameraWrapper(input_path)
         
     if isinstance(input_path, str) and input_path.isdigit():
         input_path = int(input_path)

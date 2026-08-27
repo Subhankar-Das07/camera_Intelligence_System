@@ -13,20 +13,52 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from typing import List, Tuple, Dict, Any, Optional
 import json
+import numpy as np
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Convert numpy scalars/arrays to native Python types before JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 
 from core.registry import registry
 from core.redis_client import get_redis, redis_str
 from core.video_source import get_video_source, ThreadedCamera
 from core.mobile_ws import router as mobile_router, start_mobile_worker
 from core.site_admin_api import router as site_admin_router
+from core.site_admin_search_api import router as site_admin_search_router
 from core.site_admin_runtime import start_runtime
 from pipelines.vehicle_recognition import VehicleRecognitionPipeline
 from pipelines.vehicle_recognition.database import VehicleDatabase
+from ultralytics import FastSAM as _FastSAM
+from ultralytics import YOLOWorld as _YOLOWorld
+
 from pipelines.gate_analytics_pipeline import GateAnalyticsPipeline
+from pipelines.footfall_analytics_pipeline import FootfallAnalyticsPipeline
 
 # Register the vehicle recognition pipeline into the shared singleton registry
 registry.register("vehicle_recognition", VehicleRecognitionPipeline)
 registry.register("gate_analytics", GateAnalyticsPipeline)
+registry.register("footfall_analysis", FootfallAnalyticsPipeline)
+
+# ── Guardian scan models — loaded ONCE at startup, never reloaded per request ──
+# This eliminates the 2-5s cold-load that was happening on every scan click.
+_guardian_yolo: Optional[_YOLOWorld] = None
+
+def _get_guardian_models():
+    """Lazy-load guardian scan model as singleton."""
+    global _guardian_yolo
+    if _guardian_yolo is None:
+        _guardian_yolo = _YOLOWorld("yolov8s-worldv2.pt")
+    return _guardian_yolo
 
 app = FastAPI(title="Video Analytics Testing Platform")
 
@@ -39,11 +71,14 @@ ALERTS_DIR  = os.path.join(STORAGE_DIR, "alerts")
 
 for d in [UPLOAD_DIR, PREVIEW_DIR, OUTPUT_DIR, ALERTS_DIR]:
     os.makedirs(d, exist_ok=True)
+os.makedirs("storage/vehicle_images", exist_ok=True)
+os.makedirs("storage/search", exist_ok=True)
 
 app.mount("/storage", StaticFiles(directory=STORAGE_DIR), name="storage")
 app.mount("/vehicle_images", StaticFiles(directory="storage/vehicle_images"), name="vehicle_images")
 app.include_router(mobile_router)
 app.include_router(site_admin_router)
+app.include_router(site_admin_search_router)
 
 @app.on_event("startup")
 async def _on_startup():
@@ -59,12 +94,17 @@ async def _on_startup():
         registry.get_pipeline("gate_analytics").initialize()
     except Exception:
         pass
+    try:
+        registry.get_pipeline("footfall_analysis").initialize()
+    except Exception:
+        pass
     start_runtime()
 
 # ── Live stream handles stay in-process; DB/session data is Redis ─────────────
 rtsp_streams: Dict[str, ThreadedCamera] = {}
 rtsp_dims:    Dict[str, Tuple[int, int]] = {}
 active_sessions: Dict[str, Any] = {}
+visitor_sessions_meta: Dict[str, dict] = {}
 stop_events:     Dict[str, threading.Event] = {}
 
 
@@ -85,7 +125,7 @@ def _vr_alerts_key(session_id: str) -> str:
 
 
 def _append_session_alert(session_id: str, alert_event: Dict[str, Any]) -> None:
-    get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event).encode())
+    get_redis().rpush(_alerts_key(session_id), json.dumps(alert_event, cls=_NumpyEncoder).encode())
 
 
 def _get_session_alerts(session_id: str) -> List[Dict[str, Any]]:
@@ -161,6 +201,7 @@ class ProcessRequest(BaseModel):
 class GuardianScanRequest(BaseModel):
     stream_id: Optional[str] = None
     filename: Optional[str] = None
+    vocabulary: Optional[List[str]] = None
 
 class WatchedObject(BaseModel):
     id: str
@@ -174,6 +215,7 @@ class GuardianStartRequest(BaseModel):
     video_id: Optional[str] = None
     filename: Optional[str] = None
     watched_objects: List[WatchedObject]
+    config: Dict[str, Any] = {}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _socket_check(url: str, timeout: float = 3.0) -> Optional[str]:
@@ -217,6 +259,7 @@ def _mjpeg_generator_raw(stream_id: str):
 
 def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normalized, config):
     """Yield AI-annotated MJPEG frames and collect alert events."""
+    config["session_id"] = session_id
     stop_ev = stop_events.get(session_id)
     generator = pipeline.run_on_video(
         input_path=input_path,
@@ -224,21 +267,23 @@ def _mjpeg_generator_analysis(session_id: str, pipeline, input_path, roi_normali
         roi_normalized=roi_normalized,
         config=config
     )
-    for frame, alert_event in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if alert_event:
-            _append_session_alert(session_id, alert_event)
-            if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
-                if attendance_session["active"]:
-                    attendance_session["present_ids"].add(alert_event["person_id"])
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if not ok:
-                continue
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
-            # Removed time.sleep(0.033) here so processing goes as fast as possible
+    try:
+        for frame, alert_event in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if alert_event:
+                _append_session_alert(session_id, alert_event)
+                if alert_event.get("type") == "face_recognised" and config.get("mode") == "attendance":
+                    if attendance_session["active"]:
+                        attendance_session["present_ids"].add(alert_event["person_id"])
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if not ok:
+                    continue
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -350,8 +395,10 @@ async def get_pipelines():
 
 @app.post("/api/start_analysis")
 async def start_analysis(request: ProcessRequest):
-    session_id = str(uuid.uuid4())
+    import random
+    session_id = f"{random.randint(100, 999)}"
     active_sessions[session_id] = request
+    visitor_sessions_meta[session_id] = {"start_time": time.time()}
     _clear_session_alerts(session_id)
     stop_events[session_id] = threading.Event()
     return {"session_id": session_id}
@@ -393,12 +440,109 @@ def stream_video(session_id: str):
     )
 
 
+@app.get("/api/vision_watch/door_state/{session_id}")
+async def get_door_state(session_id: str):
+    """Return the current live door tracking state for polling by the frontend."""
+    if session_id not in active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        pipeline = _get_fr_pipeline()
+        return pipeline.get_door_state(session_id)
+    except Exception as e:
+        return {"state": "UNKNOWN", "open_count": 0, "close_count": 0, "last_event": None, "learning": True}
+
+
+
+
 @app.post("/api/stop_analysis/{session_id}")
 def stop_analysis(session_id: str):
     """Signal the analysis pipeline to stop, without closing the raw stream."""
     ev = stop_events.get(session_id)
     if ev:
         ev.set()
+        
+    req = active_sessions.get(session_id)
+    if req and req.pipeline_name == "face_recognition":
+        meta = visitor_sessions_meta.get(session_id, {})
+        start_time = meta.get("start_time", time.time())
+        end_time = time.time()
+        
+        alerts = _get_session_alerts(session_id)
+        
+        known_map = {}
+        unknown_map = {}
+        
+        for alert in alerts:
+            if alert.get("type") == "face_recognised":
+                pid = alert.get("person_id")
+                label = alert.get("label", pid)
+                ts = alert.get("timestamp")
+                ts_val = time.time() 
+                
+                is_unknown = label.startswith("Person_")
+                
+                if is_unknown:
+                    if pid not in unknown_map:
+                        unknown_map[pid] = {"id": pid, "label": "Unknown", "first_seen": ts_val, "last_seen": ts_val, "count": 1}
+                    else:
+                        unknown_map[pid]["last_seen"] = ts_val
+                        unknown_map[pid]["count"] += 1
+                else:
+                    if pid not in known_map:
+                        known_map[pid] = {"id": pid, "label": label, "first_seen": ts_val, "last_seen": ts_val, "count": 1}
+                    else:
+                        known_map[pid]["last_seen"] = ts_val
+                        known_map[pid]["count"] += 1
+
+        mode = req.config.get("mode", "visitor")
+        
+        # Pull latest Vision Watch state to get door counts
+        door_open_count = 0
+        door_close_count = 0
+        if mode == "vision_watch":
+            try:
+                pipeline = _get_fr_pipeline()
+                ds = pipeline.get_door_state(session_id)
+                door_open_count  = ds.get("open_count", 0)
+                door_close_count = ds.get("close_count", 0)
+            except Exception as e:
+                print(f"Error pulling door count: {e}")
+                
+            report = {
+                "session_id":       session_id,
+                "mode":             mode,
+                "start_time":       start_time,
+                "end_time":         end_time,
+                "duration":         end_time - start_time,
+                "door_open_count":  door_open_count,
+                "door_close_count": door_close_count,
+            }
+        else:
+            report = {
+                "session_id":       session_id,
+                "mode":             mode,
+                "start_time":       start_time,
+                "end_time":         end_time,
+                "duration":         end_time - start_time,
+                "known_visitors":   list(known_map.values()),
+                "unknown_visitors": list(unknown_map.values()),
+            }
+        
+        # Increment global occurrences for known visitors
+        known_pids = list(known_map.keys())
+        if known_pids:
+            try:
+                pipeline = _get_fr_pipeline()
+                im = pipeline.get_attendance_manager() if mode == "attendance" else pipeline.get_visitor_manager()
+                im.increment_occurrences(known_pids)
+            except Exception as e:
+                print(f"Failed to increment occurrences: {e}")
+        
+        # Prevent double-posting: Attendance reports are handled by /api/attendance/stop
+        if mode != "attendance":
+            r = get_redis()
+            r.hset(f"reports:{mode}", session_id, json.dumps(report, cls=_NumpyEncoder))
+        
     return {"status": "stopped"}
 
 
@@ -436,13 +580,11 @@ async def connect_webcam(index: int = 0):
         h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
         return cam, w, h
 
-    loop = asyncio.get_running_loop()
     try:
-        cam, width, height = await asyncio.wait_for(
-            loop.run_in_executor(None, _open), timeout=10.0
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=400, detail="Webcam timed out. Check that no other app is using it.")
+        # Call directly on the main event loop thread to avoid COM/threading issues with DSHOW
+        cam, width, height = _open()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     if cam is None:
         raise HTTPException(status_code=400,
@@ -504,6 +646,59 @@ async def list_identities(mode: str = "visitor"):
     result.sort(key=lambda x: x.get("created_at", 0))
     return {"identities": result}
 
+@app.get("/api/faces/pending")
+async def list_pending(mode: str = "visitor"):
+    """Return all pending registration requests (useful for Attendance mode)."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'get_pending_identities'):
+        return {"pending": []}
+        
+    pending = im.get_pending_identities()
+    for entry in pending:
+        # Provide thumbnail URL for the first face crop of the pending request
+        entry["thumbnail_url"] = f"/api/faces/pending/image/{entry['req_id']}?mode={mode}"
+    return {"pending": pending}
+
+
+@app.get("/api/faces/pending/image/{req_id}")
+async def pending_face_image(req_id: str, mode: str = "visitor"):
+    """Serve the first face crop JPEG of a pending request."""
+    im = _get_identity_manager(mode)
+    buf = im.r.get(f"{im._redis_prefix}:pending:face:{req_id}:1")
+    if not buf:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return Response(content=buf, media_type="image/jpeg")
+
+
+class PendingApproveRequest(BaseModel):
+    label: str
+
+
+@app.post("/api/faces/pending/{req_id}/approve")
+async def approve_pending(req_id: str, body: PendingApproveRequest, mode: str = "visitor"):
+    """Approve a pending request and register it permanently."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'approve_pending_identity'):
+        raise HTTPException(status_code=400, detail="Approval not supported in this mode")
+        
+    new_pid = im.approve_pending_identity(req_id, body.label)
+    if not new_pid:
+        raise HTTPException(status_code=404, detail="Pending request not found")
+    return {"status": "success", "person_id": new_pid, "label": body.label}
+
+
+@app.post("/api/faces/pending/{req_id}/reject")
+async def reject_pending(req_id: str, mode: str = "visitor"):
+    """Reject a pending request."""
+    im = _get_identity_manager(mode)
+    if not hasattr(im, 'reject_pending_identity'):
+        raise HTTPException(status_code=400, detail="Rejection not supported in this mode")
+        
+    success = im.reject_pending_identity(req_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Pending request not found")
+    return {"status": "success"}
+
 
 @app.post("/api/faces/register")
 async def register_face(
@@ -523,7 +718,7 @@ async def register_face(
     if img is None:
         raise HTTPException(status_code=400, detail="Could not decode image.")
 
-    faces = embedder.detect_and_embed(img)
+    faces = embedder.get_faces(img)
     quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
     if not quality_faces:
         raise HTTPException(
@@ -557,7 +752,7 @@ async def snapshot_and_register(stream_id: str, label: Optional[str] = None, mod
     im = _get_identity_manager(mode)
     embedder = pipeline._embedder
 
-    faces = embedder.detect_and_embed(frame)
+    faces = embedder.get_faces(frame)
     quality_faces = [f for f in faces if f.is_quality and f.embedding is not None]
     if not quality_faces:
         raise HTTPException(status_code=422, detail="No clear face in current frame.")
@@ -591,6 +786,64 @@ async def delete_identity(person_id: str, mode: str = "visitor"):
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found.")
     return {"person_id": person_id, "status": "deleted"}
 
+
+# ── Reports API ──────────────────────────────────────────────────────────────
+
+@app.get("/api/reports")
+async def list_reports(mode: str = "visitor"):
+    """Return all session reports for the given mode."""
+    r = get_redis()
+    key = f"reports:{mode}"
+    raw_hash = r.hgetall(key)
+    
+    reports = []
+    for sess_id_bytes, meta_bytes in raw_hash.items():
+        try:
+            report_data = json.loads(redis_str(meta_bytes))
+            # Only return reports that match the requested mode
+            if report_data.get("mode") != mode:
+                continue
+            summary = {
+                "session_id": report_data.get("session_id"),
+                "start_time": report_data.get("start_time"),
+                "end_time":   report_data.get("end_time"),
+                "duration":   report_data.get("duration"),
+                "mode":       mode,
+            }
+            if mode == "attendance":
+                summary["present_count"]     = len(report_data.get("present", []))
+                summary["absent_count"]      = len(report_data.get("absent", []))
+                summary["total_humans_count"]= summary["present_count"]
+            elif mode == "vision_watch":
+                summary["door_open_count"]  = report_data.get("door_open_count", 0)
+                summary["door_close_count"] = report_data.get("door_close_count", 0)
+            else:
+                summary["known_count"]       = len(report_data.get("known_visitors", []))
+                summary["unknown_count"]     = len(report_data.get("unknown_visitors", []))
+                summary["total_humans_count"]= summary["known_count"] + summary["unknown_count"]
+            reports.append(summary)
+        except Exception:
+            continue
+            
+    reports.sort(key=lambda x: x.get("start_time", 0), reverse=True)
+    return {"reports": reports}
+
+
+@app.get("/api/reports/{session_id}")
+async def get_report(session_id: str, mode: str = "visitor"):
+    """Return the full details of a specific report."""
+    r = get_redis()
+    key = f"reports:{mode}"
+    raw = r.hget(key, session_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    try:
+        report_data = json.loads(redis_str(raw))
+        return report_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Attendance Session Management ────────────────────────────────────────────
 
 @app.post("/api/attendance/start")
@@ -602,8 +855,54 @@ def start_attendance_session():
 
 @app.post("/api/attendance/stop")
 def stop_attendance_session():
+    if not attendance_session["active"]:
+        return {"status": "stopped", "present_ids": []}
+        
     attendance_session["active"] = False
-    return {"status": "stopped", "present_ids": list(attendance_session["present_ids"])}
+    end_time = time.time()
+    start_time = attendance_session.get("start_time", end_time)
+    duration = end_time - start_time
+    
+    import random
+    session_id = f"att_{random.randint(100, 999)}"
+    
+    # 1. Get present students
+    present_ids = list(attendance_session["present_ids"])
+    
+    # 2. Get all registered students
+    im = _get_identity_manager("attendance")
+    all_identities = im.get_all_identities()
+    
+    present = []
+    absent = []
+    
+    for pid, meta in all_identities.items():
+        person = {"person_id": pid, "label": meta.get("label", pid)}
+        if pid in present_ids:
+            present.append(person)
+        else:
+            absent.append(person)
+            
+    # 3. Get pending approvals (requested during this session)
+    pending_all = im.get_pending_identities() if hasattr(im, 'get_pending_identities') else []
+    pending_session = [p for p in pending_all if start_time <= p.get("timestamp", 0) <= end_time]
+    
+    report = {
+        "session_id": session_id,
+        "mode": "attendance",
+        "start_time": start_time,
+        "end_time": end_time,
+        "duration": duration,
+        "present": present,
+        "absent": absent,
+        "pending_approvals": pending_session
+    }
+    
+    # Save to Redis
+    r = get_redis()
+    r.hset("reports:attendance", session_id, json.dumps(report))
+    
+    return {"status": "stopped", "session_id": session_id, "present_ids": present_ids}
 
 @app.get("/api/attendance/status")
 def get_attendance_status():
@@ -658,40 +957,43 @@ def _vr_mjpeg_generator(session_id: str, pipeline, input_path, roi_normalized, c
         roi_normalized=roi_normalized,
         config=config,
     )
-    for frame, metadata in generator:
-        if stop_ev and stop_ev.is_set():
-            break
-        if metadata and metadata.get("detections"):
-            for det in metadata["detections"]:
-                plate = det.get("plate")
-                if plate:
+    try:
+        for frame, metadata in generator:
+            if stop_ev and stop_ev.is_set():
+                break
+            if metadata and metadata.get("detections"):
+                for det in metadata["detections"]:
+                    plate = det.get("plate")
+                    if plate:
 
-                    # Fetch latest status and vehicle_type from DB for this plate
-                    db_status       = "Unknown"
-                    db_vehicle_type = det.get("vehicle_type", "Car")
-                    image_path      = det.get("image_path")
-                    try:
-                        vehicle_row = pipeline.db.get_vehicle_stats(plate)
-                        if vehicle_row:
-                            db_status       = vehicle_row.get("status", "Unknown")
-                            db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
-                    except Exception:
-                        pass
-                    _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
+                        # Fetch latest status and vehicle_type from DB for this plate
+                        db_status       = "Unknown"
+                        db_vehicle_type = det.get("vehicle_type", "Car")
+                        image_path      = det.get("image_path")
+                        try:
+                            vehicle_row = pipeline.db.get_vehicle_stats(plate)
+                            if vehicle_row:
+                                db_status       = vehicle_row.get("status", "Unknown")
+                                db_vehicle_type = vehicle_row.get("vehicle_type", db_vehicle_type)
+                        except Exception:
+                            pass
+                        _vr_add_detection(session_id, plate, det.get("total_visits", 1), db_status, db_vehicle_type, image_path)
 
-        if metadata and metadata.get("alerts"):
-            r = get_redis()
-            for alert in metadata["alerts"]:
-                # Use Redis Sets to avoid duplicate alerts for the same plate
-                added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
-                if added:
-                    r.rpush(_vr_alerts_key(session_id), json.dumps(alert).encode())
+            if metadata and metadata.get("alerts"):
+                r = get_redis()
+                for alert in metadata["alerts"]:
+                    # Use Redis Sets to avoid duplicate alerts for the same plate
+                    added = r.sadd(f"vr:alerted_plates:{session_id}", alert["plate"])
+                    if added:
+                        r.rpush(_vr_alerts_key(session_id), json.dumps(alert, cls=_NumpyEncoder).encode())
 
-        if frame is not None:
-            ok, buf = cv2.imencode('.jpg', frame)
-            if ok:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                       + buf.tobytes() + b'\r\n')
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame)
+                if ok:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + buf.tobytes() + b'\r\n')
+    finally:
+        generator.close()
 
 
 @app.get("/api/vr_detections/{session_id}")
@@ -748,12 +1050,12 @@ def unregister_vehicle(plate: str):
 @app.post("/api/guardian/scan")
 async def guardian_scan(request: GuardianScanRequest):
     """
-    Run a one-shot YOLO detection on a single frame and return bounding boxes.
-    The frontend uses these to draw the Phase-1 selection overlay.
+    Run a one-shot scan on a single frame and return bounding boxes.
+    - FastSAM detects all objects (class-agnostic segments).
+    - YOLOv8 provides class labels (COCO names) matched by IoU.
+    - Only detections >= 60% confidence are returned.
+    - Models are singletons — no cold-load on each click.
     """
-    import numpy as _np
-    from ultralytics import FastSAM as _FastSAM
-
     # Resolve the video source
     if request.stream_id and request.stream_id in rtsp_streams:
         cam = rtsp_streams[request.stream_id]
@@ -774,40 +1076,47 @@ async def guardian_scan(request: GuardianScanRequest):
     else:
         raise HTTPException(status_code=400, detail="Provide stream_id or filename.")
 
-    # Save a preview still for the frontend to display
+    # Save a preview still for the frontend
     scan_preview_id = str(uuid.uuid4())
     preview_fn      = f"guardian_scan_{scan_preview_id}.jpg"
     preview_path    = os.path.join(PREVIEW_DIR, preview_fn)
     cv2.imwrite(preview_path, frame)
 
-    # Run YOLO inference in a thread pool to avoid blocking the event loop
+    # Run model in thread pool (non-blocking) using singleton
     loop = asyncio.get_running_loop()
-    _model = _FastSAM("FastSAM-s.pt")
+    yolo_model = _get_guardian_models()
+    CONF_GATE = 0.25
 
     def _infer():
-        # FastSAM standard inference
-        return _model(frame, conf=0.25, verbose=False)[0]
+        if request.vocabulary:
+            yolo_model.set_classes(request.vocabulary)
+        return yolo_model(frame, conf=CONF_GATE, verbose=False)[0]
 
-    results = await loop.run_in_executor(None, _infer)
+    yolo_results = await loop.run_in_executor(None, _infer)
 
     detections = []
-    if results.boxes is not None:
-        for i, box in enumerate(results.boxes):
-            cls_id  = int(box.cls[0])
-            conf    = float(box.conf[0])
-            label   = "Object"
-            xywh    = box.xywh[0].cpu().numpy()
+    if yolo_results.boxes is not None:
+        names = yolo_results.names or {}
+        for i, box in enumerate(yolo_results.boxes):
+            conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            label = names.get(cls_id, f"cls_{cls_id}")
+            
+            xywh = box.xywh[0].cpu().numpy()
             cx, cy, bw, bh = float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])
-            # Normalise to [0,1] range, xywh format (top-left x,y + w,h)
-            nx = (cx - bw / 2) / width
-            ny = (cy - bh / 2) / height
+            bx_abs = int(cx - bw/2)
+            by_abs = int(cy - bh/2)
+            
+            nx = bx_abs / width
+            ny = by_abs / height
             nw = bw / width
             nh = bh / height
+            
             detections.append({
-                "id":             f"yolo-{i}-{str(uuid.uuid4())[:8]}",
-                "label":          label,
-                "class_id":       cls_id,
-                "confidence":     round(conf, 2),
+                "id":              f"yolo-{i}-{str(uuid.uuid4())[:8]}",
+                "label":           label,
+                "class_id":        cls_id,
+                "confidence":      round(conf, 2),
                 "bbox_normalized": [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)],
             })
 
@@ -841,7 +1150,8 @@ async def guardian_start(request: GuardianStartRequest):
     ]
 
     # Build a ProcessRequest-compatible record so the existing /api/stream endpoint works
-    session_id = str(uuid.uuid4())
+    import random
+    session_id = f"{random.randint(100, 999)}"
 
     # Determine source
     filename  = request.filename or ""
@@ -859,7 +1169,7 @@ async def guardian_start(request: GuardianStartRequest):
     )
 
     active_sessions[session_id] = fake_req
-    session_alerts[session_id]  = []
+    _clear_session_alerts(session_id)
     stop_events[session_id]     = threading.Event()
 
     return {"session_id": session_id}
@@ -871,3 +1181,4 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

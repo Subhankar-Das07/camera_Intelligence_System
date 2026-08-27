@@ -69,10 +69,11 @@ class RuntimeStatusTests(unittest.TestCase):
     @patch("core.site_admin_runtime.store.list_runtime_worker_heartbeats")
     @patch("core.site_admin_runtime.store.get_site")
     def test_active_camera_ids_from_workers(self, mock_site, mock_workers):
+        import time
         mock_site.return_value = {"go_live": True}
         mock_workers.return_value = [
-            {"camera_id": "cam-a", "last_tick_at": 1.0},
-            {"camera_id": "cam-b", "last_tick_at": 2.0},
+            {"camera_id": "cam-a", "last_tick_at": time.time() - 1.0},
+            {"camera_id": "cam-b", "last_tick_at": time.time() - 2.0},
         ]
         status = runtime.get_runtime_status()
         self.assertTrue(status["scanning"])

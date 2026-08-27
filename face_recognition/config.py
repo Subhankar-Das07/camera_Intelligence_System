@@ -42,3 +42,17 @@ COLOR_CANDIDATE   = (200, 160,  60)
 # ── Identity Naming ───────────────────────────────────────────────────────────
 PERSON_ID_PREFIX   = "P"
 AUTO_LABEL_PREFIX  = "Person"
+
+# ── Vision Watch — Door Detection (Structural State Comparison) ───────────────
+# We buffer the first N frames to compute the CLOSED_REFERENCE state.
+DOOR_LEARNING_FRAMES  = 20   # frames to calculate median closed state
+
+# Intensity difference threshold to consider a pixel "changed"
+DOOR_PIXEL_DIFF_THRESH = 30  
+
+# Structural change thresholds (fraction of door zone pixels structurally changed)
+DOOR_OPEN_THRESHOLD   = 0.15  # 15% structural change → door OPEN
+DOOR_CLOSE_THRESHOLD  = 0.05  # below 5% structural change (looks like closed reference) → door CLOSED
+
+# Debounce: how many consecutive frames must agree before triggering state change
+DOOR_DEBOUNCE         = 4

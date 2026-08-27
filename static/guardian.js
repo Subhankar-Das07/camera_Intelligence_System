@@ -9,7 +9,7 @@
  *
  * Two-phase workflow:
  *   Phase 1 - Scan & Select:
- *     - "Scan Room" button calls POST /api/guardian/scan
+ *     - "Scan Object" button calls POST /api/guardian/scan
  *     - YOLO boxes drawn on canvas (orange). Click to select (green).
  *     - "Draw Custom Object" toggle: clean canvas, rect-draw mode.
  *       Each rectangle auto-labeled Unknown-1, Unknown-2, etc.
@@ -33,8 +33,7 @@
         // -- DOM refs (guardian-namespaced elements) ---------------------------
         const guardianPanel     = document.getElementById("guardian-controls");
         const scanBtn           = document.getElementById("guardian-scan-btn");
-        const modeToggleBtn     = document.getElementById("guardian-mode-toggle");
-        const clearCustomBtn    = document.getElementById("guardian-clear-custom-btn");
+
         const startGuardBtn     = document.getElementById("guardian-start-btn");
         const stopGuardBtn      = document.getElementById("guardian-stop-btn");
         const selectionList     = document.getElementById("guardian-selection-list");
@@ -52,7 +51,7 @@
         const state = {
             active:          false,          // true when guardian mode is showing
             phase:           "idle",         // "idle" | "scan" | "guarding"
-            drawMode:        "yolo",         // "yolo" | "custom"
+
 
             // Scan data from /api/guardian/scan
             scanPreviewUrl:  null,
@@ -62,13 +61,7 @@
 
             // Enrollment
             selectedYoloIds: new Set(),      // ids of clicked YOLO boxes
-            customRects:     [],             // [{id, label, bbox_normalized}]
-            customCounter:   0,
 
-            // Custom rect drawing
-            isDrawing:       false,
-            drawStart:       null,           // {x, y} in canvas pixel space
-            drawCurrent:     null,
 
             // Guardian session
             sessionId:       null,
@@ -130,7 +123,7 @@
         // The cleanest zero-coupling: watch the img src change and re-parse what we know.
 
         // Actually the simplest approach: listen to our own scan button which fires
-        // the scan request. The user always clicks "Scan Room" after connecting a source.
+        // the scan request. The user always clicks "Scan Object" after connecting a source.
         // At that point we read the data attributes we instructed index.html to set.
         // (See index.html guardian-source-bridge hidden inputs.)
 
@@ -146,14 +139,22 @@
                 return;
             }
 
-            setStatus("Scanning room...", "info");
+            setStatus("Scanning scene...", "info");
             scanBtn.disabled = true;
+
+            const vocabInput = document.getElementById("guardian-vocab-input");
+            let vocabulary = null;
+            if (vocabInput && vocabInput.value.trim() !== "") {
+                vocabulary = vocabInput.value.split(",").map(s => s.trim()).filter(s => s);
+            }
+            
+            const payload = { ...src, vocabulary };
 
             try {
                 const res = await fetch("/api/guardian/scan", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(src),
+                    body: JSON.stringify(payload),
                 });
                 if (!res.ok) {
                     const err = await res.json();
@@ -192,9 +193,7 @@
                 setTimeout(doAlignAndDraw, 250);
                 setTimeout(doAlignAndDraw, 700);
 
-                setStatus(`Found ${data.detections.length} object(s). Click a box to select, or toggle "Draw Custom Object".`, "ok");
-
-                if (modeToggleBtn) modeToggleBtn.disabled = false;
+                setStatus(`Found ${data.detections.length} object(s). Click a box to select.`, "ok");
             } catch (err) {
                 setStatus("❌ " + err.message, "error");
             } finally {
@@ -202,43 +201,7 @@
             }
         }
 
-        // -- Mode toggle (YOLO <-> Custom draw) ---------------------------------
-        if (modeToggleBtn) {
-            modeToggleBtn.addEventListener("click", toggleDrawMode);
-        }
-
-        function toggleDrawMode() {
-            if (state.phase !== "scan") return;
-            state.drawMode = state.drawMode === "yolo" ? "custom" : "yolo";
-            modeToggleBtn.textContent =
-                state.drawMode === "yolo" ? "✏️ Drag Box over Object" : "🔲 Back to YOLO Selection";
-            modeToggleBtn.style.background =
-                state.drawMode === "custom" ? "rgba(139,92,246,0.25)" : "";
-            // Explicitly enable pointer-events and set correct cursor so mouse events fire
-            roiCanvas.style.pointerEvents = "auto";
-            roiCanvas.style.cursor = state.drawMode === "custom" ? "crosshair" : "pointer";
-            if (clearCustomBtn) {
-                clearCustomBtn.style.display = state.drawMode === "custom" ? "block" : "none";
-            }
-            redrawCanvas();
-        }
-
-        // -- Clear custom ROIs ------------------------------------------------
-        if (clearCustomBtn) {
-            clearCustomBtn.addEventListener("click", () => {
-                state.customRects  = [];
-                state.customCounter = 0;
-                redrawCanvas();
-                updateSelectionList();
-                checkStartReady();
-                setStatus("Custom ROIs cleared. Draw new ones or click YOLO boxes.", "info");
-            });
-        }
-
         // -- Canvas interaction ------------------------------------------------
-        roiCanvas.addEventListener("mousedown",  onCanvasMouseDown);
-        roiCanvas.addEventListener("mousemove",  onCanvasMouseMove);
-        roiCanvas.addEventListener("mouseup",    onCanvasMouseUp);
         roiCanvas.addEventListener("click",      onCanvasClick);
 
         function canvasXY(e) {
@@ -251,8 +214,7 @@
 
         // --- Click (YOLO box selection) ---
         function onCanvasClick(e) {
-            if (!state.active || state.phase !== "scan" || state.drawMode !== "yolo") return;
-            if (state.isDrawing) return; // suppress click at end of rect draw
+            if (!state.active || state.phase !== "scan") return;
 
             const { x, y } = canvasXY(e);
             const W = roiCanvas.width, H = roiCanvas.height;
@@ -275,57 +237,7 @@
             }
         }
 
-        // --- Rect drawing (custom mode) ---
-        function onCanvasMouseDown(e) {
-            if (!state.active || state.phase !== "scan" || state.drawMode !== "custom") return;
-            state.isDrawing = true;
-            state.drawStart   = canvasXY(e);
-            state.drawCurrent = canvasXY(e);
-        }
 
-        function onCanvasMouseMove(e) {
-            if (!state.isDrawing) return;
-            state.drawCurrent = canvasXY(e);
-            redrawCanvas();
-        }
-
-        function onCanvasMouseUp(e) {
-            if (!state.isDrawing) return;
-            state.isDrawing = false;
-            const end = canvasXY(e);
-
-            const W = roiCanvas.width, H = roiCanvas.height;
-            const x1 = Math.min(state.drawStart.x, end.x);
-            const y1 = Math.min(state.drawStart.y, end.y);
-            const x2 = Math.max(state.drawStart.x, end.x);
-            const y2 = Math.max(state.drawStart.y, end.y);
-            const rw = x2 - x1, rh = y2 - y1;
-
-            if (rw < 10 || rh < 10) {
-                state.drawStart = null; state.drawCurrent = null;
-                redrawCanvas();
-                setStatus("⚠️ Please click and drag to draw a box. Single clicks are ignored.", "warn");
-                return;
-            }
-
-            state.customCounter++;
-            const label = `Unknown-${state.customCounter}`;
-            state.customRects.push({
-                id:   `custom-${state.customCounter}`,
-                label,
-                bbox_normalized: [
-                    parseFloat((x1 / W).toFixed(4)),
-                    parseFloat((y1 / H).toFixed(4)),
-                    parseFloat((rw / W).toFixed(4)),
-                    parseFloat((rh / H).toFixed(4)),
-                ],
-            });
-
-            state.drawStart = null; state.drawCurrent = null;
-            redrawCanvas();
-            updateSelectionList();
-            checkStartReady();
-        }
 
         // -- Canvas drawing ----------------------------------------------------
         function redrawCanvas() {
@@ -340,9 +252,7 @@
                 const bx = nx * W, by = ny * H, bw = nw * W, bh = nh * H;
                 const selected = state.selectedYoloIds.has(det.id);
 
-                // In custom mode, show YOLO boxes dimmed so user knows what's there
-                const alpha = state.drawMode === "custom" ? 0.3 : 1.0;
-                ctx.globalAlpha = alpha;
+                ctx.globalAlpha = 1.0;
 
                 ctx.strokeStyle = selected ? "#22c55e" : "#f97316";
                 ctx.lineWidth   = selected ? 2.5 : 1.5;
@@ -366,42 +276,6 @@
 
                 ctx.globalAlpha = 1.0;
             }
-
-            // Draw custom ROI rects
-            for (const rect of state.customRects) {
-                const [nx, ny, nw, nh] = rect.bbox_normalized;
-                const bx = nx * W, by = ny * H, bw = nw * W, bh = nh * H;
-
-                ctx.strokeStyle = "#a855f7";
-                ctx.lineWidth   = 2;
-                ctx.setLineDash([]);
-                ctx.strokeRect(bx, by, bw, bh);
-                ctx.fillStyle = "rgba(168,85,247,0.12)";
-                ctx.fillRect(bx, by, bw, bh);
-
-                // Label
-                ctx.font      = "bold 12px Inter, sans-serif";
-                const tw      = ctx.measureText(rect.label).width;
-                ctx.fillStyle = "#a855f7";
-                ctx.fillRect(bx, by - 18, tw + 8, 18);
-                ctx.fillStyle = "#fff";
-                ctx.fillText(rect.label, bx + 4, by - 4);
-            }
-
-            // Live drawing preview rect
-            if (state.isDrawing && state.drawStart && state.drawCurrent) {
-                const x1 = Math.min(state.drawStart.x, state.drawCurrent.x);
-                const y1 = Math.min(state.drawStart.y, state.drawCurrent.y);
-                const rw = Math.abs(state.drawCurrent.x - state.drawStart.x);
-                const rh = Math.abs(state.drawCurrent.y - state.drawStart.y);
-                ctx.strokeStyle = "#c084fc";
-                ctx.lineWidth   = 1.5;
-                ctx.setLineDash([4, 3]);
-                ctx.strokeRect(x1, y1, rw, rh);
-                ctx.fillStyle   = "rgba(192,132,252,0.1)";
-                ctx.fillRect(x1, y1, rw, rh);
-                ctx.setLineDash([]);
-            }
         }
 
         // -- Canvas alignment (mirrors app.js alignCanvas logic) ---------------
@@ -409,6 +283,8 @@
             if (!state.imageWidth || !state.imageHeight) return;
             const rect = mainVideoImg.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
+
+            const containerRect = mainVideoImg.parentElement.getBoundingClientRect();
 
             const imgRatio = state.imageWidth / state.imageHeight;
             const boxRatio = rect.width / rect.height;
@@ -422,10 +298,13 @@
                 offsetX = (rect.width - renderW) / 2; offsetY = 0;
             }
 
+            const finalLeft = (rect.left - containerRect.left) + offsetX;
+            const finalTop  = (rect.top - containerRect.top) + offsetY;
+
             roiCanvas.style.width  = renderW + "px";
             roiCanvas.style.height = renderH + "px";
-            roiCanvas.style.left   = offsetX + "px";
-            roiCanvas.style.top    = offsetY + "px";
+            roiCanvas.style.left   = finalLeft + "px";
+            roiCanvas.style.top    = finalTop + "px";
         }
 
         window.addEventListener("resize", () => { if (state.active) alignCanvas(); });
@@ -447,7 +326,7 @@
 
                 const dot = document.createElement("span");
                 dot.className = "guardian-dot";
-                dot.style.background = obj.type === "yolo" ? "#22c55e" : "#a855f7";
+                dot.style.background = "#22c55e";
 
                 const lbl = document.createElement("span");
                 lbl.textContent = obj.label;
@@ -457,11 +336,7 @@
                 rmBtn.textContent = "✕";
                 rmBtn.className   = "guardian-remove-btn";
                 rmBtn.addEventListener("click", () => {
-                    if (obj.type === "yolo") {
-                        state.selectedYoloIds.delete(obj.id);
-                    } else {
-                        state.customRects = state.customRects.filter(r => r.id !== obj.id);
-                    }
+                    state.selectedYoloIds.delete(obj.id);
                     redrawCanvas();
                     updateSelectionList();
                     checkStartReady();
@@ -487,22 +362,12 @@
                 }
             }
 
-            for (const rect of state.customRects) {
-                result.push({
-                    id:              rect.id,
-                    type:            "custom",
-                    label:           rect.label,
-                    class_id:        null,
-                    bbox_normalized: rect.bbox_normalized,
-                });
-            }
-
             return result;
         }
 
         function checkStartReady() {
             if (!startGuardBtn) return;
-            const hasObjects = state.selectedYoloIds.size > 0 || state.customRects.length > 0;
+            const hasObjects = state.selectedYoloIds.size > 0;
             startGuardBtn.disabled = !(hasObjects && state.phase === "scan");
         }
 
@@ -520,7 +385,13 @@
 
             const src = getSourcePayload();
 
-            setStatus("Starting guardian session...", "info");
+            const vocabInput = document.getElementById("guardian-vocab-input");
+            let vocabulary = null;
+            if (vocabInput && vocabInput.value.trim() !== "") {
+                vocabulary = vocabInput.value.split(",").map(s => s.trim()).filter(s => s);
+            }
+
+            setStatus("Starting tracking session...", "info");
             startGuardBtn.disabled = true;
 
             try {
@@ -532,6 +403,7 @@
                         video_id:        src.video_id,
                         filename:        src.filename,
                         watched_objects: enrolled,
+                        config:          { vocabulary }
                     }),
                 });
                 if (!res.ok) {
@@ -560,13 +432,12 @@
             // Show stop button
             if (stopGuardBtn)  stopGuardBtn.classList.remove("hidden");
             if (startGuardBtn) startGuardBtn.classList.add("hidden");
-            if (modeToggleBtn) modeToggleBtn.disabled = true;
             if (scanBtn)       scanBtn.disabled = true;
 
             // Clear alert area
             const alertsContainer = document.getElementById("alerts-container");
             if (alertsContainer) {
-                alertsContainer.innerHTML = '<p class="placeholder">Guardian active - no alerts yet.</p>';
+                alertsContainer.innerHTML = '<p class="placeholder">Tracking active - no alerts yet.</p>';
             }
 
             setStatus(`🛡️ Guarding ${getEnrolledObjects().length} object(s)...`, "ok");
@@ -595,7 +466,6 @@
 
             if (stopGuardBtn)  stopGuardBtn.classList.add("hidden");
             if (startGuardBtn) { startGuardBtn.classList.remove("hidden"); startGuardBtn.disabled = true; }
-            if (modeToggleBtn) modeToggleBtn.disabled = state.phase !== "scan";
             if (scanBtn)       scanBtn.disabled = false;
 
             roiCanvas.classList.remove("hidden");
@@ -603,20 +473,13 @@
             if (keepScan && state.scanPreviewUrl) {
                 mainVideoImg.src = state.scanPreviewUrl + "?t=" + Date.now();
                 redrawCanvas();
-                setStatus("Guardian stopped. Re-scan or adjust selection.", "info");
+                setStatus("Tracking stopped. Re-scan or adjust selection.", "info");
             } else {
                 // Full reset
                 state.scanDetections  = [];
                 state.selectedYoloIds = new Set();
-                state.customRects     = [];
-                state.customCounter   = 0;
-                state.drawMode        = "yolo";
                 ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
-                if (modeToggleBtn) {
-                    modeToggleBtn.textContent = "✏️ Drag Box over Object";
-                    modeToggleBtn.style.background = "";
-                }
-                setStatus("Upload a video or connect RTSP, then click Scan Room.", "info");
+                setStatus("Upload a video or connect RTSP, then click Scan Object.", "info");
             }
             updateSelectionList();
         }
@@ -687,20 +550,16 @@
             if (state.phase !== "guarding") {
                 state.scanDetections   = [];
                 state.selectedYoloIds  = new Set();
-                state.customRects      = [];
-                state.customCounter    = 0;
-                state.drawMode         = "yolo";
                 state.phase            = "idle";
                 ctx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
                 updateSelectionList();
                 checkStartReady();
-                if (modeToggleBtn) modeToggleBtn.disabled = true;
-                if (state.active) setStatus("Source loaded. Click Scan Room to begin.", "ok");
+                if (state.active) setStatus("Source loaded. Click Scan Object to begin.", "ok");
             }
         };
 
         // -- Init --------------------------------------------------------------
-        setStatus("Upload a video or connect RTSP, then click Scan Room.", "info");
+        setStatus("Upload a video or connect RTSP, then click Scan Object.", "info");
         updateSelectionList();
 
         // Trigger pipeline change check in case room_guardian is already selected

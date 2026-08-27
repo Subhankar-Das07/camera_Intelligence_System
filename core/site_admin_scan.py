@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -169,14 +170,76 @@ def _init_pipelines(state: Dict[str, Any], cam: Dict[str, Any], frame: np.ndarra
     state["pipelines_initialized"] = True
 
 
+POSE_DETECT_CONF = float(os.environ.get("SITE_ADMIN_POSE_DETECT_CONF", "0.55"))
+PERSON_BOX_MIN_CONF = float(os.environ.get("SITE_ADMIN_PERSON_BOX_MIN_CONF", "0.65"))
+PERSON_MIN_VISIBLE_KPTS = int(os.environ.get("SITE_ADMIN_PERSON_MIN_KPTS", "4"))
+PERSON_MIN_BOX_OVERLAP = float(os.environ.get("SITE_ADMIN_PERSON_MIN_BOX_OVERLAP", "0.12"))
+PERSON_MIN_BOX_AREA_FRAC = float(os.environ.get("SITE_ADMIN_PERSON_MIN_BOX_AREA_FRAC", "0.008"))
+# Shoulders / hips / knees / ankles — reject head-only reflection ghosts
+_BODY_SUPPORT_KPT_INDICES = (5, 6, 11, 12, 13, 14, 15, 16)
+
+
 def build_pose_cache(frame: np.ndarray) -> Dict[str, Any]:
     """Single YOLO pose pass; share across intrusion/danger_zone rules."""
     model = _get_pose_model()
-    results = model(frame, classes=[0], verbose=False)[0]
-    cache: Dict[str, Any] = {"results": results, "keypoints_xy": None, "keypoints_conf": None}
+    results = model(frame, classes=[0], conf=POSE_DETECT_CONF, verbose=False)[0]
+    cache: Dict[str, Any] = {
+        "results": results,
+        "keypoints_xy": None,
+        "keypoints_conf": None,
+        "boxes_xyxy": None,
+        "boxes_conf": None,
+    }
     if results.keypoints is not None:
         cache["keypoints_xy"] = results.keypoints.xy.cpu().numpy()
         cache["keypoints_conf"] = results.keypoints.conf.cpu().numpy()
+    if results.boxes is not None and len(results.boxes) > 0:
+        try:
+            cache["boxes_xyxy"] = results.boxes.xyxy.cpu().numpy()
+            cache["boxes_conf"] = results.boxes.conf.cpu().numpy()
+        except Exception:
+            pass
+    # #region agent log
+    try:
+        import json as _json
+        _n = 0 if cache["keypoints_xy"] is None else int(len(cache["keypoints_xy"]))
+        _bc = []
+        if cache.get("boxes_conf") is not None:
+            _bc = [round(float(x), 3) for x in list(cache["boxes_conf"][:8])]
+        _kc_max = []
+        if cache.get("keypoints_conf") is not None:
+            for row in list(cache["keypoints_conf"][:4]):
+                _kc_max.append(round(float(max(row)), 3) if len(row) else 0.0)
+        _payload = _json.dumps({
+            "sessionId": "46c418",
+            "hypothesisId": "A,C",
+            "location": "site_admin_scan.py:build_pose_cache",
+            "message": "pose pass summary",
+            "data": {
+                "n_pose_persons": _n,
+                "n_boxes": len(_bc),
+                "boxes_conf": _bc,
+                "kpt_max_conf_per_person": _kc_max,
+                "pose_detect_conf": POSE_DETECT_CONF,
+                "h": int(frame.shape[0]),
+                "w": int(frame.shape[1]),
+            },
+            "timestamp": int(time.time() * 1000),
+            "runId": "post-fix-v3",
+        }) + "\n"
+        for _p in (
+            "debug-46c418.log",
+            os.path.join("static", "debug-46c418.log"),
+            os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+        ):
+            try:
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(_payload)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # #endregion
     return cache
 
 
@@ -187,6 +250,83 @@ def _part_for_kpt(kpt_idx: int, parts: List[str]) -> str:
     return "whole"
 
 
+def _person_box_passes_gate(
+    p_i: int,
+    boxes_xyxy: Optional[np.ndarray],
+    boxes_conf: Optional[np.ndarray],
+    roi_poly: Polygon,
+    *,
+    min_box_conf: float,
+    frame_w: int,
+    frame_h: int,
+    min_overlap: float = PERSON_MIN_BOX_OVERLAP,
+    min_area_frac: float = PERSON_MIN_BOX_AREA_FRAC,
+) -> Tuple[bool, Optional[float], bool, float]:
+    """
+    Require a confident person detection with meaningful ROI overlap.
+    Returns (ok, box_conf, bbox_intersects_roi, overlap_ratio).
+    """
+    if boxes_conf is None or boxes_xyxy is None or p_i >= len(boxes_conf) or p_i >= len(boxes_xyxy):
+        return False, None, False, 0.0
+    box_conf = float(boxes_conf[p_i])
+    if box_conf < min_box_conf:
+        return False, box_conf, False, 0.0
+    x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[p_i][:4]]
+    box_w = max(0.0, x2 - x1)
+    box_h = max(0.0, y2 - y1)
+    box_area = box_w * box_h
+    frame_area = float(max(1, frame_w) * max(1, frame_h))
+    if box_area < min_area_frac * frame_area:
+        return False, box_conf, False, 0.0
+    overlap_ratio = 0.0
+    intersects = False
+    try:
+        from shapely.geometry import box as shapely_box
+
+        person_box = shapely_box(x1, y1, x2, y2)
+        if person_box.intersects(roi_poly):
+            intersects = True
+            inter = person_box.intersection(roi_poly).area
+            overlap_ratio = float(inter / box_area) if box_area > 1e-6 else 0.0
+    except Exception:
+        intersects = False
+        overlap_ratio = 0.0
+    if not intersects:
+        return False, box_conf, False, overlap_ratio
+    # Center-in-ROI also counts as a strong presence signal
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    center_in = False
+    try:
+        center_in = bool(roi_poly.contains(Point(cx, cy)))
+    except Exception:
+        center_in = False
+    if not center_in and overlap_ratio < min_overlap:
+        return False, box_conf, True, overlap_ratio
+    return True, box_conf, True, overlap_ratio
+
+
+def _person_skeleton_passes(
+    conf: np.ndarray,
+    *,
+    min_conf: float,
+    min_visible: int = PERSON_MIN_VISIBLE_KPTS,
+) -> Tuple[bool, int, int]:
+    """
+    Reject sparse / head-only pose ghosts (wet pavement reflections, etc.).
+    Returns (ok, visible_count, body_support_count).
+    """
+    visible = 0
+    body = 0
+    for i, c in enumerate(conf):
+        if float(c) < min_conf:
+            continue
+        visible += 1
+        if i in _BODY_SUPPORT_KPT_INDICES:
+            body += 1
+    ok = visible >= min_visible and body >= 1
+    return ok, visible, body
+
+
 def _evaluate_pose_from_keypoints(
     keypoints_xy: np.ndarray,
     keypoints_conf: np.ndarray,
@@ -194,39 +334,254 @@ def _evaluate_pose_from_keypoints(
     scan_type: str,
     width: int,
     height: int,
+    boxes_xyxy: Optional[np.ndarray] = None,
+    boxes_conf: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
     roi = rule.get("roi_normalized") or []
     if len(roi) < 3:
         return None
     roi_poly = Polygon(_denorm_roi(roi, width, height))
+    # Danger zones previously used a 20px buffer; that caused plant/edge FPs
+    # when keypoints landed just outside the drawn ROI (buffer_only_hit).
     machine_active = scan_type == "danger_zone"
-    buffered = roi_poly.buffer(20) if machine_active else roi_poly
+    danger_buffer_px = int(os.environ.get("SITE_ADMIN_DANGER_BUFFER_PX", "0"))
+    buffered = roi_poly.buffer(danger_buffer_px) if machine_active and danger_buffer_px > 0 else roi_poly
 
     trigger = common.normalize_pose_trigger(scan_type, rule.get("pose_trigger"))
     indices = common.pose_trigger_indices(trigger)
     min_conf = float(trigger.get("min_conf") or 0.5)
     parts = list(trigger.get("parts") or [])
+    require_person = bool(trigger.get("require_person", True))
     rule_name = rule.get("name") or scan_type.replace("_", " ")
+    min_box_conf = PERSON_BOX_MIN_CONF
 
-    for person_kpts, conf in zip(keypoints_xy, keypoints_conf):
+    # #region agent log
+    try:
+        import json as _json
+        _payload = _json.dumps({
+            "sessionId": "46c418",
+            "hypothesisId": "B,D",
+            "location": "site_admin_scan.py:_evaluate_pose_from_keypoints:entry",
+            "message": "pose eval entry",
+            "data": {
+                "scan_type": scan_type,
+                "rule_name": rule_name,
+                "require_person": require_person,
+                "require_person_enforced": True,
+                "min_conf": min_conf,
+                "min_box_conf": min_box_conf,
+                "min_visible_kpts": PERSON_MIN_VISIBLE_KPTS,
+                "min_box_overlap": PERSON_MIN_BOX_OVERLAP,
+                "n_persons": int(len(keypoints_xy)),
+                "n_boxes": 0 if boxes_conf is None else int(len(boxes_conf)),
+                "danger_buffer_px": danger_buffer_px if machine_active else 0,
+                "parts": parts,
+            },
+            "timestamp": int(time.time() * 1000),
+            "runId": "post-fix-v3",
+        }) + "\n"
+        for _p in (
+            "debug-46c418.log",
+            os.path.join("static", "debug-46c418.log"),
+            os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+        ):
+            try:
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(_payload)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # #endregion
+
+    for p_i, (person_kpts, conf) in enumerate(zip(keypoints_xy, keypoints_conf)):
+        box_ok, box_conf, bbox_intersects, overlap_ratio = True, None, True, 1.0
+        if require_person:
+            box_ok, box_conf, bbox_intersects, overlap_ratio = _person_box_passes_gate(
+                p_i,
+                boxes_xyxy,
+                boxes_conf,
+                roi_poly,
+                min_box_conf=min_box_conf,
+                frame_w=width,
+                frame_h=height,
+            )
+            if not box_ok:
+                # #region agent log
+                try:
+                    import json as _json
+                    _payload = _json.dumps({
+                        "sessionId": "46c418",
+                        "hypothesisId": "C",
+                        "location": "site_admin_scan.py:_evaluate_pose_from_keypoints:person_gate_reject",
+                        "message": "skipped weak/non-overlapping person",
+                        "data": {
+                            "rule_name": rule_name,
+                            "person_idx": int(p_i),
+                            "box_conf": None if box_conf is None else round(float(box_conf), 4),
+                            "bbox_intersects_roi": bool(bbox_intersects),
+                            "overlap_ratio": round(float(overlap_ratio), 4),
+                            "min_box_conf": min_box_conf,
+                            "min_box_overlap": PERSON_MIN_BOX_OVERLAP,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "post-fix-v3",
+                    }) + "\n"
+                    for _p in (
+                        "debug-46c418.log",
+                        os.path.join("static", "debug-46c418.log"),
+                        os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+                    ):
+                        try:
+                            with open(_p, "a", encoding="utf-8") as _f:
+                                _f.write(_payload)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # #endregion
+                continue
+
+            sk_ok, vis_n, body_n = _person_skeleton_passes(conf, min_conf=min_conf)
+            if not sk_ok:
+                # #region agent log
+                try:
+                    import json as _json
+                    _payload = _json.dumps({
+                        "sessionId": "46c418",
+                        "hypothesisId": "E",
+                        "location": "site_admin_scan.py:_evaluate_pose_from_keypoints:skeleton_reject",
+                        "message": "skipped incoherent/sparse pose",
+                        "data": {
+                            "rule_name": rule_name,
+                            "person_idx": int(p_i),
+                            "box_conf": None if box_conf is None else round(float(box_conf), 4),
+                            "visible_kpts": int(vis_n),
+                            "body_support_kpts": int(body_n),
+                            "min_visible_kpts": PERSON_MIN_VISIBLE_KPTS,
+                            "overlap_ratio": round(float(overlap_ratio), 4),
+                        },
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "post-fix-v3",
+                    }) + "\n"
+                    for _p in (
+                        "debug-46c418.log",
+                        os.path.join("static", "debug-46c418.log"),
+                        os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+                    ):
+                        try:
+                            with open(_p, "a", encoding="utf-8") as _f:
+                                _f.write(_payload)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # #endregion
+                continue
+
         for kpt_idx in indices:
             if kpt_idx >= len(person_kpts) or kpt_idx >= len(conf):
                 continue
-            if float(conf[kpt_idx]) <= min_conf:
+            kpt_c = float(conf[kpt_idx])
+            if kpt_c <= min_conf:
                 continue
             x, y = person_kpts[kpt_idx]
             pt = Point(float(x), float(y))
-            inside = buffered.contains(pt) if machine_active else roi_poly.contains(pt)
-            if inside:
+            inside_roi = roi_poly.contains(pt)
+            inside_buffered = buffered.contains(pt) if buffered is not roi_poly else inside_roi
+            # Always require the keypoint inside the drawn ROI (no soft buffer hits)
+            if inside_buffered and not inside_roi:
+                # #region agent log
+                try:
+                    import json as _json
+                    _payload = _json.dumps({
+                        "sessionId": "46c418",
+                        "hypothesisId": "B",
+                        "location": "site_admin_scan.py:_evaluate_pose_from_keypoints:buffer_reject",
+                        "message": "skipped buffer-only keypoint",
+                        "data": {
+                            "rule_name": rule_name,
+                            "person_idx": int(p_i),
+                            "keypoint": common.POSE_KPT_NAMES.get(int(kpt_idx), f"kpt_{kpt_idx}"),
+                            "kpt_conf": round(kpt_c, 4),
+                            "box_conf": None if box_conf is None else round(float(box_conf), 4),
+                            "xy": [round(float(x), 1), round(float(y), 1)],
+                            "danger_buffer_px": danger_buffer_px if machine_active else 0,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "post-fix-v3",
+                    }) + "\n"
+                    for _p in (
+                        "debug-46c418.log",
+                        os.path.join("static", "debug-46c418.log"),
+                        os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+                    ):
+                        try:
+                            with open(_p, "a", encoding="utf-8") as _f:
+                                _f.write(_payload)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # #endregion
+                continue
+            if inside_roi:
                 kpt_name = common.POSE_KPT_NAMES.get(int(kpt_idx), f"kpt_{kpt_idx}")
                 body_part = _part_for_kpt(int(kpt_idx), parts)
                 part_label = common.POSE_PART_LABELS.get(body_part, body_part)
+                # #region agent log
+                try:
+                    import json as _json
+                    _payload = _json.dumps({
+                        "sessionId": "46c418",
+                        "hypothesisId": "A,C,D,E",
+                        "location": "site_admin_scan.py:_evaluate_pose_from_keypoints:hit",
+                        "message": "pose ROI hit",
+                        "data": {
+                            "scan_type": scan_type,
+                            "rule_name": rule_name,
+                            "person_idx": int(p_i),
+                            "keypoint": kpt_name,
+                            "kpt_conf": round(kpt_c, 4),
+                            "box_conf": None if box_conf is None else round(float(box_conf), 4),
+                            "has_box": box_conf is not None,
+                            "bbox_intersects_roi": bool(bbox_intersects),
+                            "overlap_ratio": round(float(overlap_ratio), 4),
+                            "inside_raw_roi": bool(inside_roi),
+                            "inside_buffered": bool(inside_buffered),
+                            "buffer_only_hit": False,
+                            "xy": [round(float(x), 1), round(float(y), 1)],
+                            "require_person": require_person,
+                            "require_person_enforced": True,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "post-fix-v3",
+                    }) + "\n"
+                    for _p in (
+                        "debug-46c418.log",
+                        os.path.join("static", "debug-46c418.log"),
+                        os.path.join(os.path.dirname(__file__), "debug-46c418.log"),
+                    ):
+                        try:
+                            with open(_p, "a", encoding="utf-8") as _f:
+                                _f.write(_payload)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # #endregion
                 return {
                     "type": scan_type,
                     "severity": rule.get("severity") or "high",
                     "body_part": body_part,
                     "keypoint": kpt_name,
                     "keypoint_idx": int(kpt_idx),
+                    "person_idx": int(p_i),
+                    "person_xyxy": (
+                        [float(v) for v in boxes_xyxy[p_i][:4]]
+                        if boxes_xyxy is not None and p_i < len(boxes_xyxy)
+                        else None
+                    ),
                     "message": f"{rule_name} — {kpt_name.replace('_', ' ')} ({part_label}) in area",
                 }
     return None
@@ -251,16 +606,35 @@ def _evaluate_pose_rule(
             scan_type,
             w,
             h,
+            boxes_xyxy=pose_cache.get("boxes_xyxy"),
+            boxes_conf=pose_cache.get("boxes_conf"),
         )
 
     model = _get_pose_model()
-    results = model(frame, classes=[0], verbose=False)[0]
+    results = model(frame, classes=[0], conf=POSE_DETECT_CONF, verbose=False)[0]
     if results.keypoints is None:
         return None
 
     keypoints_xy = results.keypoints.xy.cpu().numpy()
     keypoints_conf = results.keypoints.conf.cpu().numpy()
-    return _evaluate_pose_from_keypoints(keypoints_xy, keypoints_conf, rule, scan_type, w, h)
+    boxes_xyxy = None
+    boxes_conf = None
+    if results.boxes is not None and len(results.boxes) > 0:
+        try:
+            boxes_xyxy = results.boxes.xyxy.cpu().numpy()
+            boxes_conf = results.boxes.conf.cpu().numpy()
+        except Exception:
+            pass
+    return _evaluate_pose_from_keypoints(
+        keypoints_xy,
+        keypoints_conf,
+        rule,
+        scan_type,
+        w,
+        h,
+        boxes_xyxy=boxes_xyxy,
+        boxes_conf=boxes_conf,
+    )
 
 
 def _apply_person_journeys(
@@ -384,6 +758,208 @@ def _with_pipe_lock(state: Dict[str, Any], fn):
     return fn()
 
 
+def _store_verifier_votes(state: Dict[str, Any], rule: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    monitor_session = state.get("monitor_session")
+    session_lock = state.get("session_lock")
+    if monitor_session is None:
+        # Preview / go-live may stash on state directly
+        votes = state.setdefault("verifier_votes_by_rule", {})
+        votes[rule.get("id") or ""] = payload
+        state["verifier_votes"] = payload
+        return
+    if session_lock is not None:
+        with session_lock:
+            votes = monitor_session.setdefault("verifier_votes_by_rule", {})
+            votes[rule.get("id") or ""] = payload
+            monitor_session["verifier_votes"] = payload
+    else:
+        votes = monitor_session.setdefault("verifier_votes_by_rule", {})
+        votes[rule.get("id") or ""] = payload
+        monitor_session["verifier_votes"] = payload
+
+
+def _detect_persons_xyxy(frame: np.ndarray, pose_cache: Optional[Dict[str, Any]] = None):
+    if pose_cache and pose_cache.get("boxes_xyxy") is not None and len(pose_cache["boxes_xyxy"]):
+        return pose_cache["boxes_xyxy"], pose_cache.get("boxes_conf")
+    model = _get_pose_model()
+    results = model(frame, classes=[0], conf=POSE_DETECT_CONF, verbose=False)[0]
+    if results.boxes is None or len(results.boxes) == 0:
+        return np.zeros((0, 4), dtype=np.float32), None
+    return results.boxes.xyxy.cpu().numpy(), results.boxes.conf.cpu().numpy()
+
+
+def _detect_persons_for_loitering(
+    frame: np.ndarray,
+    pose_cache: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Person boxes for loitering — prefer detect model (seated/far) at low conf."""
+    conf = float(os.environ.get("SITE_ADMIN_LOITER_DETECT_CONF", "0.22"))
+    try:
+        from core import site_admin_verify as verify
+
+        model = verify._get_person_model()
+        results = model(frame, classes=[0], conf=conf, verbose=False)[0]
+        if results.boxes is not None and len(results.boxes):
+            return results.boxes.xyxy.cpu().numpy(), results.boxes.conf.cpu().numpy()
+    except Exception as e:
+        log.debug("loiter detect model failed: %s", e)
+    # Fallbacks
+    model = _get_pose_model()
+    results = model(frame, classes=[0], conf=conf, verbose=False)[0]
+    if results.boxes is not None and len(results.boxes):
+        return results.boxes.xyxy.cpu().numpy(), results.boxes.conf.cpu().numpy()
+    return _detect_persons_xyxy(frame, pose_cache)
+
+
+def _evaluate_loitering(
+    frame: np.ndarray,
+    rule: Dict[str, Any],
+    cam: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """RS-WACV24-inspired loitering: dwell + tortuosity/pace in ROI."""
+    from core import site_admin_verify as verify
+    from core.loitering_trajectory import loitering_decision, normalize_loiter_config
+
+    roi = rule.get("roi_normalized") or []
+    if len(roi) < 3:
+        return None
+    h, w = frame.shape[:2]
+    roi_px = verify.roi_polygon_px(roi, w, h)
+    boxes, confs = _detect_persons_for_loitering(frame, state.get("pose_cache"))
+    if boxes is None or len(boxes) == 0:
+        votes = {
+            "final": "fail",
+            "chips": [
+                {"name": "PrimaryYOLO", "status": "fail", "detail": "no_person"},
+                {"name": "LoiterMetrics", "status": "skip", "detail": "no_track"},
+                {"name": "Final", "status": "fail", "detail": "no_person"},
+            ],
+        }
+        _store_verifier_votes(state, rule, votes)
+        return None
+
+    tid, dwell, path = verify.track_and_dwell(
+        state,
+        cam.get("id") or "",
+        rule.get("id") or "",
+        boxes,
+        confs,
+        roi_px,
+    )
+    # Recover timestamps from dwell store
+    key = f"{cam.get('id') or ''}:{rule.get('id') or ''}"
+    rec = (state.get("_dwell") or {}).get(key, {}).get(tid or "", {})
+    timed_path = rec.get("path") or []
+    points = [(float(p[0]), float(p[1])) for p in timed_path] if timed_path else list(path)
+    times = [float(p[2]) for p in timed_path if len(p) > 2] if timed_path else []
+    if len(times) < len(points):
+        import time as _time
+
+        now = _time.time()
+        times = [now - (len(points) - i) * 0.5 for i in range(len(points))]
+
+    cfg = normalize_loiter_config(rule)
+    decision = loitering_decision(dwell, points, times, cfg)
+
+    # Person verify on best box overlapping ROI
+    best_box = None
+    best_conf = 0.0
+    best_overlap = 0.0
+    box_summaries = []
+    for i, box in enumerate(boxes):
+        inside, ov = verify.box_in_loiter_roi(box, roi_px)
+        c = float(confs[i]) if confs is not None and i < len(confs) else 0.5
+        box_summaries.append({
+            "i": i,
+            "conf": round(c, 3),
+            "overlap": round(ov, 3),
+            "inside": bool(inside),
+            "xyxy": [round(float(v), 1) for v in box[:4]],
+        })
+        if inside and c >= best_conf:
+            best_conf = c
+            best_box = box
+            best_overlap = ov
+    if best_box is None and box_summaries:
+        top = max(box_summaries, key=lambda s: s["overlap"])
+        if top["overlap"] > 0 or top.get("inside"):
+            best_overlap = top["overlap"]
+            best_conf = top["conf"]
+            best_box = boxes[top["i"]]
+    crop = verify.crop_person(frame, best_box) if best_box is not None else None
+    # Primary detection already class=0; accept when box is in/near ROI
+    if best_box is not None and best_conf >= 0.22 and (
+        best_overlap >= 0.02 or any(s.get("inside") for s in box_summaries)
+    ):
+        person_vote = verify.Vote(
+            "PersonVerify", "pass", f"primary_conf={best_conf:.2f}", score=best_conf
+        )
+    elif crop is not None:
+        person_vote = verify.verify_person_on_crop(crop)
+    else:
+        person_vote = verify.Vote("PersonVerify", "fail", "no_box")
+    # Zone: prefer track dwell / loiter membership over strict PolygonZone alone
+    zone_vote = verify.supervision_zone_vote(boxes, confs, roi_px, frame_shape=(h, w))
+    in_roi = dwell > 0 or any(s.get("inside") for s in box_summaries) or best_overlap >= 0.02
+    if zone_vote.status == "fail" and in_roi:
+        zone_vote = verify.Vote(
+            "ZoneDwell",
+            "pass",
+            f"overlap={best_overlap:.2f};dwell={dwell:.1f}",
+            score=best_overlap or dwell,
+        )
+    loiter_vote = verify.Vote(
+        "LoiterMetrics",
+        "pass" if decision["triggered"] else "fail",
+        f"dwell={decision['dwell_sec']}s tort={decision['tortuosity']} spd={decision['speed_px_s']}",
+        score=decision["dwell_sec"],
+    )
+    votes_list = [
+        verify.Vote("PrimaryYOLO", "pass", f"n={len(boxes)}"),
+        person_vote,
+        zone_vote,
+        loiter_vote,
+    ]
+    soft = (
+        person_vote.status != "fail"
+        and zone_vote.status != "fail"
+        and decision["triggered"]
+    )
+    streak = verify.bump_confirm_streak(
+        state, cam.get("id") or "", rule.get("id") or "", tid or "loiter", soft
+    )
+    ok = soft and streak >= verify.VERIFY_MIN_FRAMES
+    votes_list.append(
+        verify.Vote("Final", "pass" if ok else "fail", f"streak={streak}/{verify.VERIFY_MIN_FRAMES}")
+    )
+    payload = verify.votes_to_payload(votes_list, final_ok=ok, streak=streak)
+    # Optional agentic graph + RAG hints
+    graph_out = verify.run_verify_graph(
+        {
+            "votes": votes_list,
+            "streak": streak,
+            "rag_hints": verify.rag_hints_for_camera(cam.get("name") or ""),
+        }
+    )
+    payload["graph"] = graph_out.get("votes")
+    _store_verifier_votes(state, rule, payload)
+    if not ok:
+        return None
+    rule_name = rule.get("name") or "Loitering"
+    return {
+        "type": "loitering",
+        "severity": rule.get("severity") or "medium",
+        "message": (
+            f"{rule_name} — loitering "
+            f"{decision['dwell_sec']:.0f}s (tort={decision['tortuosity']:.1f})"
+        ),
+        "loitering": decision,
+        "verifier_votes": payload,
+        "track_id": tid,
+    }
+
+
 def evaluate_rule_on_frame(
     cam: Dict[str, Any],
     rule: Dict[str, Any],
@@ -405,6 +981,32 @@ def evaluate_rule_on_frame(
         if scan_type in ("intrusion", "danger_zone"):
             pose_cache = state.get("pose_cache")
             event = _evaluate_pose_rule(frame, rule, scan_type, pose_cache=pose_cache)
+            if event:
+                from core import site_admin_verify as verify
+
+                person_idx = event.get("person_idx")
+                boxes = (pose_cache or {}).get("boxes_xyxy")
+                confs = (pose_cache or {}).get("boxes_conf")
+                vr = verify.verify_pose_candidate(
+                    frame,
+                    rule,
+                    event,
+                    state,
+                    camera_id=cam.get("id") or "",
+                    boxes_xyxy=boxes,
+                    boxes_conf=confs,
+                    person_idx=person_idx if isinstance(person_idx, int) else None,
+                )
+                event["verifier_votes"] = verify.votes_to_payload(
+                    vr.votes, final_ok=vr.ok, streak=vr.streak
+                )
+                _store_verifier_votes(state, rule, event["verifier_votes"])
+                if not vr.ok:
+                    return None
+                return rule, event, out
+
+        elif scan_type == "loitering":
+            event = _evaluate_loitering(frame, rule, cam, state)
             if event:
                 return rule, event, out
 
@@ -540,7 +1142,9 @@ def evaluate_camera_frame(
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]]:
     """Evaluate all rules on one frame in parallel; returns alert candidates."""
     hits: List[Tuple[Dict[str, Any], Dict[str, Any], np.ndarray]] = []
-    needs_pose = any((r.get("scan_type") or "") in ("intrusion", "danger_zone") for r in rules)
+    needs_pose = any(
+        (r.get("scan_type") or "") in ("intrusion", "danger_zone", "loitering") for r in rules
+    )
     state["pose_cache"] = build_pose_cache(frame) if needs_pose else None
     workers = min(SCAN_RULE_WORKERS, max(1, len(rules)))
 
@@ -572,6 +1176,7 @@ def priority_weight(scan_type: str) -> int:
     weights = {
         "intrusion": 30,
         "danger_zone": 28,
+        "loitering": 22,
         "fall": 25,
         "fall_standing_lying": 24,
         "gate_analytics": 15,

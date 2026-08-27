@@ -1,3 +1,4 @@
+# ── Vehicle Recognition module (Pratyush) ────────────────────────────────────
 fastapi
 uvicorn
 opencv-python
@@ -30,3 +31,10 @@ redis
 # ── Site Admin (DVR HTTP snapshot cameras) ───────────────────────────────────
 # Hikvision ISAPI /picture fetch with HTTP digest auth
 requests
+
+# ── Intel Hardware Acceleration ──────────────────────────────────────────────
+openvino
+
+# ── Tracking and Inference ───────────────────────────────────────────────────
+trackers==2.3.0
+git+https://github.com/openai/CLIP.git

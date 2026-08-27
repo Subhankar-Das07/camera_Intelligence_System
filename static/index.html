@@ -3,78 +3,178 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Camera Intelligence System</title>
+    <title>Camera Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/shell/shell.css">
+    <link rel="stylesheet" href="/landing.css">
 </head>
-<body>
-    <nav class="cis-nav">
-        <a class="cis-brand" href="/">
-            <strong>Camera Intelligence</strong>
-            <span>Unified vision platform</span>
-        </a>
-        <div class="cis-nav-links">
-            <a href="/" data-nav="overview">Overview</a>
-            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
-            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
-            <a href="/features/face/" data-nav="face">Face Recognition</a>
+<body class="landing">
+    <section class="lp-hero" aria-label="Welcome">
+        <header class="lp-logo-bar" aria-label="DRP Infotech">
+            <a class="cis-brand cis-brand--logo-only" href="/" aria-label="DRP Infotech home">
+                <img class="cis-brand-logo" src="/assets/brand/drp-infotech-logo.png" width="44" height="44" alt="DRP Infotech">
+            </a>
+        </header>
+        <div class="lp-hero-media" style="background-image: url('/assets/landing/hero-ai-cctv.jpg');" role="img" aria-label="Security operations center with AI-analyzed CCTV feeds"></div>
+        <div class="lp-hero-veil"></div>
+        <div class="lp-hero-scan" aria-hidden="true"></div>
+        <div class="lp-hero-inner">
+            <div class="lp-hero-copy">
+                <p class="lp-eyebrow">AI Computer Vision · CCTV · On-prem</p>
+                <h1 class="lp-headline">Turn your existing cameras into an intelligent security layer</h1>
+                <p class="lp-lede">Live feeds from DVR and IP cameras, analyzed on your LAN — vehicle plates, face match, zone intrusion, and anomaly alerts pushed before incidents grow.</p>
+                <ul class="lp-hero-chips" aria-label="Capabilities">
+                    <li>Live CCTV feeds</li>
+                    <li>AI detection</li>
+                    <li>Plate &amp; face ID</li>
+                    <li>Instant alerts</li>
+                </ul>
+            </div>
+
+            <div class="lp-hero-side">
+                <div class="lp-monitor" aria-hidden="true">
+                    <div class="lp-monitor-bar">
+                        <span class="lp-monitor-dot"></span>
+                        <span class="lp-monitor-dot"></span>
+                        <span class="lp-monitor-dot"></span>
+                        <span class="lp-monitor-title">Live AI scan</span>
+                    </div>
+                    <div class="lp-monitor-grid">
+                        <div class="lp-monitor-tile lp-monitor-tile--main">
+                            <span class="lp-box lp-box--vehicle">Vehicle · 96%</span>
+                            <span class="lp-box lp-box--plate">MH-12-AB-4521</span>
+                        </div>
+                        <div class="lp-monitor-tile">
+                            <span class="lp-box lp-box--person">Person · 94%</span>
+                        </div>
+                        <div class="lp-monitor-tile">
+                            <span class="lp-box lp-box--zone">Zone breach</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="lp-login" id="lp-login">
+                <form class="lp-login-form" id="lp-login-form" autocomplete="off">
+                    <p class="lp-login-title">Enter workspace</p>
+                    <p class="lp-login-hint">Demo access — leave blank and continue</p>
+                    <label class="lp-field">
+                        <span>Username</span>
+                        <input class="lp-input" type="text" name="username" placeholder="Optional" autocomplete="username">
+                    </label>
+                    <label class="lp-field">
+                        <span>Password</span>
+                        <input class="lp-input" type="password" name="password" placeholder="Optional" autocomplete="current-password">
+                    </label>
+                    <button class="lp-submit" type="submit">Continue</button>
+                </form>
+                <div class="lp-gate" id="lp-gate" hidden>
+                    <p class="lp-login-title">Welcome back</p>
+                    <p class="lp-login-hint">Demo session is active on this browser.</p>
+                    <a class="lp-submit lp-submit--link" href="/features/site-admin/">Continue to Site Admin</a>
+                    <button class="lp-reset" type="button" id="lp-reset">Use a different session</button>
+                </div>
+            </div>
+            </div>
         </div>
-    </nav>
+    </section>
 
-    <main class="cis-page overview-wrap">
-        <section class="overview-hero">
-            <h1>Camera Intelligence System</h1>
-            <p>
-                One product shell for zone safety, vehicle plates, and face identity.
-                Clients operate the site from <strong>Site Admin</strong> (configure once,
-                then alerts and reports). Feature tabs stay available for engineering demos.
-            </p>
-        </section>
-
-        <div class="guidance">
-            <h3>How to use</h3>
-            <ul>
-                <li>Pick a feature from the top bar — you stay inside the same product chrome.</li>
-                <li>On each page, read the Guidance panel for short setup notes.</li>
-                <li>Connect a video file or RTSP camera, then run that feature’s pipeline.</li>
-                <li>Structured data (vehicles, faces, sessions) is stored in Redis.</li>
-            </ul>
+    <section class="lp-caps" aria-label="Outcomes">
+        <header class="lp-caps-head">
+            <h2>Know early. Live easier.</h2>
+            <p>AI turns existing CCTV into alerts and peace of mind — before a small issue becomes a big incident.</p>
+        </header>
+        <div class="lp-caps-row">
+            <figure class="lp-cap">
+                <img src="/assets/landing/cap-alert.jpg" alt="Owner receiving an early security alert on a phone">
+                <figcaption>
+                    <strong>Alerted ahead of time</strong>
+                    <span>Know before it escalates</span>
+                </figcaption>
+            </figure>
+            <figure class="lp-cap">
+                <img src="/assets/landing/stat-vehicles.jpg" alt="Gate traffic with vehicles under CCTV">
+                <figcaption>
+                    <strong>Vehicles &amp; plates</strong>
+                    <span>Track gate traffic and plate awareness</span>
+                </figcaption>
+            </figure>
+            <figure class="lp-cap">
+                <img src="/assets/landing/stat-face.jpg" alt="Building entrance with security camera">
+                <figcaption>
+                    <strong>Faces &amp; risk control</strong>
+                    <span>Known vs unknown; tighten access</span>
+                </figcaption>
+            </figure>
         </div>
+        <ul class="lp-cap-tags">
+            <li>Intrusion</li>
+            <li>Anomaly</li>
+            <li>Plates</li>
+            <li>Face</li>
+            <li>Fall</li>
+        </ul>
+    </section>
 
-        <div class="feature-grid">
-            <a class="feature-card" href="/features/zone-safety/">
-                <h2>Zone Safety</h2>
-                <p>Intrusion detection, danger-zone proximity, and fall detection with ROI drawing and live alerts.</p>
-                <div class="path">static/features/zone-safety/</div>
-            </a>
-            <a class="feature-card" href="/features/vehicle/">
-                <h2>Vehicle Recognition</h2>
-                <p>Detect plates, count visits, and review the detection log. Persistence is Redis-backed.</p>
-                <div class="path">static/features/vehicle/</div>
-            </a>
-            <a class="feature-card" href="/features/face/">
-                <h2>Face Recognition</h2>
-                <p>Live recognition, register identities, rename people, and manage the identity gallery.</p>
-                <div class="path">static/features/face/</div>
-            </a>
-            <a class="feature-card" href="/features/site-admin/">
-                <h2>Site Admin</h2>
-                <p>Configure cameras, rules, alerts, and reports. Admin sets up once; feeds scan continuously.</p>
-                <div class="path">static/features/site-admin/</div>
-            </a>
+    <section class="lp-insights" aria-label="AI statistics">
+        <header class="lp-caps-head">
+            <h2>What the cameras measure for you</h2>
+            <p>Illustrative site insights AI can collect from CCTV — vehicles, plates, anomalies, faces, and daily protection for shops and factories.</p>
+        </header>
+        <div class="lp-stats">
+            <div class="lp-stat">
+                <span class="lp-stat-value">128</span>
+                <span class="lp-stat-label">Vehicles tracked today</span>
+            </div>
+            <div class="lp-stat">
+                <span class="lp-stat-value">64</span>
+                <span class="lp-stat-label">Number plates seen</span>
+            </div>
+            <div class="lp-stat">
+                <span class="lp-stat-value">7</span>
+                <span class="lp-stat-label">Anomalies flagged early</span>
+            </div>
+            <div class="lp-stat">
+                <span class="lp-stat-value">23</span>
+                <span class="lp-stat-label">Faces recognized</span>
+            </div>
+            <div class="lp-stat">
+                <span class="lp-stat-value">3</span>
+                <span class="lp-stat-label">Risk persons restricted</span>
+            </div>
+            <div class="lp-stat">
+                <span class="lp-stat-value">24/7</span>
+                <span class="lp-stat-label">On-prem AI watching</span>
+            </div>
         </div>
-
-        <section class="dev-note">
-            <h3>Developer note — branch ownership</h3>
-            <p>Keep feature work isolated under one folder so merges stay clean:</p>
-            <ul>
-                <li><code>static/features/zone-safety/</code> — intrusion / danger zone / fall UI</li>
-                <li><code>static/features/vehicle/</code> — vehicle UI</li>
-                <li><code>static/features/face/</code> — face UI</li>
-                <li><code>static/shell/</code> + <code>static/shared/</code> — shared chrome only</li>
-            </ul>
-        </section>
-    </main>
+        <div class="lp-insights-row">
+            <figure class="lp-cap">
+                <img src="/assets/landing/stat-shop.jpg" alt="Retail shop protected by AI cameras">
+                <figcaption>
+                    <strong>Shops &amp; commercial</strong>
+                    <span>Protect the floor while business stays easy</span>
+                </figcaption>
+            </figure>
+            <figure class="lp-cap">
+                <img src="/assets/landing/stat-factory.jpg" alt="Manufacturing workshop under AI CCTV">
+                <figcaption>
+                    <strong>Manufacturing units</strong>
+                    <span>Danger zones and people safety on the floor</span>
+                </figcaption>
+            </figure>
+            <figure class="lp-cap">
+                <img src="/assets/landing/cap-cctv-site.jpg" alt="CCTV camera with AI detection at a secured site">
+                <figcaption>
+                    <strong>Homes &amp; compounds</strong>
+                    <span>Perimeter cameras with AI watch 24/7</span>
+                </figcaption>
+            </figure>
+        </div>
+        <p class="lp-insights-note">Demo figures for presentation — live counts appear in Site Admin reports after go-live.</p>
+    </section>
 
     <script src="/shell/shell.js"></script>
+    <script src="/landing.js"></script>
 </body>
 </html>

@@ -9,15 +9,12 @@
 </head>
 <body>
     <nav class="cis-nav">
-        <a class="cis-brand" href="/">
-            <strong>Camera Intelligence</strong>
-            <span>Unified vision platform</span>
+        <a class="cis-brand cis-brand--logo-only" href="/" aria-label="DRP Infotech home">
+            <img class="cis-brand-logo" src="/assets/brand/drp-infotech-logo.png" width="44" height="44" alt="DRP Infotech">
         </a>
         <div class="cis-nav-links">
-            <a href="/" data-nav="overview">Overview</a>
-            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
-            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
-            <a href="/features/face/" data-nav="face">Face Recognition</a>
+            <a href="/" data-nav="home">Home</a>
+            <a href="/features/site-admin/" data-nav="site-admin">Site Admin</a>
         </div>
     </nav>
 
@@ -63,6 +60,7 @@
                         <select id="mode-selector" class="fr-input" style="width: 100%; margin-top: 8px;">
                             <option value="visitor">Visitor Identification</option>
                             <option value="attendance">Attendance Tracker</option>
+                            <option value="vision_watch">Vision Watch</option>
                         </select>
                     </div>
                 </section>
@@ -121,6 +119,26 @@
                         <button class="fr-btn fr-btn-secondary" id="att-reg-snapshot-btn" type="button" disabled style="margin-top:10px;">Snapshot from Live Feed</button>
                         <button class="fr-btn fr-btn-register" id="att-reg-submit-btn" type="button" disabled>Register Student</button>
                     </div>
+
+                    <div id="fr-vision-watch-controls" class="hidden">
+                        <p class="fr-hint">Configure watchman tracking and door monitoring.</p>
+
+                        <div style="margin-bottom: 12px;">
+                            <label class="fr-hint" style="font-weight:600; margin-bottom:4px; display:block;">Watchman Tracking</label>
+                            <input type="text" id="vw-watchman-name" class="fr-input" placeholder="Watchman Name (e.g. John)">
+                        </div>
+
+                        <div>
+                            <label class="fr-hint" style="font-weight:600; margin-bottom:4px; display:block;">🚪 Door Monitor Zone</label>
+                            <p class="fr-hint">Click on the video to draw a polygon over the door. Close the polygon by clicking near the first point.</p>
+                            <div style="display: flex; gap: 8px; margin-top: 8px;">
+                                <button class="fr-btn fr-btn-secondary" id="vw-clear-roi-btn" type="button" style="flex:1;">🗑 Clear Zone</button>
+                            </div>
+                            <div id="vw-door-status-hint" style="margin-top:10px; padding: 8px; background: rgba(255,255,255,0.05); border-radius:6px; font-size:0.78rem; color:#94a3b8;">
+                                🟡 Draw a zone, then start stream. Auto-detects in ~3 seconds.
+                            </div>
+                        </div>
+                    </div>
                     
                     <div class="fr-reg-feedback hidden" id="reg-feedback"></div>
                 </section>
@@ -135,11 +153,12 @@
                         <span class="fr-legend-dot unknown"></span><span>Unknown</span>
                     </div>
                 </div>
-                <div class="fr-video-wrapper" id="fr-video-wrapper">
+                <div class="fr-video-wrapper" id="fr-video-wrapper" style="position: relative;">
                     <div class="fr-video-placeholder" id="fr-placeholder">
                         <p>Start a video source to begin live face recognition</p>
                     </div>
-                    <img id="fr-stream-img" class="fr-stream-img hidden" alt="Recognition Feed">
+                    <img id="fr-stream-img" class="fr-stream-img hidden" alt="Recognition Feed" style="display: block; width: 100%; height: auto;">
+                    <canvas id="fr-roi-canvas" class="hidden" style="position: absolute; top: 0; left: 0; pointer-events: auto; z-index: 10;"></canvas>
                 </div>
                 <div class="fr-events-section">
                     <h3 class="fr-events-title">Recognition Events</h3>
@@ -150,16 +169,38 @@
             </main>
 
             <aside class="fr-identity-panel">
-                <div class="fr-panel-header">
-                    <h2 class="fr-panel-title" id="right-panel-title">Identity Manager</h2>
-                    <button class="fr-btn fr-btn-icon" id="refresh-identities-btn" type="button" title="Refresh">↻</button>
+                <div class="fr-panel-header" id="fr-admin-entry-header" style="justify-content: center; height: 100%; align-items: center; display: flex; flex-direction: column; gap: 16px;">
+                    <button class="fr-btn fr-btn-primary" id="fr-admin-switch-btn" type="button" style="font-size: 1.2rem; padding: 12px 24px; width: 80%;">Admin</button>
+                    <button class="fr-btn fr-btn-secondary" id="fr-reports-switch-btn" type="button" style="font-size: 1.2rem; padding: 12px 24px; width: 80%;">Reports</button>
                 </div>
-                <div class="fr-identity-filter">
-                    <button class="fr-filter-tab active" id="filter-known-btn" data-filter="known" type="button">Known</button>
-                    <button class="fr-filter-tab" data-filter="blank" type="button">&nbsp;</button>
+
+                <div id="fr-reports-content" class="hidden" style="display: flex; flex-direction: column; height: 100%;">
+                    <div class="fr-panel-header">
+                        <button class="fr-btn fr-btn-secondary" id="fr-reports-back-btn" type="button" style="padding: 4px 8px; font-size: 0.8rem; margin-right: 8px;">← Back</button>
+                        <h2 class="fr-panel-title">Session Reports</h2>
+                        <button class="fr-btn fr-btn-icon" id="refresh-reports-btn" type="button" title="Refresh">↻</button>
+                    </div>
+                    <div class="fr-identity-list" id="reports-list" style="flex: 1; overflow-y: auto;">
+                        <div class="fr-identity-loading">Loading reports...</div>
+                    </div>
                 </div>
-                <div class="fr-identity-list" id="identity-list">
-                    <div class="fr-identity-loading">Loading identities...</div>
+
+                <div id="fr-admin-content" class="hidden" style="display: flex; flex-direction: column; height: 100%;">
+                    <div class="fr-panel-header">
+                        <button class="fr-btn fr-btn-secondary" id="fr-admin-back-btn" type="button" style="padding: 4px 8px; font-size: 0.8rem; margin-right: 8px;">← Back</button>
+                        <h2 class="fr-panel-title" id="right-panel-title">Identity Manager</h2>
+                        <button class="fr-btn fr-btn-icon" id="refresh-identities-btn" type="button" title="Refresh">↻</button>
+                    </div>
+                    <div class="fr-identity-filter">
+                        <button class="fr-filter-tab active" id="filter-known-btn" data-filter="known" type="button">Known</button>
+                        <button class="fr-filter-tab" id="filter-pending-btn" data-filter="pending" type="button">Pending</button>
+                    </div>
+                    <div class="fr-identity-list" id="identity-list" style="flex: 1; overflow-y: auto;">
+                        <div class="fr-identity-loading">Loading identities...</div>
+                    </div>
+                    <div class="fr-identity-list hidden" id="pending-list" style="flex: 1; overflow-y: auto;">
+                        <div class="fr-identity-loading">Loading pending requests...</div>
+                    </div>
                 </div>
             </aside>
         </div>
@@ -173,6 +214,18 @@
             <div class="fr-modal-actions">
                 <button class="fr-btn fr-btn-primary" id="rename-confirm-btn" type="button">Save</button>
                 <button class="fr-btn fr-btn-secondary" id="rename-cancel-btn" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="fr-modal hidden" id="report-modal">
+        <div class="fr-modal-content" style="max-width: 600px; width: 90%;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 id="report-modal-title">Session Report</h3>
+                <button class="fr-btn fr-btn-secondary" id="close-report-modal" style="padding: 2px 8px;">X</button>
+            </div>
+            <p class="fr-hint" id="report-modal-meta"></p>
+            <div id="report-modal-body" style="max-height: 400px; overflow-y: auto; margin-top: 16px; display: flex; flex-direction: column; gap: 12px;">
             </div>
         </div>
     </div>

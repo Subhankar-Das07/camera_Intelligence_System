@@ -10,6 +10,7 @@
     cameras: [],
     rules: [],
     alerts: [],
+    editingRuleId: "",
     roi: [],
     previewUrl: "",
     monitorSessionId: null,
@@ -44,11 +45,25 @@
     scanPreviewWizard: false,
     scanPreviewSidebar: false,
     scanPreviewTimer: null,
+    scanPreviewAgeTimer: null,
     scanPreviewGen: 0,
     scanPreviewApplyRules: false,
     scanPreviewFocusCamId: "",
     scanPreviewLastHeroAt: 0,
     scanPreviewStatusTimer: null,
+    searchStep: 1,
+    searchCameraId: "",
+    searchRuleIds: [],
+    searchClipStartSec: 0,
+    searchClipEndSec: 180,
+    searchVideoMeta: null,
+    searchClipDragging: false,
+    searchFilmstripCache: {},
+    searchFilmstripGen: 0,
+    searchJobId: "",
+    searchPoll: null,
+    searchProgress: null,
+    searchResults: [],
   };
 
   function emptyGateConfig() {
@@ -601,7 +616,23 @@
     return data;
   }
 
-  const ADMIN_VIEWS = ["wizard", "cameras", "rules", "staff", "vehicles", "settings"];
+  async function searchApi(path, opts = {}) {
+    const method = opts.method || (opts.json || opts.body ? "POST" : "GET");
+    const res = await fetch("/api/site-admin/search" + path, {
+      method,
+      headers: headers(opts.json ? { "Content-Type": "application/json" } : opts.headers),
+      body: opts.json ? JSON.stringify(opts.json) : opts.body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      const msg = typeof d === "string" ? d : d ? JSON.stringify(d) : res.statusText;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  const ADMIN_VIEWS = ["wizard", "cameras", "rules", "staff", "vehicles", "settings", "search"];
 
   function isAdmin() {
     return state.role !== "viewer";
@@ -620,6 +651,9 @@
       b.style.display = locked ? "none" : "";
     });
     document.querySelectorAll(".sa-nav-group[data-nav-group='rules']").forEach((g) => {
+      g.style.display = hideAdmin ? "none" : "";
+    });
+    document.querySelectorAll(".sa-nav-group[data-nav-group='others']").forEach((g) => {
       g.style.display = hideAdmin ? "none" : "";
     });
   }
@@ -700,6 +734,99 @@
     return single ? [single] : [];
   }
 
+  function runtimeWorkersByCamera() {
+    const workers = state.status?.runtime?.workers || [];
+    const map = {};
+    workers.forEach((w) => {
+      if (w && w.camera_id) map[w.camera_id] = w;
+    });
+    return map;
+  }
+
+  function formatScanAgeSec(sec) {
+    if (sec == null || !Number.isFinite(sec)) return "";
+    const s = Math.max(0, Math.floor(sec));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    return Math.floor(s / 3600) + "h ago";
+  }
+
+  function cameraScanInfo(camId) {
+    const live = !!state.status?.go_live;
+    if (!live) {
+      return { status: "idle", label: "Idle", ageSec: null, lastCheck: "", waitMs: 0 };
+    }
+    const w = runtimeWorkersByCamera()[camId];
+    if (!w) {
+      const hasRules = cameraHasEnabledRules(camId);
+      return {
+        status: hasRules ? "stale" : "idle",
+        label: hasRules ? "Stale" : "No rules",
+        ageSec: null,
+        lastCheck: "Never",
+        waitMs: 0,
+      };
+    }
+    const serverNow = Number(state.status?.runtime?.server_time);
+    const last = Number(w.last_tick_at || w.updated_at || 0);
+    let ageSec = null;
+    if (last > 0) {
+      const nowSec = Number.isFinite(serverNow) ? serverNow : Date.now() / 1000;
+      // Prefer live clock with skew from last /status fetch
+      const skew =
+        Number.isFinite(serverNow) && state._statusFetchedAt
+          ? state._statusFetchedAt / 1000 - serverNow
+          : 0;
+      ageSec = Math.max(0, Date.now() / 1000 - skew - last);
+    }
+    let status = String(w.status || "").toLowerCase() || "unknown";
+    if (status === "scanning" && ageSec != null && ageSec > 20) status = "stale";
+    if (status === "waiting" && ageSec != null && ageSec > 45) status = "stale";
+    const waitMs = Number(w.inference_wait_ms || 0);
+    const pauseReason = String(w.pause_reason || "").toLowerCase();
+    const pauseLabels = {
+      monitor: "Paused (Monitor)",
+      camera_disabled: "Paused (Off)",
+      no_rules: "No rules",
+      source_unavailable: "Offline",
+    };
+    const labels = {
+      scanning: "Scanning",
+      waiting: waitMs > 1500 ? "Waiting" : "Scanning",
+      paused: pauseLabels[pauseReason] || "Paused",
+      idle: "No rules",
+      offline: "Offline",
+      stale: "Stale",
+      unknown: "Unknown",
+    };
+    return {
+      status,
+      label: labels[status] || status,
+      ageSec,
+      lastCheck: ageSec != null ? formatScanAgeSec(ageSec) : "—",
+      waitMs,
+      pauseReason,
+    };
+  }
+
+  function buildScanBadgeHtml(info, compact) {
+    const cls = "sa-preview-badge sa-preview-badge--" + escapeHtml(info.status || "unknown");
+    const title =
+      info.status === "paused" && info.pauseReason === "monitor"
+        ? "Rule scanning paused while Monitor is open on this camera"
+        : info.status === "scanning" || info.status === "waiting"
+          ? "Last rule evaluation: " + (info.lastCheck || "—")
+          : "";
+    if (compact) {
+      return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(info.label)}</span>`;
+    }
+    const check =
+      info.lastCheck && info.lastCheck !== "—"
+        ? `<span class="sa-preview-check" title="Last time this camera finished a rule-scan tick">Last check: ${escapeHtml(info.lastCheck)}</span>`
+        : `<span class="sa-preview-check sa-preview-check--muted">Last check: —</span>`;
+    return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(info.label)}</span>${check}`;
+  }
+
   function resolvePreviewFocusCamId() {
     const cams = previewCameras();
     if (!cams.length) return "";
@@ -729,6 +856,10 @@
     if (state.scanPreviewTimer) {
       clearInterval(state.scanPreviewTimer);
       state.scanPreviewTimer = null;
+    }
+    if (state.scanPreviewAgeTimer) {
+      clearInterval(state.scanPreviewAgeTimer);
+      state.scanPreviewAgeTimer = null;
     }
     clearPreviewStatusTimer();
   }
@@ -773,7 +904,25 @@
             </div>`;
           })
           .join("");
-        legendEl.innerHTML = parallelHint + (items || '<span class="sa-muted">No rules</span>');
+        const votes = st.verifier_votes || null;
+        const chips = Array.isArray(votes?.chips) ? votes.chips : [];
+        const voteHtml = chips.length
+          ? `<div class="sa-verifier-row" title="Multi-verifier consensus (verify-before-alert)">
+              <span class="sa-verifier-label">Verifiers</span>
+              ${chips
+                .map((c) => {
+                  const stt = (c.status || "skip").toLowerCase();
+                  return `<span class="sa-verifier-chip sa-verifier-chip--${escapeHtml(stt)}" title="${escapeHtml(
+                    (c.detail || "") + (c.score != null ? " score=" + c.score : "")
+                  )}">${escapeHtml(c.name || "?")}</span>`;
+                })
+                .join("")}
+              <span class="sa-verifier-chip sa-verifier-chip--${escapeHtml(
+                (votes.final || "fail").toLowerCase()
+              )}">Decision: ${escapeHtml((votes.final || "fail").toUpperCase())}</span>
+            </div>`
+          : "";
+        legendEl.innerHTML = parallelHint + voteHtml + (items || '<span class="sa-muted">No rules</span>');
         legendEl.hidden = false;
       }
     }
@@ -865,24 +1014,50 @@
     const focusId = resolvePreviewFocusCamId();
     document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact)").forEach((card) => {
       const camId = card.getAttribute("data-cam-id") || "";
-      card.classList.toggle("is-active", activeIds.has(camId));
+      const info = cameraScanInfo(camId);
+      const isActive = info.status === "scanning" || info.status === "waiting" || activeIds.has(camId);
+      card.classList.toggle("is-active", isActive);
       card.classList.toggle("is-selected", camId === focusId);
-    });
-    document.querySelectorAll(".sa-preview-card:not(.sa-preview-card-compact) .sa-preview-badge").forEach((badge) => {
-      const card = badge.closest(".sa-preview-card");
-      if (card) badge.hidden = !activeIds.has(card.getAttribute("data-cam-id") || "");
+      card.classList.toggle("is-paused", info.status === "paused");
+      card.classList.toggle("is-stale", info.status === "stale" || info.status === "offline");
+      const labelEl = card.querySelector(".sa-preview-label");
+      if (labelEl) {
+        const name = previewCameras().find((c) => c.id === camId)?.name || camId;
+        labelEl.innerHTML = `${escapeHtml(name)}${buildScanBadgeHtml(info, false)}`;
+      }
     });
     document.querySelectorAll(".sa-preview-card-compact").forEach((card) => {
       const camId = card.getAttribute("data-cam-id") || "";
-      const isActive = activeIds.has(camId);
+      const info = cameraScanInfo(camId);
+      const isActive = info.status === "scanning" || info.status === "waiting" || activeIds.has(camId);
       card.classList.toggle("is-active", isActive);
+      card.classList.toggle("is-paused", info.status === "paused");
+      card.classList.toggle("is-stale", info.status === "stale" || info.status === "offline");
       const badge = card.querySelector(".sa-preview-badge");
-      if (badge) badge.hidden = !isActive;
+      if (badge) {
+        badge.className = "sa-preview-badge sa-preview-badge--" + (info.status || "unknown");
+        badge.textContent = info.label;
+        badge.hidden = false;
+        badge.title = info.lastCheck ? "Last check: " + info.lastCheck : "";
+      }
     });
     const heroLabel = document.getElementById("w-preview-hero-label");
     if (heroLabel) {
       const cam = previewCameras().find((c) => c.id === focusId);
-      heroLabel.textContent = cam ? cam.name : "";
+      if (!cam) {
+        heroLabel.textContent = "";
+      } else {
+        const info = cameraScanInfo(cam.id);
+        const extra =
+          info.pauseReason === "monitor"
+            ? " · Monitor open"
+            : info.waitMs > 1500
+              ? ` · Queue ${Math.round(info.waitMs)}ms`
+              : "";
+        heroLabel.innerHTML = `${escapeHtml(cam.name)} <span class="sa-preview-hero-meta">${escapeHtml(
+          info.label
+        )} · Last check: ${escapeHtml(info.lastCheck || "—")}${escapeHtml(extra)}</span>`;
+      }
     }
     syncPreviewRulesCheckbox();
   }
@@ -909,21 +1084,24 @@
   }
 
   function buildPreviewCardHtml(cam, compact, noRules) {
-    const activeIds = new Set(activeScanCameraIds());
     const focusId = resolvePreviewFocusCamId();
-    const isActive = activeIds.has(cam.id);
+    const info = cameraScanInfo(cam.id);
+    const isActive = info.status === "scanning" || info.status === "waiting";
     const isSelected = !compact && cam.id === focusId;
-    const badge = '<span class="sa-preview-badge"' + (isActive ? "" : " hidden") + ">Scanning</span>";
+    const stateCls =
+      (isActive ? " is-active" : "") +
+      (info.status === "paused" ? " is-paused" : "") +
+      (info.status === "stale" || info.status === "offline" ? " is-stale" : "");
     if (compact) {
-      return `<div class="sa-preview-card sa-preview-card-compact${isActive ? " is-active" : ""}" data-cam-id="${escapeHtml(cam.id)}" title="${escapeHtml(cam.name)}">
+      return `<div class="sa-preview-card sa-preview-card-compact${stateCls}" data-cam-id="${escapeHtml(cam.id)}" title="${escapeHtml(cam.name)} · ${escapeHtml(info.label)} · Last check: ${escapeHtml(info.lastCheck || "—")}">
         <img alt="" loading="lazy" />
-        ${badge}
+        ${buildScanBadgeHtml(info, true)}
       </div>`;
     }
     const noRulesCls = noRules ? " sa-preview-card-no-rules" : "";
-    return `<div class="sa-preview-card${noRulesCls}${isActive ? " is-active" : ""}${isSelected ? " is-selected" : ""}" data-cam-id="${escapeHtml(cam.id)}" role="button" tabindex="0" title="Show in large preview">
+    return `<div class="sa-preview-card${noRulesCls}${stateCls}${isSelected ? " is-selected" : ""}" data-cam-id="${escapeHtml(cam.id)}" role="button" tabindex="0" title="Show in large preview">
       <div class="sa-preview-thumb"><img alt="" loading="lazy" /></div>
-      <div class="sa-preview-label">${escapeHtml(cam.name)}${badge}</div>
+      <div class="sa-preview-label">${escapeHtml(cam.name)}${buildScanBadgeHtml(info, false)}</div>
     </div>`;
   }
 
@@ -1019,6 +1197,7 @@
       if (!scanPreviewWanted() || document.hidden) return;
       try {
         state.status = await api("/status");
+        state._statusFetchedAt = Date.now();
         if (!state.status?.go_live) {
           stopScanPreview();
           return;
@@ -1034,6 +1213,12 @@
     };
     tick();
     state.scanPreviewTimer = setInterval(tick, 4000);
+    if (!state.scanPreviewAgeTimer) {
+      state.scanPreviewAgeTimer = setInterval(() => {
+        if (!scanPreviewWanted() || document.hidden) return;
+        updatePreviewHighlights();
+      }, 1000);
+    }
   }
 
   function syncScanPreviewUI() {
@@ -1139,6 +1324,7 @@
 
   async function refresh() {
     state.status = await api("/status");
+    state._statusFetchedAt = Date.now();
     const live = !!state.status.go_live;
     if (!live && (state.scanPreviewWizard || state.scanPreviewSidebar)) {
       state.scanPreviewWizard = false;
@@ -1180,6 +1366,9 @@
   }
 
   function go(view) {
+    if (state.view === "search" && view !== "search") {
+      searchStopPoll();
+    }
     if (state.view === "monitor" && view !== "monitor") {
       stopMonitorIfAny();
     }
@@ -1200,7 +1389,19 @@
   }
 
   function render() {
-    const views = { wizard, cameras, rules, staff, vehicles, monitor, journeys, alerts, reports, settings };
+    const views = {
+      wizard,
+      cameras,
+      rules,
+      staff,
+      vehicles,
+      monitor,
+      journeys,
+      alerts,
+      reports,
+      search: searchView,
+      settings,
+    };
     (views[state.view] || wizard)();
   }
 
@@ -1641,17 +1842,54 @@
               </button>
             </td>`
           : `<td class="sa-rule-thumb-cell"><span class="sa-alert-thumb sa-alert-thumb--empty">No preview</span></td>`;
-        return `<tr data-rule-camera-id="${escapeHtml(r.camera_id)}">
+        const poseParts =
+          Array.isArray(r.pose_trigger?.parts) && r.pose_trigger.parts.length
+            ? r.pose_trigger.parts
+            : r.scan_type === "intrusion"
+              ? ["legs"]
+              : r.scan_type === "danger_zone"
+                ? ["whole"]
+                : [];
+        const triggerNote =
+          r.scan_type === "intrusion" || r.scan_type === "danger_zone"
+            ? poseParts
+                .map(
+                  (p) =>
+                    ({ head: "Head", hands: "Hands", legs: "Legs", torso: "Torso", whole: "Whole" }[p] ||
+                    p)
+                )
+                .join(", ")
+            : r.scan_type === "loitering"
+              ? `Dwell ${r.loiter_config?.dwell_sec ?? 20}s`
+              : "—";
+        const actions = isAdmin()
+          ? `<div class="sa-row sa-rule-actions">
+              <button class="btn secondary" data-editr="${escapeHtml(r.id)}" type="button">Edit</button>
+              <button class="btn danger" data-delr="${escapeHtml(r.id)}" type="button">Remove</button>
+            </div>`
+          : "";
+        const editingCls = state.editingRuleId === r.id ? " is-editing-rule" : "";
+        return `<tr data-rule-camera-id="${escapeHtml(r.camera_id)}" data-rule-id="${escapeHtml(r.id)}" class="${editingCls.trim()}">
           ${thumbCell}
           <td>${escapeHtml(r.name)}</td>
           <td>${escapeHtml(cam?.name || r.camera_id)}</td>
           <td>${escapeHtml(scanLabel)}</td>
+          <td><span class="sa-rule-trigger">${escapeHtml(triggerNote)}</span></td>
           <td>${roiNote}</td>
           <td>${r.enabled === false ? "Off" : "On"}</td>
-          <td>${isAdmin() ? `<button class="btn danger" data-delr="${r.id}" type="button">Remove</button>` : ""}</td>
+          <td>${actions}</td>
         </tr>`;
       })
       .join("");
+    const editingRule = state.editingRuleId
+      ? state.rules.find((x) => x.id === state.editingRuleId)
+      : null;
+    const editingBanner = editingRule
+      ? `<div class="sa-edit-banner" id="r-edit-banner">
+            <span>Editing <strong>${escapeHtml(editingRule.name || "rule")}</strong> — review body parts / ROI, then Update.</span>
+            <button class="btn secondary" type="button" id="r-edit-cancel" style="width:auto;">Cancel edit</button>
+          </div>`
+      : "";
     main.innerHTML = `
       <div class="sa-h">
         <div>
@@ -1666,7 +1904,8 @@
       </div>
       ${
         isAdmin()
-          ? `<div class="sa-card" style="margin-bottom:1rem;">
+          ? `<div class="sa-card" style="margin-bottom:1rem;" id="r-editor-card">
+        ${editingBanner}
         <div class="sa-form">
           <div class="sa-field"><label>Rule name</label><input class="text-input" id="r-name" placeholder="Main gate"></div>
           <div class="sa-field"><label>Camera</label><select class="text-input" id="r-cam">${camOpts}</select></div>
@@ -1706,13 +1945,24 @@
           <div id="pose-trigger-setup" class="sa-pose-trigger-setup" style="display:none;">
             <div class="sa-field">
               <label>Body-part trigger</label>
-              <p class="sa-muted sa-field-hint">Alert when any selected body part enters the ROI.</p>
+              <p class="sa-muted sa-field-hint">Alert when any selected body part enters the ROI. “Whole person” includes nose/head — use <strong>Legs</strong> only for foot/leg alerts.</p>
               <div class="sa-pose-parts">
                 <label><input type="checkbox" class="pose-part" value="head"> Head</label>
                 <label><input type="checkbox" class="pose-part" value="hands"> Hands</label>
                 <label><input type="checkbox" class="pose-part" value="legs"> Legs</label>
                 <label><input type="checkbox" class="pose-part" value="torso"> Torso</label>
                 <label><input type="checkbox" class="pose-part" value="whole"> Whole person</label>
+              </div>
+            </div>
+          </div>
+          <div id="loiter-setup" class="sa-loiter-setup" style="display:none;">
+            <div class="sa-field">
+              <label>Loitering thresholds</label>
+              <p class="sa-muted sa-field-hint">Trajectory analysis (WACV’24-style): dwell in ROI + wandering (tortuosity) or slow pace.</p>
+              <div class="sa-row" style="gap:1rem;align-items:flex-end;">
+                <div class="sa-field" style="margin:0;"><label>Dwell (sec)</label><input class="text-input" id="loiter-dwell" type="number" min="3" max="600" step="1" value="20" style="width:6rem;"></div>
+                <div class="sa-field" style="margin:0;"><label>Min tortuosity</label><input class="text-input" id="loiter-tort" type="number" min="1" max="50" step="0.1" value="1.8" style="width:6rem;"></div>
+                <div class="sa-field" style="margin:0;"><label>Max speed (px/s)</label><input class="text-input" id="loiter-speed" type="number" min="5" max="500" step="1" value="45" style="width:6rem;"></div>
               </div>
             </div>
           </div>
@@ -1727,15 +1977,17 @@
             <button class="btn secondary" type="button" id="r-suggest">Suggest regions</button>
             <button class="btn secondary" type="button" id="r-suggest-done" style="display:none;">Done picking</button>
             <button class="btn secondary" type="button" id="r-clear">Clear ROI</button>
-            <button class="btn primary" type="button" id="r-save" style="width:auto;">Save rule</button>
+            <button class="btn primary" type="button" id="r-save" style="width:auto;">${
+              state.editingRuleId ? "Update rule" : "Save rule"
+            }</button>
           </div>
         </div>
       </div>`
           : ""
       }
       <table class="sa-table" id="r-rules-table">
-        <thead><tr><th>Preview</th><th>Name</th><th>Camera</th><th>Scan</th><th>Geometry</th><th>On</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="sa-muted">No rules yet</td></tr>'}</tbody>
+        <thead><tr><th>Preview</th><th>Name</th><th>Camera</th><th>Scan</th><th>Trigger</th><th>Geometry</th><th>On</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" class="sa-muted">No rules yet</td></tr>'}</tbody>
       </table>`;
 
     document.getElementById("r-goto-staff")?.addEventListener("click", () => go("staff"));
@@ -1760,6 +2012,7 @@
     const typeSel = document.getElementById("r-type");
     const gateSetup = document.getElementById("gate-setup");
     const poseSetup = document.getElementById("pose-trigger-setup");
+    const loiterSetup = document.getElementById("loiter-setup");
     const roiHint = document.getElementById("roi-hint");
     const typeHint = document.getElementById("r-type-hint");
 
@@ -1770,6 +2023,10 @@
     function isPoseTriggerType() {
       const t = typeSel?.value || "";
       return t === "intrusion" || t === "danger_zone";
+    }
+
+    function isLoiterType() {
+      return typeSel?.value === "loitering";
     }
 
     function defaultPoseParts(scanType) {
@@ -1814,12 +2071,16 @@
     function syncGateUi() {
       const gate = isGateType();
       const pose = isPoseTriggerType();
+      const loiter = isLoiterType();
       if (gateSetup) gateSetup.style.display = gate ? "block" : "none";
       if (poseSetup) poseSetup.style.display = pose ? "block" : "none";
+      if (loiterSetup) loiterSetup.style.display = loiter ? "block" : "none";
       if (roiHint && !state.roiPickMode) {
         roiHint.textContent = gate
           ? "Gate rule: draw count line, gate ROI, and three distance zones — or Suggest regions and click a shape for ROI/zones."
-          : "Click the preview to draw ROI, or Suggest regions (FastSAM) to click a detected area. Fall / face / vehicle can run without a polygon.";
+          : loiter
+            ? "Draw the loitering ROI. Alert when a person stays/wanders there past dwell + trajectory thresholds."
+            : "Click the preview to draw ROI, or Suggest regions (FastSAM) to click a detected area. Fall / face / vehicle can run without a polygon.";
       }
       document.querySelectorAll(".sa-gate-step").forEach((b) => {
         b.classList.toggle("active", b.getAttribute("data-gmode") === state.gateDrawMode);
@@ -1828,10 +2089,85 @@
       syncTypeHint();
     }
 
+    function populateEditorFromRule(rule) {
+      if (!rule) return;
+      const nameEl = document.getElementById("r-name");
+      if (nameEl) nameEl.value = rule.name || "";
+      const camEl = document.getElementById("r-cam");
+      if (camEl) camEl.value = rule.camera_id || "";
+      if (typeSel) typeSel.value = rule.scan_type || "intrusion";
+      const ch = Array.isArray(rule.channels) ? rule.channels : ["web"];
+      const web = document.getElementById("ch-web");
+      const wa = document.getElementById("ch-wa");
+      const em = document.getElementById("ch-email");
+      if (web) web.checked = ch.includes("web");
+      if (wa) wa.checked = ch.includes("whatsapp");
+      if (em) em.checked = ch.includes("email");
+      if (rule.scan_type === "gate_analytics") {
+        const gc = rule.gate_config || {};
+        state.gateConfig = {
+          count_line: Array.isArray(gc.count_line) ? gc.count_line.map((p) => [...p]) : [],
+          gate_roi: Array.isArray(gc.gate_roi) ? gc.gate_roi.map((p) => [...p]) : [],
+          distance_zones: {
+            near: Array.isArray(gc.distance_zones?.near) ? gc.distance_zones.near.map((p) => [...p]) : [],
+            medium: Array.isArray(gc.distance_zones?.medium)
+              ? gc.distance_zones.medium.map((p) => [...p])
+              : [],
+            far: Array.isArray(gc.distance_zones?.far) ? gc.distance_zones.far.map((p) => [...p]) : [],
+          },
+          direction_in: gc.direction_in === "right" ? "right" : "left",
+        };
+        state.roi = [];
+        state.gateDrawMode = "count_line";
+        const dir = document.querySelector(
+          `input[name="g-dir"][value="${state.gateConfig.direction_in}"]`
+        );
+        if (dir) dir.checked = true;
+      } else {
+        state.gateConfig = emptyGateConfig();
+        state.roi = Array.isArray(rule.roi_normalized)
+          ? rule.roi_normalized.map((p) => [...p])
+          : [];
+      }
+      if (rule.scan_type === "intrusion" || rule.scan_type === "danger_zone") {
+        const parts =
+          Array.isArray(rule.pose_trigger?.parts) && rule.pose_trigger.parts.length
+            ? rule.pose_trigger.parts
+            : defaultPoseParts(rule.scan_type);
+        setPosePartChecks(parts);
+      }
+      if (rule.scan_type === "loitering") {
+        const lc = rule.loiter_config || {};
+        const d = document.getElementById("loiter-dwell");
+        const t = document.getElementById("loiter-tort");
+        const s = document.getElementById("loiter-speed");
+        if (d) d.value = lc.dwell_sec ?? 20;
+        if (t) t.value = lc.min_tortuosity ?? 1.8;
+        if (s) s.value = lc.max_speed ?? 45;
+      }
+    }
+
+    function beginEditRule(rule) {
+      if (!rule || !isAdmin()) return;
+      state.editingRuleId = rule.id;
+      rules();
+      document.getElementById("r-editor-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    function cancelEditRule() {
+      state.editingRuleId = "";
+      state.roi = [];
+      state.gateConfig = emptyGateConfig();
+      state.gateDrawMode = "count_line";
+      rules();
+    }
+
     document.getElementById("r-type-info")?.addEventListener("click", () => openScanCatalogHelp());
 
     typeSel?.addEventListener("change", () => {
-      if (isPoseTriggerType()) {
+      if (isPoseTriggerType() && !state.editingRuleId) {
+        setPosePartChecks(defaultPoseParts(typeSel.value));
+      } else if (isPoseTriggerType() && !selectedPoseParts().length) {
         setPosePartChecks(defaultPoseParts(typeSel.value));
       }
       syncGateUi();
@@ -1858,15 +2194,21 @@
     const camSel = document.getElementById("r-cam");
     const MAX_RULES_PER_CAMERA = 3;
 
-    function enabledRulesOnCamera(camId) {
-      return state.rules.filter((r) => r.camera_id === camId && r.enabled !== false);
+    if (editingRule) {
+      populateEditorFromRule(editingRule);
+    }
+
+    function enabledRulesOnCamera(camId, excludeId) {
+      return state.rules.filter(
+        (r) => r.camera_id === camId && r.enabled !== false && (!excludeId || r.id !== excludeId)
+      );
     }
 
     function syncCameraRuleLimitHint() {
       const hint = document.getElementById("r-cam-limit-hint");
       if (!hint || !camSel) return;
       const camId = camSel.value;
-      const n = enabledRulesOnCamera(camId).length;
+      const n = enabledRulesOnCamera(camId, state.editingRuleId || "").length;
       if (!camId) {
         hint.textContent = "";
         return;
@@ -2052,7 +2394,9 @@
       if (document.getElementById("ch-wa").checked) channels.push("whatsapp");
       if (document.getElementById("ch-email")?.checked) channels.push("email");
       const camId = document.getElementById("r-cam").value;
-      if (enabledRulesOnCamera(camId).length >= MAX_RULES_PER_CAMERA) {
+      const editingId = state.editingRuleId || "";
+      const existing = editingId ? state.rules.find((x) => x.id === editingId) : null;
+      if (enabledRulesOnCamera(camId, editingId || undefined).length >= MAX_RULES_PER_CAMERA) {
         return alert(`Max ${MAX_RULES_PER_CAMERA} enabled rules per camera. Disable or remove one first.`);
       }
       const payload = {
@@ -2061,14 +2405,29 @@
         scan_type: scanType,
         roi_normalized: state.roi,
         channels: channels.length ? channels : ["web"],
-        enabled: true,
+        enabled: existing ? existing.enabled !== false : true,
+        severity: existing?.severity || "high",
       };
       if (scanType === "intrusion" || scanType === "danger_zone") {
         const parts = selectedPoseParts();
         if (!parts.length) {
           return alert("Select at least one body part for the trigger.");
         }
-        payload.pose_trigger = { parts, min_conf: 0.5, require_person: true };
+        payload.pose_trigger = {
+          parts,
+          min_conf: existing?.pose_trigger?.min_conf ?? 0.5,
+          require_person: true,
+        };
+      }
+      if (scanType === "loitering") {
+        if ((state.roi || []).length < 3) {
+          return alert("Draw a loitering ROI (3+ points).");
+        }
+        payload.loiter_config = {
+          dwell_sec: Number(document.getElementById("loiter-dwell")?.value || 20),
+          min_tortuosity: Number(document.getElementById("loiter-tort")?.value || 1.8),
+          max_speed: Number(document.getElementById("loiter-speed")?.value || 45),
+        };
       }
       if (scanType === "gate_analytics") {
         const dirEl = document.querySelector('input[name="g-dir"]:checked');
@@ -2088,7 +2447,10 @@
         }
       }
       try {
-        const saved = await api("/rules", { json: payload });
+        const saved = editingId
+          ? await api("/rules/" + encodeURIComponent(editingId), { method: "PUT", json: payload })
+          : await api("/rules", { json: payload });
+        state.editingRuleId = "";
         state.roi = [];
         state.gateConfig = emptyGateConfig();
         state.gateDrawMode = "count_line";
@@ -2099,7 +2461,7 @@
             /* calibrate optional if camera offline */
           }
         }
-        if (entry?.kind === "identity") {
+        if (!editingId && entry?.kind === "identity") {
           alert(
             scanType === "vehicle"
               ? "Rule saved. After plates appear over a few days, approve yours in Vehicles."
@@ -2112,9 +2474,19 @@
         alert(e.message);
       }
     });
+    document.getElementById("r-edit-cancel")?.addEventListener("click", () => cancelEditRule());
+    main.querySelectorAll("[data-editr]").forEach((b) => {
+      b.onclick = () => {
+        const rule = state.rules.find((x) => x.id === b.getAttribute("data-editr"));
+        if (rule) beginEditRule(rule);
+      };
+    });
     main.querySelectorAll("[data-delr]").forEach((b) => {
       b.onclick = async () => {
-        await api("/rules/" + b.getAttribute("data-delr"), { method: "DELETE" });
+        const rid = b.getAttribute("data-delr");
+        if (!confirm("Remove this rule?")) return;
+        await api("/rules/" + rid, { method: "DELETE" });
+        if (state.editingRuleId === rid) state.editingRuleId = "";
         await loadLists();
         rules();
       };
@@ -2936,6 +3308,22 @@
     if (hint) hint.hidden = !state.monitorSuggestPickMode;
   }
 
+  function camerasWithRulesOptions(selectedId) {
+    const camerasWithRules = state.cameras.filter((c) =>
+      state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
+    );
+    return (
+      `<option value=""${!selectedId ? " selected" : ""}>Select camera…</option>` +
+      camerasWithRules
+        .map((c) => {
+          const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
+          const sel = c.id === selectedId ? " selected" : "";
+          return `<option value="${c.id}"${sel}>${escapeHtml(c.name)} (${n} rules)</option>`;
+        })
+        .join("")
+    );
+  }
+
   async function monitor() {
     if (state.monitorPoll) {
       clearInterval(state.monitorPoll);
@@ -2955,19 +3343,8 @@
       state.monitorSessionId = null;
     }
 
-    const camerasWithRules = state.cameras.filter((c) =>
-      state.rules.some((r) => r.camera_id === c.id && r.enabled !== false)
-    );
     const activeCamId = monStatus.active ? monStatus.camera_id || state.monitorCameraPick : state.monitorCameraPick;
-    const camOpts =
-      `<option value=""${!activeCamId ? " selected" : ""}>Select camera…</option>` +
-      camerasWithRules
-        .map((c) => {
-          const n = state.rules.filter((r) => r.camera_id === c.id && r.enabled !== false).length;
-          const sel = c.id === activeCamId ? " selected" : "";
-          return `<option value="${c.id}"${sel}>${escapeHtml(c.name)} (${n} rules)</option>`;
-        })
-        .join("");
+    const camOpts = camerasWithRulesOptions(activeCamId);
 
     const activeRules = monStatus.active ? monStatus.rules || [] : [];
     const legend = activeRules
@@ -3869,6 +4246,510 @@
     });
   }
 
+  function searchStopPoll() {
+    if (state.searchPoll) {
+      clearInterval(state.searchPoll);
+      state.searchPoll = null;
+    }
+  }
+
+  function searchRulesForCamera(camId) {
+    return state.rules.filter((r) => r.camera_id === camId && r.enabled !== false);
+  }
+
+  function searchClipWindowSec(meta) {
+    const dur = Number(meta?.duration_sec) || 0;
+    const maxClip = Number(meta?.max_clip_sec) || 180;
+    return Math.min(maxClip, dur || maxClip);
+  }
+
+  function searchInitClipFromMeta(meta) {
+    const dur = Number(meta?.duration_sec) || 0;
+    const win = searchClipWindowSec(meta);
+    state.searchVideoMeta = meta;
+    state.searchClipStartSec = 0;
+    state.searchClipEndSec = Math.min(win, dur || win);
+  }
+
+  function searchSetClipStart(startSec) {
+    const meta = state.searchVideoMeta;
+    if (!meta) return;
+    const dur = Number(meta.duration_sec) || 0;
+    const win = searchClipWindowSec(meta);
+    const maxStart = Math.max(0, dur - win);
+    const start = Math.max(0, Math.min(Number(startSec) || 0, maxStart));
+    state.searchClipStartSec = start;
+    state.searchClipEndSec = Math.min(start + win, dur);
+  }
+
+  function searchClipLabel() {
+    return `${formatMonitorTime(state.searchClipStartSec)} – ${formatMonitorTime(state.searchClipEndSec)}`;
+  }
+
+  const SEARCH_FILMSTRIP_FRAMES = 18;
+  const SEARCH_FILMSTRIP_HEIGHT = 48;
+
+  function searchSeekVideo(video, timeSec) {
+    return new Promise((resolve) => {
+      if (!video) {
+        resolve(false);
+        return;
+      }
+      const target = Math.max(0, Math.min(timeSec, (video.duration || timeSec) - 0.05));
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        video.removeEventListener("seeked", onSeeked);
+        resolve(ok);
+      };
+      const onSeeked = () => finish(true);
+      video.addEventListener("seeked", onSeeked);
+      try {
+        video.currentTime = target;
+      } catch (_) {
+        finish(false);
+        return;
+      }
+      setTimeout(() => finish(false), 4000);
+    });
+  }
+
+  async function searchBuildFilmstrip(videoEl, meta) {
+    const camId = meta?.camera_id || state.searchCameraId;
+    const thumbsEl = document.getElementById("sr-clip-thumbs");
+    const loadingEl = document.getElementById("sr-clip-filmstrip-loading");
+    if (!thumbsEl || !videoEl || !camId) return;
+
+    const gen = ++state.searchFilmstripGen;
+    const cached = state.searchFilmstripCache[camId];
+    if (cached?.urls?.length) {
+      thumbsEl.innerHTML = "";
+      cached.urls.forEach((u) => {
+        const img = document.createElement("img");
+        img.src = u;
+        img.className = "sa-search-filmstrip-thumb";
+        img.alt = "";
+        thumbsEl.appendChild(img);
+      });
+      if (loadingEl) loadingEl.hidden = true;
+      if (!state.searchClipDragging) videoEl.currentTime = state.searchClipStartSec;
+      return;
+    }
+
+    if (loadingEl) loadingEl.hidden = false;
+    thumbsEl.innerHTML = "";
+
+    const dur = Number(meta.duration_sec) || videoEl.duration || 0;
+    if (dur <= 0) {
+      if (loadingEl) loadingEl.hidden = true;
+      return;
+    }
+
+    const n = Math.max(4, Math.min(SEARCH_FILMSTRIP_FRAMES, Math.max(4, Math.ceil(dur / 15))));
+    const urls = [];
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    for (let i = 0; i < n; i++) {
+      if (gen !== state.searchFilmstripGen) return;
+      const t = n <= 1 ? 0 : (i / (n - 1)) * Math.max(0, dur - 0.1);
+      const ok = await searchSeekVideo(videoEl, t);
+      if (!ok || !videoEl.videoWidth) continue;
+      const aspect = videoEl.videoWidth / Math.max(1, videoEl.videoHeight);
+      canvas.width = Math.max(32, Math.round(SEARCH_FILMSTRIP_HEIGHT * aspect));
+      canvas.height = SEARCH_FILMSTRIP_HEIGHT;
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      const url = canvas.toDataURL("image/jpeg", 0.62);
+      urls.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.className = "sa-search-filmstrip-thumb";
+      img.alt = "";
+      thumbsEl.appendChild(img);
+    }
+
+    if (gen !== state.searchFilmstripGen) return;
+    state.searchFilmstripCache[camId] = { urls };
+    if (loadingEl) loadingEl.hidden = true;
+    if (!state.searchClipDragging) videoEl.currentTime = state.searchClipStartSec;
+  }
+
+  function searchWireClipTimeline() {
+    const track = document.getElementById("sr-clip-track");
+    const box = document.getElementById("sr-clip-box");
+    const video = document.getElementById("sr-clip-video");
+    const shadeL = document.getElementById("sr-clip-shade-l");
+    const shadeR = document.getElementById("sr-clip-shade-r");
+    const meta = state.searchVideoMeta;
+    if (!track || !box || !meta) return;
+
+    const dur = Number(meta.duration_sec) || 1;
+    const win = searchClipWindowSec(meta);
+    const draggable = dur > win + 0.5;
+
+    const applyBox = () => {
+      const leftPct = (state.searchClipStartSec / dur) * 100;
+      const widthPct = (win / dur) * 100;
+      box.style.left = `${leftPct}%`;
+      box.style.width = `${widthPct}%`;
+      box.classList.toggle("is-locked", !draggable);
+      if (shadeL) shadeL.style.width = `${leftPct}%`;
+      if (shadeR) {
+        shadeR.style.left = `${leftPct + widthPct}%`;
+        shadeR.style.width = `${Math.max(0, 100 - leftPct - widthPct)}%`;
+      }
+      const label = document.getElementById("sr-clip-label");
+      if (label) {
+        label.textContent = `${searchClipLabel()} of ${formatMonitorTime(dur)}`;
+      }
+      if (video && !state.searchClipDragging) {
+        video.currentTime = state.searchClipStartSec;
+      }
+    };
+
+    applyBox();
+
+    if (!draggable) return;
+
+    const posToStart = (clientX) => {
+      const rect = track.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const centerSec = ratio * dur;
+      searchSetClipStart(centerSec - win / 2);
+      applyBox();
+    };
+
+    const bindDrag = (getX) => (e) => {
+      e.preventDefault();
+      state.searchClipDragging = true;
+      const onMove = (ev) => {
+        if (!state.searchClipDragging) return;
+        posToStart(getX(ev));
+      };
+      const endDrag = () => {
+        state.searchClipDragging = false;
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", endDrag);
+        document.removeEventListener("touchmove", onMove);
+        document.removeEventListener("touchend", endDrag);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", endDrag);
+      document.addEventListener("touchmove", onMove, { passive: true });
+      document.addEventListener("touchend", endDrag);
+    };
+
+    box.addEventListener("mousedown", bindDrag((ev) => ev.clientX));
+    box.addEventListener(
+      "touchstart",
+      bindDrag((ev) => (ev.touches[0] ? ev.touches[0].clientX : 0)),
+      { passive: false }
+    );
+
+    track.addEventListener("click", (e) => {
+      if (e.target === box || box.contains(e.target)) return;
+      posToStart(e.clientX);
+    });
+  }
+
+  function searchInitClipEditor() {
+    const video = document.getElementById("sr-clip-video");
+    const meta = state.searchVideoMeta;
+    if (!video || !meta) return;
+    searchWireClipTimeline();
+    const runFilmstrip = () => {
+      searchBuildFilmstrip(video, meta).catch(() => {});
+    };
+    if (video.readyState >= 1) {
+      runFilmstrip();
+    } else {
+      video.addEventListener("loadedmetadata", runFilmstrip, { once: true });
+    }
+  }
+
+  async function searchView() {
+    if (!isAdmin()) {
+      main.innerHTML = `<p class="sa-muted">Search is admin-only.</p>`;
+      return;
+    }
+    await loadLists();
+    const step = state.searchStep;
+    const stepLabels = ["Pick feed", "Select clip", "Select rules", "Scan & results"];
+    const stepper = stepLabels
+      .map((label, i) => {
+        const n = i + 1;
+        const cls = n === step ? "is-active" : n < step ? "is-done" : "";
+        return `<li class="sa-search-step ${cls}"><span class="sa-search-step-num">${n}</span><span class="sa-search-step-label">${escapeHtml(label)}</span></li>`;
+      })
+      .join("");
+
+    const fileCams = state.cameras.filter((c) => c.type === "file");
+    let body = "";
+    let clipMetaError = "";
+
+    if (step === 2 && state.searchCameraId) {
+      const needMeta =
+        !state.searchVideoMeta || state.searchVideoMeta.camera_id !== state.searchCameraId;
+      if (needMeta) {
+        try {
+          const res = await searchApi(`/cameras/${state.searchCameraId}/video-meta`);
+          searchInitClipFromMeta(res.meta || {});
+        } catch (e) {
+          clipMetaError = e.message || String(e);
+        }
+      }
+    }
+
+    if (step === 1) {
+      const camCards = fileCams.length
+        ? fileCams
+            .map((c) => {
+              const sel = c.id === state.searchCameraId ? " is-selected" : "";
+              const thumb = c.preview_url
+                ? `<img src="${escapeHtml(c.preview_url)}" alt="" class="sa-search-src-thumb">`
+                : "";
+              return `<button type="button" class="sa-search-src${sel}" data-cam="${escapeHtml(c.id)}">${thumb}<span><strong>${escapeHtml(c.name || c.id)}</strong><span class="sa-muted">Uploaded video</span></span></button>`;
+            })
+            .join("")
+        : `<p class="sa-muted">No uploaded videos yet. <button type="button" class="btn secondary" id="sr-goto-cams">Go to Cameras</button> to upload an MP4 first.</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 1 — Select camera feed</h3><p class="sa-muted">Uses videos uploaded in Cameras (file-type cameras only).</p><div class="sa-search-sources">${camCards}</div></div>`;
+    } else if (step === 2) {
+      const cam = state.cameras.find((c) => c.id === state.searchCameraId);
+      const meta = state.searchVideoMeta;
+      if (clipMetaError) {
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3><p class="sa-error">${escapeHtml(clipMetaError)}</p></div>`;
+      } else if (meta) {
+        const dur = Number(meta.duration_sec) || 0;
+        const win = searchClipWindowSec(meta);
+        const shortClip = dur <= win + 0.5;
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3>
+          <p class="sa-muted">Camera: <strong>${escapeHtml(cam?.name || state.searchCameraId || "—")}</strong>. Scan limited to <strong>${Math.round(win / 60)} min</strong> per job.</p>
+          ${shortClip ? `<p class="sa-muted">Full clip will be scanned (under 3 min).</p>` : `<p class="sa-muted">Drag the highlighted 3-minute window on the strip over the preview.</p>`}
+          ${
+            meta.video_url
+              ? `<div class="sa-search-clip-editor">
+            <video id="sr-clip-video" class="sa-search-preview-video" src="${escapeHtml(meta.video_url)}" controls muted playsinline preload="metadata"></video>
+            <div class="sa-search-clip-overlay">
+              <p class="sa-search-filmstrip-loading" id="sr-clip-filmstrip-loading">Building preview strip…</p>
+              <div class="sa-search-filmstrip" id="sr-clip-track" role="slider" aria-label="Scan clip position">
+                <div class="sa-search-filmstrip-thumbs" id="sr-clip-thumbs"></div>
+                <div class="sa-search-filmstrip-shade sa-search-filmstrip-shade--left" id="sr-clip-shade-l"></div>
+                <div class="sa-search-filmstrip-shade sa-search-filmstrip-shade--right" id="sr-clip-shade-r"></div>
+                <div class="sa-search-timeline-box" id="sr-clip-box"></div>
+              </div>
+              <div class="sa-search-clip-time" id="sr-clip-label">${escapeHtml(searchClipLabel())} of ${escapeHtml(formatMonitorTime(dur))}</div>
+            </div>
+          </div>`
+              : ""
+          }
+        </div>`;
+      } else {
+        body = `<div class="sa-card sa-search-panel"><h3>Step 2 — Select clip to scan</h3><p class="sa-muted">Loading video info…</p></div>`;
+      }
+    } else if (step === 3) {
+      const cam = state.cameras.find((c) => c.id === state.searchCameraId);
+      const rules = searchRulesForCamera(state.searchCameraId);
+      const ruleChecks = rules.length
+        ? rules
+            .map((r) => {
+              const checked = state.searchRuleIds.includes(r.id) ? " checked" : "";
+              const label = catalogById(r.scan_type)?.label || (r.scan_type || "").replace(/_/g, " ");
+              return `<label class="sa-search-target"><input type="checkbox" class="sr-rule-cb" value="${escapeHtml(r.id)}"${checked}> <strong>${escapeHtml(r.name || r.id)}</strong> <span class="sa-badge">${escapeHtml(label)}</span></label>`;
+            })
+            .join("")
+        : `<p class="sa-muted">No rules for this camera. <button type="button" class="btn secondary" id="sr-goto-rules">Go to Rules</button> to create rules first.</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 3 — Select rules to replay</h3><p class="sa-muted">Camera: <strong>${escapeHtml(cam?.name || state.searchCameraId || "—")}</strong>. Clip: <strong>${escapeHtml(searchClipLabel())}</strong>. Choose up to 3 existing rules.</p><div class="sa-search-targets">${ruleChecks}</div></div>`;
+    } else {
+      const prog = state.searchProgress || { percent: 0, message: "Ready", phase: "idle" };
+      const scanning = state.searchJobId && prog.phase !== "done" && prog.phase !== "error";
+      const resultCards = (state.searchResults || []).length
+        ? state.searchResults
+            .map(
+              (ev) => `<article class="sa-search-result">
+              ${ev.thumb_url ? `<img src="${escapeHtml(ev.thumb_url)}" alt="" class="sa-search-cand-thumb">` : `<div class="sa-search-cand-thumb sa-search-cand-thumb--empty"></div>`}
+              <div class="sa-search-result-meta">
+                <strong>${escapeHtml(ev.rule_name || "")}</strong>
+                <span class="sa-badge">${escapeHtml((ev.scan_type || "").replace(/_/g, " "))}</span>
+                <p class="sa-muted">${escapeHtml(ev.message || "")}</p>
+                <span class="sa-muted">@ ${escapeHtml(formatMonitorTime(ev.ts_sec ?? 0))}</span>
+              </div>
+            </article>`
+            )
+            .join("")
+        : `<p class="sa-muted">${state.searchJobId && prog.phase === "done" ? "No rule breaks detected in this clip." : "Results appear here after the scan completes."}</p>`;
+      body = `<div class="sa-card sa-search-panel"><h3>Step 4 — Scan &amp; results</h3>
+        <p class="sa-muted">Scan window: <strong>${escapeHtml(searchClipLabel())}</strong></p>
+        <div class="sa-search-progress" role="progressbar" aria-valuenow="${prog.percent || 0}"><div class="sa-search-progress-bar" style="width:${Math.min(100, prog.percent || 0)}%"></div></div>
+        <p class="sa-muted sa-search-progress-msg">${escapeHtml(prog.message || prog.phase || "")}</p>
+        ${!state.searchJobId || prog.phase === "error" ? `<button type="button" class="btn primary" id="sr-start"${scanning ? " disabled" : ""}>Start scan</button>` : ""}
+        ${prog.phase === "error" ? `<p class="sa-error">${escapeHtml(prog.message || "Scan failed")}</p>` : ""}
+        <div class="sa-search-results">${resultCards}</div>
+      </div>`;
+    }
+
+    main.innerHTML = `<div class="sa-h"><div><h2>Search</h2><p>Replay uploaded footage with your existing camera rules and review when rules break.</p></div></div>
+      <ol class="sa-search-stepper">${stepper}</ol>${body}
+      <div class="sa-row sa-search-nav">
+        ${step > 1 ? `<button type="button" class="btn secondary" id="sr-back">Back</button>` : ""}
+        ${step < 4 ? `<button type="button" class="btn primary" id="sr-next"${step === 2 && (clipMetaError || !state.searchVideoMeta) ? " disabled" : ""}>Continue</button>` : `<button type="button" class="btn secondary" id="sr-restart">New search</button>`}
+      </div>`;
+
+    document.getElementById("sr-goto-cams")?.addEventListener("click", () => go("cameras"));
+    document.getElementById("sr-goto-rules")?.addEventListener("click", () => go("rules"));
+
+    document.getElementById("sr-back")?.addEventListener("click", () => {
+      searchStopPoll();
+      if (step === 4) {
+        state.searchJobId = "";
+        state.searchProgress = null;
+        state.searchResults = [];
+      }
+      state.searchStep = Math.max(1, step - 1);
+      searchView();
+    });
+
+    document.getElementById("sr-restart")?.addEventListener("click", () => {
+      searchStopPoll();
+      state.searchStep = 1;
+      state.searchCameraId = "";
+      state.searchRuleIds = [];
+      state.searchVideoMeta = null;
+      state.searchClipStartSec = 0;
+      state.searchClipEndSec = 180;
+      state.searchJobId = "";
+      state.searchProgress = null;
+      state.searchResults = [];
+      searchView();
+    });
+
+    document.getElementById("sr-next")?.addEventListener("click", () => {
+      if (step === 1) {
+        if (!state.searchCameraId) {
+          alert("Select a camera feed");
+          return;
+        }
+        state.searchRuleIds = [];
+        state.searchVideoMeta = null;
+        state.searchStep = 2;
+        searchView();
+        return;
+      }
+      if (step === 2) {
+        if (!state.searchVideoMeta) {
+          alert("Wait for video info to load");
+          return;
+        }
+        state.searchStep = 3;
+        searchView();
+        return;
+      }
+      if (step === 3) {
+        const picked = [...main.querySelectorAll(".sr-rule-cb:checked")].map((el) => el.value);
+        if (!picked.length) {
+          alert("Select at least one rule");
+          return;
+        }
+        if (picked.length > 3) {
+          alert("Maximum 3 rules per search");
+          return;
+        }
+        state.searchRuleIds = picked;
+        state.searchStep = 4;
+        searchView();
+      }
+    });
+
+    if (step === 1) {
+      main.querySelectorAll(".sa-search-src[data-cam]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.searchCameraId = btn.getAttribute("data-cam") || "";
+          state.searchRuleIds = [];
+          state.searchVideoMeta = null;
+          searchView();
+        });
+      });
+    }
+
+    if (step === 2 && state.searchVideoMeta && !clipMetaError) {
+      searchInitClipEditor();
+    }
+
+    if (step === 3) {
+      main.querySelectorAll(".sr-rule-cb").forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const picked = [...main.querySelectorAll(".sr-rule-cb:checked")].map((el) => el.value);
+          if (picked.length > 3) {
+            cb.checked = false;
+            alert("Maximum 3 rules per search");
+            return;
+          }
+          state.searchRuleIds = picked;
+        });
+      });
+    }
+
+    if (step === 4) {
+      document.getElementById("sr-start")?.addEventListener("click", async () => {
+        try {
+          const { job } = await searchApi("/jobs", {
+            json: {
+              camera_id: state.searchCameraId,
+              rule_ids: state.searchRuleIds,
+              start_sec: state.searchClipStartSec,
+              end_sec: state.searchClipEndSec,
+            },
+          });
+          state.searchJobId = job.id;
+          state.searchProgress = { percent: 0, message: "Queued", phase: "queued" };
+          state.searchResults = [];
+          searchView();
+          searchStopPoll();
+          state.searchPoll = setInterval(async () => {
+            try {
+              if (!state.searchJobId) return;
+              const st = await searchApi(`/jobs/${state.searchJobId}`);
+              state.searchProgress = st.progress || state.searchProgress;
+              const jobSt = st.job || {};
+              if (jobSt.status === "error") {
+                searchStopPoll();
+                if (state.view === "search") searchView();
+                return;
+              }
+              if (jobSt.status === "done") {
+                searchStopPoll();
+                const res = await searchApi(`/jobs/${state.searchJobId}/results`);
+                state.searchResults = res.results || [];
+                if (state.view === "search") searchView();
+                return;
+              }
+              if (state.view === "search" && state.searchStep === 4) {
+                const bar = main.querySelector(".sa-search-progress-bar");
+                const msgEl = main.querySelector(".sa-search-progress-msg");
+                if (bar) bar.style.width = `${Math.min(100, state.searchProgress?.percent || 0)}%`;
+                if (msgEl) msgEl.textContent = state.searchProgress?.message || state.searchProgress?.phase || "";
+              }
+            } catch (_) {
+              /* ignore poll errors */
+            }
+          }, 1500);
+        } catch (e) {
+          alert(e.message || String(e));
+        }
+      });
+      if (state.searchJobId && state.searchPoll) {
+        /* polling active */
+      } else if (state.searchJobId && state.searchProgress?.phase === "done" && !state.searchResults.length) {
+        searchApi(`/jobs/${state.searchJobId}/results`)
+          .then((res) => {
+            state.searchResults = res.results || [];
+            if (state.view === "search") searchView();
+          })
+          .catch(() => {});
+      }
+    }
+  }
+
   function settings() {
     const s = state.status?.site || {};
     const nums = (s.whatsapp_numbers || []).join(", ");
@@ -3967,6 +4848,12 @@
     b.onclick = () => go(b.getAttribute("data-view"));
   });
 
+  document.getElementById("sa-nav-others")?.addEventListener("click", () => {
+    document.querySelectorAll(".sa-nav-group[data-nav-group='others']").forEach((g) => {
+      g.classList.toggle("is-open");
+    });
+  });
+
   document.getElementById("live-preview-toggle")?.addEventListener("click", toggleScanPreviewSidebar);
 
   document.addEventListener("visibilitychange", () => {
@@ -3996,6 +4883,16 @@
     .catch((e) => {
       main.innerHTML = `<p class="sa-error">Could not reach Site Admin API. Is Redis running? ${escapeHtml(e.message)}</p>`;
     });
+
+  window.SASearch = {
+    state,
+    main,
+    escapeHtml,
+    isAdmin,
+    loadLists,
+    searchApi,
+    search: searchView,
+  };
 
   setInterval(() => {
     refresh().catch(() => {});

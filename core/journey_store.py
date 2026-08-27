@@ -34,8 +34,17 @@ REID_DIM = 512
 _lock = threading.RLock()
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        if isinstance(obj, np.bool_): return bool(obj)
+        return super().default(obj)
+
+
 def _dumps(obj: Any) -> bytes:
-    return json.dumps(obj, separators=(",", ":")).encode()
+    return json.dumps(obj, separators=(",", ":"), cls=_NumpyEncoder).encode()
 
 
 def _loads(raw: Any) -> Optional[Dict[str, Any]]:

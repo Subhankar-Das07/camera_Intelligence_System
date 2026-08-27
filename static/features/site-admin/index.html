@@ -9,15 +9,11 @@
 </head>
 <body>
     <nav class="cis-nav">
-        <a class="cis-brand" href="/">
-            <strong>Camera Intelligence</strong>
-            <span>Unified vision platform</span>
+        <a class="cis-brand cis-brand--logo-only" href="/" aria-label="DRP Infotech home">
+            <img class="cis-brand-logo" src="/assets/brand/drp-infotech-logo.png" width="44" height="44" alt="DRP Infotech">
         </a>
         <div class="cis-nav-links">
-            <a href="/" data-nav="overview">Overview</a>
-            <a href="/features/zone-safety/" data-nav="zone-safety">Zone Safety</a>
-            <a href="/features/vehicle/" data-nav="vehicle">Vehicle Recognition</a>
-            <a href="/features/face/" data-nav="face">Face Recognition</a>
+            <a href="/" data-nav="home">Home</a>
             <a href="/features/site-admin/" data-nav="site-admin">Site Admin</a>
         </div>
         <div class="sa-role-switch" id="role-switch" title="Switch role on this browser">
@@ -45,7 +41,16 @@
                 <button type="button" data-view="monitor">Monitor</button>
                 <button type="button" data-view="alerts">Alerts</button>
                 <button type="button" data-view="reports">Reports</button>
+                <button type="button" data-view="search">Search</button>
                 <button type="button" data-view="settings">Settings</button>
+                <div class="sa-nav-group" data-nav-group="others">
+                    <button type="button" class="sa-nav-parent" id="sa-nav-others">Others</button>
+                    <div class="sa-nav-sub">
+                        <a href="/features/zone-safety/">Zone Safety</a>
+                        <a href="/features/vehicle/">Vehicle Recognition</a>
+                        <a href="/features/face/">Face Recognition</a>
+                    </div>
+                </div>
             </nav>
             <div class="sa-live" id="live-panel">
                 <div class="sa-live-head">
