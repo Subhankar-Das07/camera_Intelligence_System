@@ -58,7 +58,7 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
     - YOLOv8 vehicle detection + ByteTrack multi-object tracking
     - Optional dedicated license-plate detector (YOLO-based)
     - RapidOCR plate reading with multi-frame consensus
-    - SQLite visit database with session-aware cooldown
+    - Redis visit database with session-aware cooldown
 
     Implements :class:`core.base_pipeline.BaseVideoPipeline` so it can be
     instantiated and dispatched via the existing ``PipelineRegistry``.
@@ -89,7 +89,7 @@ class VehicleRecognitionPipeline(BaseVideoPipeline):
             min_consensus_frames (int): Frames required for majority-vote consensus.
             session_cooldown_seconds (int): Seconds before a returning plate is
                                             counted as a new visit.
-            db_path (str): File path for the SQLite database.
+            db_path (str): Legacy path argument (unused, backend is Redis).
         """
         logger.info("Initializing VehicleRecognitionPipeline…")
 
