@@ -263,22 +263,32 @@ def _require_admin(x_cis_role: Optional[str]) -> None:
 
 @router.get("/status")
 def status():
-    site = store.get_site()
-    cams = store.list_cameras()
-    rules = store.list_rules()
-    return {
-        "site": site,
-        "cameras": len(cams),
-        "rules": len(rules),
-        "alerts": len(store.list_alerts(50)),
-        "go_live": bool(site.get("go_live")),
-        "whatsapp_configured": whatsapp_adapter.configured(),
-        "email_configured": email_adapter.configured(),
-        "scan_types": common.available_scan_types(),
-        "scan_catalog": common.SCAN_CATALOG,
-        "monitor": site_admin_monitor.get_monitor_status(),
-        "runtime": site_admin_runtime.get_runtime_status(),
-    }
+    import time
+    from redis.exceptions import ConnectionError, TimeoutError
+    
+    attempts = 3
+    for i in range(attempts):
+        try:
+            site = store.get_site()
+            cams = store.list_cameras()
+            rules = store.list_rules()
+            return {
+                "site": site,
+                "cameras": len(cams),
+                "rules": len(rules),
+                "alerts": len(store.list_alerts(50)),
+                "go_live": bool(site.get("go_live")),
+                "whatsapp_configured": whatsapp_adapter.configured(),
+                "email_configured": email_adapter.configured(),
+                "scan_types": common.available_scan_types(),
+                "scan_catalog": common.SCAN_CATALOG,
+                "monitor": site_admin_monitor.get_monitor_status(),
+                "runtime": site_admin_runtime.get_runtime_status(),
+            }
+        except (ConnectionError, TimeoutError) as e:
+            if i == attempts - 1:
+                raise HTTPException(status_code=500, detail=f"Could not reach Site Admin API. Is Redis running? ({e})")
+            time.sleep(0.1)
 
 
 @router.get("/site")

@@ -268,6 +268,11 @@ def camera_worker_main(
                 gen.close()
             except Exception:
                 pass
+        
+        # Disconnect Redis pool to prevent zombie connection leaks
+        from core.redis_client import disconnect_redis
+        disconnect_redis()
+        
         log.info("camera worker stopped: %s", camera_id)
 
 

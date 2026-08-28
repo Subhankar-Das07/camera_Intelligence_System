@@ -81,6 +81,55 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(status["active_camera_id"], "cam-a")
         self.assertEqual(len(status["workers"]), 2)
 
+    @patch("core.site_admin_runtime.store.list_runtime_worker_heartbeats")
+    @patch("core.site_admin_runtime.store.get_site")
+    def test_stale_and_waiting_workers(self, mock_site, mock_workers):
+        import time
+        mock_site.return_value = {"go_live": True}
+        # 10 seconds ago = waiting. 30 seconds ago = stale.
+        mock_workers.return_value = [
+            {"camera_id": "cam-1", "last_tick_at": time.time() - 10.0},
+            {"camera_id": "cam-2", "last_tick_at": time.time() - 30.0},
+            {"camera_id": "cam-3", "last_tick_at": None, "status": "paused"}
+        ]
+        status = runtime.get_runtime_status()
+        workers = status["workers"]
+        self.assertEqual(workers[0]["status"], "waiting")
+        self.assertEqual(workers[1]["status"], "stale")
+        self.assertEqual(workers[2]["status"], "paused")
+
+class WorkerStopTests(unittest.TestCase):
+    @patch("core.site_admin_runtime._worker_stop")
+    @patch("core.site_admin_runtime.store.clear_runtime_worker_heartbeats")
+    def test_stop_all_workers_graceful(self, mock_clear, mock_stop):
+        from unittest.mock import MagicMock
+        runtime._worker_stop = MagicMock()
+        proc = MagicMock()
+        proc.is_alive.return_value = False
+        runtime._workers = {"cam-1": proc}
+        
+        runtime._stop_all_workers()
+        
+        runtime._worker_stop.set.assert_called_once()
+        mock_clear.assert_called_once()
+        self.assertEqual(len(runtime._workers), 0)
+
+    @patch("core.site_admin_runtime.store.clear_runtime_worker_heartbeats")
+    def test_stop_all_workers_force_terminate(self, mock_clear):
+        from unittest.mock import MagicMock
+        runtime._worker_stop = MagicMock()
+        proc = MagicMock()
+        # Pretend it stays alive even after join
+        proc.is_alive.side_effect = [True, True]
+        proc.name = "StuckWorker"
+        runtime._workers = {"cam-2": proc}
+        
+        runtime._stop_all_workers()
+        
+        proc.terminate.assert_called_once()
+        self.assertEqual(len(runtime._workers), 0)
+
+
 
 class IntegrationNotes(unittest.TestCase):
     """Manual integration checklist (requires Redis + DVR)."""

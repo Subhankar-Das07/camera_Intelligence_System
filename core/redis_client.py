@@ -9,6 +9,7 @@ from typing import Optional
 import redis
 
 _lock = threading.Lock()
+_pool: Optional[redis.ConnectionPool] = None
 _client: Optional[redis.Redis] = None
 
 
@@ -17,22 +18,33 @@ def get_redis_url() -> str:
 
 
 def get_redis() -> redis.Redis:
-    """Return a process-wide Redis client (decode_responses=False for binary blobs)."""
-    global _client
+    """Return a process-wide Redis client backed by a ConnectionPool."""
+    global _pool, _client
     if _client is not None:
         return _client
     with _lock:
         if _client is None:
-            _client = redis.Redis.from_url(
+            _pool = redis.ConnectionPool.from_url(
                 get_redis_url(),
                 decode_responses=False,
                 socket_connect_timeout=5,
                 socket_timeout=30,
-                protocol=2,
+                max_connections=50,
             )
+            _client = redis.Redis(connection_pool=_pool)
             _client.ping()
         return _client
 
+def disconnect_redis() -> None:
+    """Disconnect pool to prevent zombie connections in child processes."""
+    global _pool, _client
+    with _lock:
+        if _pool is not None:
+            _pool.disconnect()
+            _pool = None
+        if _client is not None:
+            _client.close()
+            _client = None
 
 def redis_str(value: bytes | str | None, default: str = "") -> str:
     if value is None:
@@ -40,3 +52,4 @@ def redis_str(value: bytes | str | None, default: str = "") -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
