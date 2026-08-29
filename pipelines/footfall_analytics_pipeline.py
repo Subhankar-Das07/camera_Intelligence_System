@@ -387,8 +387,9 @@ class FootfallAnalyticsPipeline(BaseVideoPipeline):
             outside_poly = [[0, 0], [0, height], [width//2, height], [width//2, 0]]
             inside_poly = [[width//2, 0], [width//2, height], [width, height], [width, 0]]
         else:
-            # Unnormalize if needed
-            if isinstance(outside_poly[0][0], float) and outside_poly[0][0] <= 1.0:
+            # Unnormalize if needed. Avoid isinstance(float) because JSON may parse 0.0 as int 0.
+            max_val = max([max(x, y) for x, y in outside_poly])
+            if max_val <= 1.0:
                 outside_poly = [[int(x*width), int(y*height)] for x,y in outside_poly]
                 inside_poly = [[int(x*width), int(y*height)] for x,y in inside_poly]
             
